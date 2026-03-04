@@ -80,7 +80,7 @@ export async function parseToken(tokenStr: string): Promise<ParsedToken> {
     let peerId = ''
     let fingerprint = ''
     try {
-        const { sha256 } = await import('@noble/hashes/sha2')
+        const { sha256 } = await import('@noble/hashes/sha2.js')
         peerId = bs58.encode(sha256(publicKey))
         fingerprint = peerId.slice(0, 8)
     } catch {
