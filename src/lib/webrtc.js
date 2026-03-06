@@ -24,27 +24,25 @@ import {
 // STUN: discovers public IP for direct P2P (usually enough on most networks)
 // TURN: relay fallback — needed for symmetric NAT / VPNs / strict firewalls
 const ICE = [
-  // ── STUN (no credentials needed) ──────────────────────────────────────────
+  // ── STUN only (no credentials) ────────────────────────────────────────────
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
   { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: 'stun:stun.relay.metered.ca:80' },  // NEW — metered.ca new endpoint
 
-  // ── TURN relay (UDP + TCP fallback) ───────────────────────────────────────
-  // metered.ca open-relay (current working endpoint, higher limits than old openrelay)
-  { urls: 'turn:a.relay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:a.relay.metered.ca:80?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:a.relay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:a.relay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  // ── TURN relay — openrelay.metered.ca (verified free public relay) ─────────
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:80?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turns:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
 
-  // expressturn free TURN (no signup, global anycast nodes)
-  { urls: 'turn:relay1.expressturn.com:3478', username: 'efUN6MFIBNJRTCRYZP', credential: 'eTHbVm9qiwSlv76U' },
-
-  // Xirsys free STUN (reliable, widely used)
-  { urls: 'stun:fr-turn1.xirsys.com' },
+  // ── TURN relay — freestun.net (second free public relay, no signup) ─────────
+  { urls: 'turn:freestun.net:3479', username: 'free', credential: 'free' },
+  { urls: 'turn:freestun.net:5350', username: 'free', credential: 'free' },
+  { urls: 'turns:freestun.net:5350', username: 'free', credential: 'free' },
 ]
 
 const CHUNK = 65536            // 64 KB chunks — best throughput/latency tradeoff
@@ -56,11 +54,13 @@ const fromB64J = b => JSON.parse(decodeURIComponent(escape(atob(b))))
 /** Pause sending until the channel's buffered data drops below HWM */
 function waitDrain(ch) {
   if (ch.bufferedAmount < HWM) return Promise.resolve()
-  ch.bufferedAmountLowThreshold = HWM / 2
   return new Promise(res => {
-    const h = () => { ch.removeEventListener('bufferedamountlow', h); res() }
-    ch.addEventListener('bufferedamountlow', h)
-    setTimeout(res, 8000)  // safety net — never hang forever
+    ch.bufferedAmountLowThreshold = HWM / 2
+    const onLow = () => {
+      ch.removeEventListener('bufferedamountlow', onLow)
+      res()
+    }
+    ch.addEventListener('bufferedamountlow', onLow)
   })
 }
 
@@ -77,12 +77,12 @@ export class P2PNode {
   setSpamLimit(n) { this._spamLimit = n }
 
   // ── INITIATOR ─────────────────────────────────────────────────────────────
-  async createOffer(kp, myNodeId) {
+  async createOffer(kp, myNodeId, myName) {
     const pc = this._mkPc()
     // ordered=true: chunks arrive in order (critical for file reassembly)
     const ch = pc.createDataChannel('ftps', { ordered: true })
     const tmp = 'tmp_' + Date.now().toString(36)
-    this.conns.set(tmp, { pc, ch, sharedKey: null, kp, fingerprint: null })
+    this.conns.set(tmp, { pc, ch, sharedKey: null, kp, fingerprint: null, peerName: '' })
     this._wireChannel(ch, tmp)
     this._wirePeerConn(pc, tmp)
     const offer = await pc.createOffer()
@@ -93,17 +93,18 @@ export class P2PNode {
     this.conns.get(tmp).fingerprint = fp
     return {
       tempId: tmp,
-      offerB64: toB64J({ sdp: pc.localDescription, pub, nid: myNodeId, v: '3' }),
+      offerB64: toB64J({ sdp: pc.localDescription, pub, nid: myNodeId, name: myName, v: '3' }),
       fingerprint: fp,
     }
   }
 
   // ── RESPONDER ─────────────────────────────────────────────────────────────
-  async createAnswer(offerB64, kp, myNodeId) {
+  async createAnswer(offerB64, kp, myNodeId, myName) {
     const od = fromB64J(offerB64)
     const pc = this._mkPc()
     const peerId = od.nid || ('peer_' + Date.now().toString(36))
-    const conn = { pc, ch: null, sharedKey: null, kp, fingerprint: null }
+    const peerName = od.name || ''
+    const conn = { pc, ch: null, sharedKey: null, kp, fingerprint: null, peerName }
     this.conns.set(peerId, conn)
     this._wirePeerConn(pc, peerId)
 
@@ -126,7 +127,8 @@ export class P2PNode {
 
     return {
       peerId,
-      answerB64: toB64J({ sdp: pc.localDescription, pub, nid: myNodeId, v: '3' }),
+      peerName,
+      answerB64: toB64J({ sdp: pc.localDescription, pub, nid: myNodeId, name: myName, v: '3' }),
       fingerprint: fp,
     }
   }
@@ -138,6 +140,8 @@ export class P2PNode {
 
     const ad = fromB64J(answerB64)
     const peerId = ad.nid || tempId
+    const peerName = ad.name || ''
+    conn.peerName = peerName
 
     // Rename the map entry to the real peer ID BEFORE setRemoteDescription
     // so that any ICE/channel events that fire during or after see the real ID
@@ -156,10 +160,10 @@ export class P2PNode {
     // If the channel already opened during ICE (race: same-LAN fast connect),
     // manually fire onOpen so the app knows the connection is live
     if (conn.ch?.readyState === 'open') {
-      this.h.onOpen?.(peerId)
+      this.h.onOpen?.(peerId, peerName)
     }
 
-    return peerId
+    return { peerId, peerName }
   }
 
   // ── SEND ──────────────────────────────────────────────────────────────────
@@ -327,15 +331,13 @@ export class P2PNode {
   _gatherICE(pc) {
     return new Promise(res => {
       if (pc.iceGatheringState === 'complete') { res(); return }
-      const h = () => {
-        if (pc.iceGatheringState === 'complete') {
-          pc.removeEventListener('icegatheringstatechange', h)
-          res()
-        }
+      const done = () => { pc.onicegatheringstatechange = null; res() }
+      // Use property assignment (more universally supported than addEventListener for this)
+      pc.onicegatheringstatechange = () => {
+        if (pc.iceGatheringState === 'complete') done()
       }
-      pc.addEventListener('icegatheringstatechange', h)
-      // Allow up to 14 seconds: STUN is ~1s, TURN can be 5-8s on slow networks
-      setTimeout(res, 14000)
+      // 8 seconds max: STUN ~1s, TURN ~3-5s; if not done by 8s, use what we have
+      setTimeout(done, 8000)
     })
   }
 }

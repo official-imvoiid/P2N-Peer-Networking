@@ -113,6 +113,10 @@ button:active:not(:disabled){transform:scale(.98)}
 /* MODAL OVERLAY */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:100;display:flex;align-items:center;justify-content:center;padding:16px}
 
+/* CODE COPY BUTTON */
+.cbtn{background:${T.surface};border:1px solid ${T.border};color:${T.textDim};font-size:10px;padding:2px 8px;border-radius:3px;cursor:pointer;font-family:inherit}
+.cbtn:hover{background:${T.panel};color:${T.text}}
+
 /* STATUS TAGS */
 .stag{font-size:10px;letter-spacing:.2px;padding:2px 7px;border-radius:4px;font-weight:500}
 
@@ -129,7 +133,11 @@ const escH = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '
 
 function renderMD(text) {
   return text
-    .replace(/```(\w*)\n?([\s\S]*?)```/g, (_, l, c) => `<div class="codeblock"><span class="codeblock-lang">${l || 'code'}</span><pre>${escH(c.trim())}</pre></div>`)
+    .replace(/```(\w*)\n?([\s\S]*?)```/g, (_, l, c) => {
+      const id = 'cb_' + Math.random().toString(36).slice(2, 8)
+      const escaped = escH(c.trim())
+      return `<div class="codeblock"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span class="codeblock-lang">${l || 'code'}</span><button onclick="navigator.clipboard.writeText(document.getElementById('${id}').textContent);this.textContent='✓ Copied';setTimeout(()=>this.textContent='⎘ Copy',1500)" class="cbtn">⎘ Copy</button></div><pre id="${id}">${escaped}</pre></div>`
+    })
     .replace(/`([^`]+)`/g, '<code class="icode">$1</code>')
     .replace(/\*\*(.+?)\*\*/g, '<strong style="color:${T.text}">$1</strong>')
     .replace(/\*(.+?)\*/g, '<em>$1</em>')
@@ -462,22 +470,181 @@ function ReadmeModal({ onClose }) {
 }
 
 // ── CONFIRM MODAL ─────────────────────────────────────────────────────────────
-function ConfirmModal({ msg, onYes, onNo }) {
+function ConfirmModal({ confirm, onNo }) {
+  const [typed, setTyped] = useState('')
+  const isTypeConfirm = confirm.isTypeConfirm
+  const canYes = !isTypeConfirm || typed === confirm.targetWord
   return (
     <div className="overlay">
-      <div className="card fadeup" style={{ width: 'min(380px,96vw)', padding: 28, boxShadow: '0 20px 60px rgba(0,0,0,.7)' }}>
-        <div style={{ fontSize: 14, color: T.amber, marginBottom: 20, lineHeight: 1.7 }}>{msg}</div>
+      <div className="card fadeup" style={{ width: 'min(420px,96vw)', padding: 28, boxShadow: '0 20px 60px rgba(0,0,0,.9)', border: `1px solid ${T.red}40` }}>
+        <div style={{ fontSize: 15, color: T.red, marginBottom: 20, lineHeight: 1.7, fontWeight: 600 }}>{confirm.msg}</div>
+
+        {isTypeConfirm && (
+          <div style={{ marginBottom: 24 }}>
+            <div style={{ fontSize: 12, color: T.textDim, marginBottom: 8 }}>Please type <strong>{confirm.targetWord}</strong> to verify this destructive action:</div>
+            <input type="text" value={typed} onChange={e => setTyped(e.target.value)} placeholder={confirm.targetWord} className="inp" style={{ width: '100%', fontSize: 14, textAlign: 'center', letterSpacing: 2, fontWeight: 700, background: T.red + '10', borderColor: T.red + '30', color: T.red }} />
+          </div>
+        )}
+
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button onClick={onNo} className="btn btn-ghost">Cancel</button>
-          <button onClick={onYes} className="btn btn-danger">Confirm Wipe</button>
+          <button onClick={confirm.onYes} className="btn btn-danger" disabled={!canYes}>Verify & Proceed</button>
         </div>
       </div>
     </div>
   )
 }
 
-// ── FILE MSG COMPONENT ────────────────────────────────────────────────────────
-function FileMsg({ msg, onSandbox }) {
+// ── SANDBOX VIEWER — preview readable files, warn about archives ─────────────
+const READABLE_TEXT = /\.(txt|md|log|json|xml|csv|html|htm|css|js|jsx|ts|tsx|py|java|c|cpp|h|hpp|cs|go|rs|rb|php|sh|bat|ps1|yaml|yml|toml|ini|cfg|conf|env|sql|r|swift|kt|scala|lua|pl|asm|vhdl|v|sv|makefile)$/i
+const READABLE_IMG = /\.(png|jpg|jpeg|gif|bmp|webp|svg|ico|avif)$/i
+const READABLE_PDF = /\.pdf$/i
+const IS_ARCHIVE = /\.(zip|gz|tar|rar|7z|bz2|xz|tgz|tar\.gz|tar\.bz2|tar\.xz|cab|iso|dmg|deb|rpm|apk|jar|war|ear)$/i
+
+function SandboxViewer({ file, onClose, notify }) {
+  const [textContent, setTextContent] = React.useState(null)
+  const [imgUrl, setImgUrl] = React.useState(null)
+  const [pdfUrl, setPdfUrl] = React.useState(null)
+  const [loading, setLoading] = React.useState(true)
+  const [archivePw, setArchivePw] = React.useState('')
+  const name = file.meta?.name || 'unknown'
+  const isText = READABLE_TEXT.test(name)
+  const isImg = READABLE_IMG.test(name)
+  const isPdf = READABLE_PDF.test(name)
+  const isArch = IS_ARCHIVE.test(name)
+
+  React.useEffect(() => {
+    if (!file.blob) { setLoading(false); return }
+    if (isText) {
+      file.blob.text().then(t => { setTextContent(t); setLoading(false) }).catch(() => { setTextContent('[Could not read file]'); setLoading(false) })
+    } else if (isImg) {
+      setImgUrl(URL.createObjectURL(file.blob)); setLoading(false)
+    } else if (isPdf) {
+      setPdfUrl(URL.createObjectURL(file.blob)); setLoading(false)
+    } else {
+      setLoading(false)
+    }
+    return () => { if (imgUrl) URL.revokeObjectURL(imgUrl); if (pdfUrl) URL.revokeObjectURL(pdfUrl) }
+  }, [])
+
+  const dl = () => {
+    if (file.blob) { const a = document.createElement('a'); a.href = URL.createObjectURL(file.blob); a.download = name; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(a.href) }
+  }
+
+  const ext = name.split('.').pop().toLowerCase()
+  const typeLabel = isText ? `Text / Code (.${ext})` : isImg ? `Image (.${ext})` : isPdf ? 'PDF Document' : isArch ? `Archive (.${ext})` : `Binary (.${ext})`
+  const typeIcon = isText ? '📝' : isImg ? '🖼️' : isPdf ? '📑' : isArch ? '📦' : '📄'
+
+  return (
+    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="card fadeup" style={{ width: isImg || isPdf ? 'min(800px,96vw)' : 'min(640px,96vw)', maxHeight: '88vh', padding: 0, overflow: 'hidden', boxShadow: '0 20px 60px rgba(0,0,0,.7)', display: 'flex', flexDirection: 'column' }}>
+        {/* Header */}
+        <div style={{ padding: '13px 18px', borderBottom: `1px solid ${T.border}`, background: T.panel, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span style={{ fontSize: 22 }}>{typeIcon}</span>
+            <div>
+              <div style={{ fontSize: 13, color: T.accent, fontWeight: 600 }}>🔒 Sandbox Preview</div>
+              <div style={{ fontSize: 11, color: T.textDim, marginTop: 1 }}>{name} · {fmtSz(file.meta?.size || 0)} · {typeLabel}</div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button onClick={dl} className="btn btn-green btn-sm">⬇ Save</button>
+            <button onClick={onClose} className="btn btn-ghost btn-sm">✕ Close</button>
+          </div>
+        </div>
+
+        {/* Security strip */}
+        <div style={{ background: T.panel, borderBottom: `1px solid ${T.border}`, padding: '6px 18px', fontSize: 10, color: T.textDim, display: 'flex', gap: 14 }}>
+          <span>🔒 Read-only sandbox</span>
+          <span>⊘ No script execution</span>
+          <span>⊘ No file system access</span>
+        </div>
+
+        {/* Content body */}
+        <div style={{ flex: 1, overflow: 'auto', padding: 0 }}>
+          {loading && <div style={{ padding: 40, textAlign: 'center', color: T.textDim }}>Loading preview…</div>}
+
+          {/* TEXT / CODE PREVIEW */}
+          {!loading && isText && textContent !== null && (
+            <div style={{ position: 'relative' }}>
+              <button onClick={() => { navigator.clipboard?.writeText(textContent); notify?.('File content copied', 'ok') }}
+                style={{ position: 'absolute', top: 10, right: 14, background: T.surface, border: `1px solid ${T.border}`, color: T.textDim, borderRadius: 4, padding: '4px 10px', fontSize: 11, cursor: 'pointer', zIndex: 2 }}>
+                ⎘ Copy All
+              </button>
+              <pre style={{ margin: 0, padding: '16px 18px', fontSize: 12, lineHeight: 1.65, color: T.text, background: T.bg, whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontFamily: "'JetBrains Mono', 'Fira Code', 'Consolas', monospace', monospace", minHeight: 200 }}>
+                {textContent}
+              </pre>
+            </div>
+          )}
+
+          {/* IMAGE PREVIEW */}
+          {!loading && isImg && imgUrl && (
+            <div style={{ padding: 20, textAlign: 'center', background: T.bg, minHeight: 200 }}>
+              <img src={imgUrl} alt={name} style={{ maxWidth: '100%', maxHeight: '60vh', borderRadius: 6, border: `1px solid ${T.border}` }} />
+            </div>
+          )}
+
+          {/* PDF PREVIEW */}
+          {!loading && isPdf && pdfUrl && (
+            <iframe src={pdfUrl} title={name} style={{ width: '100%', height: '65vh', border: 'none', background: '#fff' }} />
+          )}
+
+          {/* ARCHIVE PREVIEW */}
+          {!loading && isArch && (
+            <div style={{ padding: 20 }}>
+              <div style={{ background: T.amber + '0d', border: `1px solid ${T.amber}30`, borderRadius: 6, padding: '12px 16px', marginBottom: 14, fontSize: 12, color: T.amber, lineHeight: 1.7 }}>
+                <strong>⚠ Security Notice:</strong> This is an archive file. Do not extract it on your system without scanning for malware first. FTPS cannot decompress or scan the contents.
+              </div>
+
+              <div style={{ background: T.red + '08', border: `1px solid ${T.red}25`, borderRadius: 6, padding: '12px 16px', marginBottom: 14, fontSize: 12, color: T.red, lineHeight: 1.7 }}>
+                <strong>🔐 Encrypted / Password-Protected Archives:</strong> If this archive is encrypted or password-protected, FTPS cannot open or preview its contents. You will need to extract it locally using a tool like 7-Zip, WinRAR, or similar — <strong>inside a sandboxed / VM environment</strong>.
+              </div>
+
+              <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, padding: '14px 18px', marginBottom: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 10 }}>
+                  <span style={{ fontSize: 32 }}>📦</span>
+                  <div>
+                    <div style={{ fontSize: 15, color: T.text, fontWeight: 600 }}>{name}</div>
+                    <div style={{ fontSize: 12, color: T.textDim }}>{fmtSz(file.meta?.size || 0)} · {file.meta?.mime || 'archive'}</div>
+                  </div>
+                </div>
+                <div style={{ fontSize: 11, color: T.textDim, lineHeight: 1.8 }}>
+                  Content cannot be listed in-browser — archive files need a local decompressor.<br />
+                  Recommended: download and extract in a virtual machine or sandboxed environment.
+                </div>
+              </div>
+
+              <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, padding: '12px 16px', marginBottom: 14 }}>
+                <div style={{ fontSize: 11, color: T.textDim, letterSpacing: 1, marginBottom: 8, fontWeight: 600 }}>ARCHIVE PASSWORD (if known)</div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input type="text" value={archivePw} onChange={e => setArchivePw(e.target.value)}
+                    placeholder="Enter archive password if sender shared one…" className="inp" style={{ flex: 1, fontSize: 12 }} />
+                  <button onClick={() => { if (archivePw) { navigator.clipboard?.writeText(archivePw); notify?.('Password copied — paste into your extractor', 'ok') } }}
+                    className="btn btn-accent btn-sm" disabled={!archivePw}>⎘ Copy Password</button>
+                </div>
+                <div style={{ fontSize: 10, color: T.null_, marginTop: 6 }}>
+                  FTPS cannot decrypt archives in-browser. Copy this password and use it when extracting with 7-Zip / WinRAR.
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* UNKNOWN / BINARY FILE */}
+          {!loading && !isText && !isImg && !isPdf && !isArch && (
+            <div style={{ padding: 30, textAlign: 'center' }}>
+              <div style={{ fontSize: 40, marginBottom: 12 }}>📄</div>
+              <div style={{ fontSize: 14, color: T.text, marginBottom: 6 }}>{name}</div>
+              <div style={{ fontSize: 12, color: T.textDim, marginBottom: 16 }}>{fmtSz(file.meta?.size || 0)} · Binary file — no preview available</div>
+              <button onClick={dl} className="btn btn-green" style={{ padding: '10px 30px' }}>⬇ Save File</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function FileMsg({ msg, onSandbox, onRevoke }) {
   const isMe = msg.from === 'me'
   const pct = msg.pct ?? 1
   const done = msg.type === 'file_done' || msg.type === 'file_out'
@@ -511,8 +678,13 @@ function FileMsg({ msg, onSandbox }) {
           )}
           <div style={{ display: 'flex', gap: 6 }}>
             <button onClick={dl} className="btn btn-green btn-sm" style={{ flex: 1 }}>⬇ Save File</button>
-            {isArchive && <button onClick={() => onSandbox && onSandbox(msg)} className="btn btn-amber btn-sm" style={{ flex: 1 }}>🔒 Preview in Sandbox</button>}
+            <button onClick={() => onSandbox && onSandbox(msg)} className={`btn ${isArchive ? 'btn-amber' : 'btn-accent'} btn-sm`} style={{ flex: 1 }}>🔒 Preview in Sandbox</button>
           </div>
+        </div>
+      )}
+      {isMe && done && (
+        <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+          <button onClick={() => onRevoke && onRevoke(msg.id)} className="btn btn-ghost btn-sm" style={{ flex: 1, padding: '4px 0', fontSize: 10, color: T.amber }}>🛑 Revoke Access</button>
         </div>
       )}
       <div style={{ fontSize: 10, color: T.textDim, marginTop: 4, textAlign: 'right' }}>{msg.time}</div>
@@ -521,7 +693,7 @@ function FileMsg({ msg, onSandbox }) {
 }
 
 // ── FOLDER MSG COMPONENT ──────────────────────────────────────────────────────
-function FolderMsg({ msg, onOpen }) {
+function FolderMsg({ msg, onOpen, onRevoke }) {
   const entries = Object.keys(msg.folder?.children || {})
   return (
     <div onClick={onOpen} style={{ padding: '11px 14px', background: T.amber + '10', border: `1px solid ${T.amber}35`, borderRadius: 10, maxWidth: '68%', cursor: 'pointer', transition: 'background .15s' }} onMouseEnter={e => e.currentTarget.style.background = T.amber + '18'} onMouseLeave={e => e.currentTarget.style.background = T.amber + '10'}>
@@ -531,11 +703,18 @@ function FolderMsg({ msg, onOpen }) {
           <div style={{ fontSize: 13, color: T.amber, fontWeight: 700 }}>Shared Folder</div>
           <div style={{ fontSize: 12, color: T.text }}>{msg.folder?.name}</div>
         </div>
-        <div style={{ fontSize: 11, color: T.textDim, background: T.green + '18', border: `1px solid ${T.green}30`, padding: '2px 8px', borderRadius: 4, color: T.green }}>🔒 Sandboxed</div>
+        <div style={{ fontSize: 11, color: T.textDim, background: T.green + '18', border: `1px solid ${T.green}30`, padding: '2px 8px', borderRadius: 4 }}>🔒 Sandboxed</div>
       </div>
-      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 6 }}>{entries.length} item{entries.length !== 1 ? 's' : ''}: {entries.slice(0, 3).join(', ')}{entries.length > 3 ? '…' : ''}</div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ fontSize: 11, color: T.textDim, marginBottom: 6 }}>{entries.length} item{entries.length !== 1 ? 's' : ''}: {entries.slice(0, 3).join(', ')}{entries.length > 3 ? '…' : ''}</div>
+        <div style={{ fontSize: 10, color: T.textDim }}>{msg.time}</div>
+      </div>
+      {msg.from === 'me' && (
+        <div style={{ display: 'flex', gap: 6, marginTop: 4 }} onClick={e => e.stopPropagation()}>
+          <button onClick={() => onRevoke && onRevoke(msg.id)} className="btn btn-ghost btn-xs" style={{ width: '100%', color: T.amber }}>🛑 Revoke</button>
+        </div>
+      )}
       <div style={{ fontSize: 11, color: T.textMid, background: T.panel, borderRadius: 5, padding: '5px 8px' }}>Click to browse · Read-only · Isolated sandbox</div>
-      <div style={{ fontSize: 10, color: T.null_, marginTop: 4, textAlign: 'right' }}>{msg.time}</div>
     </div>
   )
 }
@@ -596,6 +775,7 @@ export default function App() {
   const [notif, setNotif] = useState(null)
   const [sideSmall, setSideSmall] = useState(false)
   const [localIP, setLocalIP] = useState('detecting…')
+  const [publicIP, setPublicIP] = useState('detecting…')
   const [uptime, setUptime] = useState(0)
   const [lockTimer, setLockTimer] = useState(900)
   const [sandboxFile, setSandboxFile] = useState(null)
@@ -612,23 +792,28 @@ export default function App() {
   const pushMsg = useCallback((pid, m) => setMsgs(prev => ({ ...prev, [pid]: [...(prev[pid] || []), m] })), [])
   const updMsg = useCallback((pid, id, patch) => setMsgs(prev => ({ ...prev, [pid]: (prev[pid] || []).map(m => m.id === id ? { ...m, ...patch } : m) })), [])
 
-  // Refresh protection — use a ref so the handler always sees current screen
-  // (avoids stale closure from useEffect dependency)
+  // refresh protection
   const screenRef = useRef(screen)
   useEffect(() => { screenRef.current = screen }, [screen])
   useEffect(() => {
     const h = e => {
       if (screenRef.current === 'main' || screenRef.current === 'locked') {
+        const msg = '⚠ WARNING: Leaving this page will permanently drop your P2P connections and wipe all unsaved chat / file data.'
         e.preventDefault()
-        e.returnValue = ''
-        return ''
+        e.returnValue = msg
+        return msg
       }
     }
     window.addEventListener('beforeunload', h)
     return () => window.removeEventListener('beforeunload', h)
   }, [])  // mount-once — uses ref internally
 
-  useEffect(() => { detectIP().then(setLocalIP) }, [])
+  // fetch IPs
+  useEffect(() => {
+    detectIP().then(setLocalIP)
+    // Fetch public IP since browsers obfuscate local IP
+    fetch('https://api.ipify.org?format=json').then(r => r.json()).then(d => setPublicIP(d.ip)).catch(() => setPublicIP('Unavailable'))
+  }, [])
 
   useEffect(() => {
     const r = () => { lastAct.current = Date.now() }
@@ -673,7 +858,12 @@ export default function App() {
         setPeers(ps => ps.map(p => p.id === pid ? { ...p, connState: state } : p))
       },
       onMsg(pid, msg) {
-        if (msg.type === 'folder_share') pushMsg(pid, { id: Date.now(), from: 'them', type: 'folder', folder: msg.folder, time: now8() })
+        if (msg.type === 'revoke') {
+          // Peer asked us to revoke/delete a specific message (file/folder)
+          setMsgs(prev => ({ ...prev, [pid]: (prev[pid] || []).map(m => m.id === msg.targetId ? { ...m, text: '🚫 Access revoked by sender.', type: 'text', revoked: true } : m) }))
+          notify('A file/folder access was revoked by the sender', 'info')
+        }
+        else if (msg.type === 'folder_share') pushMsg(pid, { id: Date.now(), from: 'them', type: 'folder', folder: msg.folder, time: now8() })
         else pushMsg(pid, { id: Date.now(), from: 'them', text: msg.text, time: now8(), type: 'text' })
       },
       onFileStart(pid, meta) {
@@ -711,7 +901,10 @@ export default function App() {
     const e = {}
     if (!form.name.trim()) e.name = 'Required'
     if (!form.passphrase.trim()) e.passphrase = 'Required — use 🎲 to generate one'
-    if (form.password.length < 6) e.password = 'Min 6 characters'
+    if (!form.password || form.password.length < 8) e.password = 'Min 8 chars'
+    else if (!/[A-Z]/.test(form.password)) e.password = 'Needs 1 uppercase'
+    else if (!/[a-z]/.test(form.password)) e.password = 'Needs 1 lowercase'
+    else if (!/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(form.password)) e.password = 'Needs 1 special char'
     if (Object.keys(e).length) { setFormErr(e); return }
     const kp = await generateKeyPair()
     keyRef.current = { keyPair: kp, pub: await exportPublicKey(kp.publicKey) }
@@ -746,7 +939,7 @@ export default function App() {
   const doOffer = async () => {
     setGenMode('loading')
     try {
-      const { tempId, offerB64, fingerprint } = await p2pRef.current.createOffer(keyRef.current.keyPair, myId.current)
+      const { tempId, offerB64, fingerprint } = await p2pRef.current.createOffer(keyRef.current.keyPair, myId.current, account?.name)
       setPendId(tempId); setGenCode(offerB64); setInitiatorCode(offerB64); setGenMode('offering')
       // Add a pending peer entry with fingerprint
       setPeers(ps => [...ps.filter(p => p.id !== tempId), { id: tempId, name: '', online: false, since: now8(), state: 'offering', fingerprint }])
@@ -758,9 +951,9 @@ export default function App() {
     if (!offerBox.trim()) { notify('Paste the offer first', 'err'); return }
     setGenMode('loading')
     try {
-      const { peerId, answerB64, fingerprint } = await p2pRef.current.createAnswer(offerBox.trim(), keyRef.current.keyPair, myId.current)
+      const { peerId, peerName, answerB64, fingerprint } = await p2pRef.current.createAnswer(offerBox.trim(), keyRef.current.keyPair, myId.current, account?.name)
       setGenCode(answerB64); setResponderCode(answerB64)
-      setPeers(ps => [...ps.filter(p => p.id !== peerId), { id: peerId, name: '', online: false, since: now8(), state: 'answering', fingerprint }])
+      setPeers(ps => [...ps.filter(p => p.id !== peerId), { id: peerId, name: peerName, online: false, since: now8(), state: 'answering', fingerprint }])
       setGenMode('answering')
       notify('Answer ready — send back to peer', 'info')
     } catch (e) { notify('Answer failed: ' + e.message, 'err'); setGenMode('idle') }
@@ -769,12 +962,12 @@ export default function App() {
   const doFinalize = async () => {
     if (!ansBox.trim() || !pendId) { notify('Paste the answer first', 'err'); return }
     try {
-      const peerId = await p2pRef.current.finalizeOffer(pendId, ansBox.trim())
+      const { peerId, peerName } = await p2pRef.current.finalizeOffer(pendId, ansBox.trim())
       // Update any temp peer entry, or add the real peer if not yet listed
       setPeers(ps => {
         const ex = ps.find(p => p.id === pendId || p.id === peerId)
-        if (ex) return ps.map(p => (p.id === pendId || p.id === peerId) ? { ...p, id: peerId, state: 'connecting' } : p)
-        return [...ps, { id: peerId, name: '', online: false, since: now8(), state: 'connecting' }]
+        if (ex) return ps.map(p => (p.id === pendId || p.id === peerId) ? { ...p, id: peerId, name: peerName || p.name, state: 'connecting' } : p)
+        return [...ps, { id: peerId, name: peerName, online: false, since: now8(), state: 'connecting' }]
       })
       notify('Connection finalized! Waiting for channel to open…', 'ok'); setGenMode('done')
     } catch (e) { notify('Finalize failed: ' + e.message, 'err') }
@@ -832,18 +1025,52 @@ export default function App() {
       let node = tree
       for (let i = 0; i < parts.length - 1; i++) {
         const seg = parts[i]
-        if (!node[seg]) node[seg] = { type: 'folder', children: {} }
+        if (!node[seg]) node[seg] = { type: 'dir', children: {} }
         node = node[seg].children
       }
-      const name = parts[parts.length - 1]
-      const ext = name.split('.').pop().toLowerCase()
-      node[name] = { type: 'file', ext, size: fmtSz(file.size), blob: file }
+      node[parts[parts.length - 1]] = { type: 'file', file }
     }
-    const rootName = files[0].webkitRelativePath.split('/')[0]
-    const meta = { name: rootName, type: 'folder', children: tree[rootName]?.children || tree }
-    await p2pRef.current.sendFolder(selPeer.id, meta)
-    pushMsg(selPeer.id, { id: Date.now(), from: 'me', type: 'folder', folder: meta, time: now8() })
-    notify(`Folder "${rootName}" shared`, 'ok')
+    const rootDirStr = Object.keys(tree)[0]
+    const rootDir = tree[rootDirStr]
+    if (!rootDir || rootDir.type !== 'dir') return notify('Invalid folder structure', 'err')
+
+    // Read all files
+    const loadNode = async (n) => {
+      if (n.type === 'file') {
+        const b64 = await new Promise(r => { const rd = new FileReader(); rd.onload = () => r(rd.result.split(',')[1]); rd.readAsDataURL(n.file) })
+        return { type: 'file', size: n.file.size, mime: n.file.type, d: b64 }
+      }
+      const out = { type: 'dir', children: {} }
+      for (const [k, v] of Object.entries(n.children)) out.children[k] = await loadNode(v)
+      return out
+    }
+    const payload = { name: rootDirStr, children: (await loadNode(rootDir)).children }
+    const msgId = Date.now()
+    if (!await p2pRef.current.sendMsg(selPeer.id, { type: 'folder_share', folder: payload })) { notify('Send failed', 'err'); return }
+    pushMsg(selPeer.id, { id: msgId, from: 'me', type: 'folder', folder: payload, time: now8() })
+    notify(`Shared folder: ${rootDirStr}`, 'ok')
+  }
+
+  const doRevoke = async (msgId) => {
+    if (!selPeer) return
+    // Send revoke control message
+    if (await p2pRef.current.sendMsg(selPeer.id, { type: 'revoke', targetId: msgId })) {
+      setMsgs(prev => ({ ...prev, [selPeer.id]: (prev[selPeer.id] || []).map(m => m.id === msgId ? { ...m, text: '🚫 You revoked access to this item.', type: 'text', revoked: true } : m) }))
+      notify('Access revoked', 'info')
+    } else {
+      notify('Failed to send revoke command', 'err')
+    }
+  }
+
+  const doClearChat = () => {
+    if (!selPeer) return
+    setConfirm({
+      msg: 'Soft Clear: Wipe chat history for this peer? (The connection will stay open)',
+      onYes: () => {
+        setMsgs(prev => ({ ...prev, [selPeer.id]: [] }))
+        setConfirm(null)
+      }
+    })
   }
 
   const doSendCode = (codeBlock) => {
@@ -869,7 +1096,7 @@ export default function App() {
         {/* Header */}
         <div style={{ textAlign: 'center', marginBottom: 28 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, marginBottom: 10 }}>
-            <div style={{ width: 40, height: 40, borderRadius: 10, background: T.accent + '18', border: `1px solid ${T.accent}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20 }}>🔐</div>
+            <div style={{ width: 40, height: 40, borderRadius: 10, background: T.accent + '18', border: `1px solid ${T.accent} 40`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20 }}>🔐</div>
             <div>
               <div style={{ fontSize: 22, color: T.text, fontWeight: 700, letterSpacing: 1 }}>FTPS</div>
               <div style={{ fontSize: 11, color: T.textDim, letterSpacing: 2 }}>SECURE FILE TRANSFER</div>
@@ -885,7 +1112,7 @@ export default function App() {
               <span>Display Name <span style={{ color: T.red }}>*</span></span>
               {formErr.name && <span>{formErr.name}</span>}
             </div>
-            <input value={form.name} type="text" placeholder="Your name or alias" className={`inp${formErr.name ? ' err' : ''}`}
+            <input value={form.name} type="text" placeholder="Your name or alias" className={`inp${formErr.name ? ' err' : ''} `}
               onChange={e => { setForm(p => ({ ...p, name: e.target.value })); setFormErr(p => ({ ...p, name: '' })) }}
               onKeyDown={e => e.key === 'Enter' && doSetup()} />
           </div>
@@ -897,7 +1124,7 @@ export default function App() {
               {formErr.passphrase && <span style={{ fontSize: 10 }}>{formErr.passphrase}</span>}
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
-              <input value={form.passphrase} type="text" placeholder="Memorable phrase — used to unlock session" className={`inp${formErr.passphrase ? ' err' : ''}`}
+              <input value={form.passphrase} type="text" placeholder="Memorable phrase — used to unlock session" className={`inp${formErr.passphrase ? ' err' : ''} `}
                 onChange={e => { setForm(p => ({ ...p, passphrase: e.target.value })); setFormErr(p => ({ ...p, passphrase: '' })) }}
                 onKeyDown={e => e.key === 'Enter' && doSetup()}
                 style={{ flex: 1 }} />
@@ -909,17 +1136,17 @@ export default function App() {
           {/* Password — required */}
           <div style={{ marginBottom: 18 }}>
             <div style={{ fontSize: 11, marginBottom: 5, fontWeight: 500, display: 'flex', justifyContent: 'space-between', color: formErr.password ? T.red : T.textDim }}>
-              <span>Password <span style={{ color: T.red }}>*</span> <span style={{ fontWeight: 400, fontSize: 10 }}>(min 6 chars)</span></span>
+              <span>Password <span style={{ color: T.red }}>*</span> <span style={{ fontWeight: 400, fontSize: 10 }}>(8+ chars: A-Z, a-z, @#$)</span></span>
               {formErr.password && <span style={{ fontSize: 10 }}>{formErr.password}</span>}
             </div>
-            <input value={form.password} type="password" placeholder="Second authentication factor" className={`inp${formErr.password ? ' err' : ''}`}
+            <input value={form.password} type="password" placeholder="Second authentication factor" className={`inp${formErr.password ? ' err' : ''} `}
               onChange={e => { setForm(p => ({ ...p, password: e.target.value })); setFormErr(p => ({ ...p, password: '' })) }}
               onKeyDown={e => e.key === 'Enter' && doSetup()} />
           </div>
-          <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, padding: '10px 12px', marginBottom: 16, fontSize: 11, color: T.textDim, lineHeight: 1.8 }}>
+          <div style={{ background: T.panel, border: `1px solid ${T.border} `, borderRadius: 6, padding: '10px 12px', marginBottom: 16, fontSize: 11, color: T.textDim, lineHeight: 1.8 }}>
             🔒 Auto-locks after {settings.lockTimeout} min inactivity · {settings.maxAttempts} wrong attempts = full session wipe
           </div>
-          <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, padding: '10px 12px', marginBottom: 18, fontSize: 11, color: T.textDim }}>
+          <div style={{ background: T.panel, border: `1px solid ${T.border} `, borderRadius: 6, padding: '10px 12px', marginBottom: 18, fontSize: 11, color: T.textDim }}>
             ⚠ Refresh or close tab = all session data is permanently gone
           </div>
           <button onClick={doSetup} className="btn btn-accent" style={{ width: '100%', padding: 12, fontSize: 13, marginBottom: 8 }}>Start Session →</button>
@@ -968,45 +1195,11 @@ export default function App() {
       {folderView && <SandboxFolder folder={folderView} onClose={() => setFolderView(null)} />}
       {showReadme && <ReadmeModal onClose={() => setShowReadme(false)} />}
       {showCode && selPeer && <CodeEditor onSend={doSendCode} onClose={() => setShowCode(false)} />}
-      {confirm && <ConfirmModal msg={confirm.msg} onYes={confirm.onYes} onNo={() => setConfirm(null)} />}
-      {sandboxFile && (
-        <div className="overlay" onClick={e => e.target === e.currentTarget && setSandboxFile(null)}>
-          <div className="card fadeup" style={{ width: 'min(520px,96vw)', padding: 0, overflow: 'hidden', boxShadow: '0 20px 60px rgba(0,0,0,.7)' }}>
-            <div style={{ padding: '13px 18px', borderBottom: `1px solid ${T.border}`, background: T.panel, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div>
-                <div style={{ fontSize: 13, color: T.accent, fontWeight: 600 }}>🔒 Archive Sandbox Preview</div>
-                <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>File is NOT extracted — display only — no script execution</div>
-              </div>
-              <button onClick={() => setSandboxFile(null)} className="btn btn-ghost btn-sm">✕ Close</button>
-            </div>
-            <div style={{ padding: 20 }}>
-              <div style={{ background: T.amber + '0d', border: `1px solid ${T.amber}30`, borderRadius: 6, padding: '10px 14px', marginBottom: 14, fontSize: 12, color: T.amber, lineHeight: 1.7 }}>
-                <strong>⚠ Security Notice:</strong> This is an archive file. Do not extract it on your system without scanning for malware first. FTPS cannot decompress or scan the contents for you.
-              </div>
-              <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, padding: '12px 16px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
-                  <span style={{ fontSize: 28 }}>📦</span>
-                  <div>
-                    <div style={{ fontSize: 14, color: T.text, fontWeight: 600 }}>{sandboxFile.meta?.name}</div>
-                    <div style={{ fontSize: 12, color: T.textDim }}>{fmtSz(sandboxFile.meta?.size || 0)} · {sandboxFile.meta?.mime || 'application/octet-stream'}</div>
-                  </div>
-                </div>
-                <div style={{ fontSize: 11, color: T.textDim, lineHeight: 1.8 }}>
-                  Content cannot be listed — archive files need a local decompressor to read.<br />
-                  Recommended: extract in a virtual machine or sandboxed environment.
-                </div>
-              </div>
-              <button onClick={() => {
-                if (sandboxFile.blob) { const a = document.createElement('a'); a.href = URL.createObjectURL(sandboxFile.blob); a.download = sandboxFile.meta.name; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(a.href) }
-                setSandboxFile(null)
-              }} className="btn btn-ghost" style={{ marginTop: 14, width: '100%' }}>⬇ Save File (without extracting)</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {confirm && <ConfirmModal confirm={confirm} onNo={() => setConfirm(null)} />}
+      {sandboxFile && <SandboxViewer file={sandboxFile} onClose={() => setSandboxFile(null)} notify={notify} />}
 
       {/* TOP BAR */}
-      <div style={{ height: 52, background: T.surface, borderBottom: `1px solid ${T.border}`, display: 'flex', alignItems: 'center', padding: '0 14px', gap: 12, flexShrink: 0, zIndex: 30 }}>
+      <div style={{ height: 52, background: T.surface, borderBottom: `1px solid ${T.border} `, display: 'flex', alignItems: 'center', padding: '0 14px', gap: 12, flexShrink: 0, zIndex: 30 }}>
         <button onClick={() => setSideSmall(s => !s)} style={{ background: 'none', border: 'none', color: T.textDim, fontSize: 18, padding: '4px 6px', borderRadius: 4, lineHeight: 1 }}>☰</button>
         <div style={{ fontSize: 15, fontWeight: 700, color: T.accent, letterSpacing: 4 }}>FTPS</div>
         <div style={{ width: 1, height: 18, background: T.border }} />
@@ -1015,29 +1208,29 @@ export default function App() {
         {/* Lock countdown */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} title="Inactivity lock countdown — resets on activity">
           <span style={{ fontSize: 12, color: lockTimer < 120 ? T.red : T.textDim, animation: lockTimer < 60 ? 'blink 1s infinite' : 'none', fontVariantNumeric: 'tabular-nums' }}>{fmtMin(lockTimer)}</span>
-          <div style={{ width: 56, height: 3, background: T.border, borderRadius: 2 }}><div style={{ height: '100%', width: `${lockPct}%`, background: lockTimer < 120 ? T.red : T.accentDim, borderRadius: 2, transition: 'width 1s linear' }} /></div>
+          <div style={{ width: 56, height: 3, background: T.border, borderRadius: 2 }}><div style={{ height: '100%', width: `${lockPct}% `, background: lockTimer < 120 ? T.red : T.accentDim, borderRadius: 2, transition: 'width 1s linear' }} /></div>
         </div>
         <div className="hide-md" style={{ fontSize: 12, color: onlinePeers.length ? T.green : T.null_ }}>
-          {onlinePeers.length ? `● ${onlinePeers.length} peer${onlinePeers.length > 1 ? 's' : ''}` : ' ○ no peers'}
+          {onlinePeers.length ? `● ${onlinePeers.length} peer${onlinePeers.length > 1 ? 's' : ''} ` : ' ○ no peers'}
         </div>
         <button onClick={doLock} className="btn btn-amber btn-sm" style={{ gap: 6 }}>🔒 Lock</button>
+        <button onClick={() => setConfirm({ isTypeConfirm: true, targetWord: 'REFRESH', msg: '⚠ REFRESH PROGRAM? All peer connections and unsaved data will be permanently destroyed. This cannot be undone.', onYes: () => window.location.reload() })} className="btn btn-ghost btn-sm" title="Restart FTPS program">↻ Refresh</button>
         <button onClick={() => setShowReadme(true)} className="btn btn-ghost btn-sm">DOCS</button>
-        <div className="hide-md" style={{ fontSize: 11, color: T.red, background: T.red + '0c', border: `1px solid ${T.red}20`, borderRadius: 4, padding: '4px 8px' }}>⚠ Refresh = lost</div>
       </div>
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
 
         {/* SIDEBAR */}
-        <div style={{ width: sideSmall ? 52 : 190, background: T.surface, borderRight: `1px solid ${T.border}`, display: 'flex', flexDirection: 'column', flexShrink: 0, transition: 'width .18s ease', overflow: 'hidden' }}>
+        <div style={{ width: sideSmall ? 52 : 190, background: T.surface, borderRight: `1px solid ${T.border} `, display: 'flex', flexDirection: 'column', flexShrink: 0, transition: 'width .18s ease', overflow: 'hidden' }}>
           {!sideSmall && (
-            <div style={{ padding: '12px 16px 10px', borderBottom: `1px solid ${T.border}` }}>
+            <div style={{ padding: '12px 16px 10px', borderBottom: `1px solid ${T.border} ` }}>
               <div style={{ fontSize: 10, color: T.textDim, letterSpacing: 2, marginBottom: 3 }}>NODE</div>
               <div style={{ fontSize: 14, color: T.accent, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{account?.name}</div>
               <div style={{ fontSize: 10, color: T.null_ }}>{myId.current}</div>
             </div>
           )}
           {[{ id: 'network', icon: '⬡', l: 'P2P Network' }, { id: 'connect', icon: '⊕', l: 'Connect Peer' }, { id: 'history', icon: '◷', l: 'History' }, { id: 'details', icon: '◉', l: 'My Details' }, { id: 'uptime', icon: '▲', l: 'Up-Time' }, { id: 'dev', icon: '⚙', l: 'System/Dev' }, { id: 'settings', icon: '✦', l: 'Settings' }].map(item => (
-            <button key={item.id} className={`sbtn ${tab === item.id ? 'act' : ''}`}
+            <button key={item.id} className={`sbtn ${tab === item.id ? 'act' : ''} `}
               style={sideSmall ? { justifyContent: 'center', padding: '13px 0', gap: 0 } : {}}
               onClick={() => { setTab(item.id); setSelPeer(null) }} title={item.l}>
               <span style={{ fontSize: 16, flexShrink: 0 }}>{item.icon}</span>
@@ -1045,7 +1238,7 @@ export default function App() {
             </button>
           ))}
           <div style={{ flex: 1 }} />
-          {!sideSmall && <div style={{ padding: '8px 14px', borderTop: `1px solid ${T.border}`, fontSize: 10, color: T.null_, lineHeight: 1.8 }}>◈ WebRTC Direct P2P<br />◈ ECDH P-256 + AES-GCM-256</div>}
+          {!sideSmall && <div style={{ padding: '8px 14px', borderTop: `1px solid ${T.border} `, fontSize: 10, color: T.null_, lineHeight: 1.8 }}>◈ WebRTC Direct P2P<br />◈ ECDH P-256 + AES-GCM-256</div>}
         </div>
 
         {/* CENTER — hidden when chat is open full-screen */}
@@ -1064,9 +1257,9 @@ export default function App() {
                   { l: 'Display Name', v: account?.name, c: T.text },
                   { l: 'Session Crypto', v: 'ECDH P-256 key exchange · AES-GCM-256 encryption', c: T.green },
                 ].map(r => (
-                  <div key={r.l} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border}` }}>
+                  <div key={r.l} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border} ` }}>
                     <span style={{ fontSize: 12, color: T.textDim }}>{r.l}</span>
-                    <span style={{ fontSize: 12, color: r.c, fontWeight: r.c === T.accent ? 700 : 400 }}>{r.v}</span>
+                    <span style={{ fontSize: 12, color: r.c === T.accent ? T.accent : r.c || T.text, fontWeight: r.c === T.accent ? 700 : 400 }}>{r.v}</span>
                   </div>
                 ))}
               </div>
@@ -1075,14 +1268,14 @@ export default function App() {
               <div style={{ fontSize: 10, color: T.textDim, letterSpacing: 2, marginBottom: 8, fontWeight: 700 }}>NETWORK</div>
               <div className="card" style={{ marginBottom: 16, overflow: 'hidden' }}>
                 {[
-                  { l: 'Local IP', v: localIP === 'detecting…' ? 'Detecting via WebRTC…' : localIP, c: localIP === 'N/A' ? T.null_ : T.accent },
-                  { l: 'Public IP', v: 'Resolved via STUN during peer handshake', c: T.textMid },
+                  { l: 'Public IP', v: publicIP === 'detecting…' ? 'Detecting via ipify.org…' : publicIP, c: publicIP === 'Unavailable' ? T.null_ : T.accent },
+                  { l: 'Local IP', v: localIP === 'detecting…' ? 'Detecting via WebRTC…' : localIP, c: localIP === 'N/A' || localIP.includes('.local') ? T.null_ : T.text },
                   { l: 'MAC Address', v: 'Not accessible — blocked by all browsers (privacy protection)', c: T.null_ },
                   { l: 'Transport', v: 'WebRTC DataChannel (ordered SCTP, reliable)', c: T.blue },
                   { l: 'Server relay', v: 'None — traffic is direct peer-to-peer', c: T.accent },
                   { l: 'STUN servers', v: 'Google, Cloudflare, STUNProtocol (NAT discovery only)', c: T.textMid },
                 ].map(r => (
-                  <div key={r.l} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border}` }}>
+                  <div key={r.l} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border} ` }}>
                     <span style={{ fontSize: 12, color: T.textDim }}>{r.l}</span>
                     <span style={{ fontSize: 12, color: r.c }}>{r.v}</span>
                   </div>
@@ -1093,18 +1286,18 @@ export default function App() {
               <div style={{ fontSize: 10, color: T.textDim, letterSpacing: 2, marginBottom: 8, fontWeight: 700 }}>PEERS</div>
               <div className="card" style={{ marginBottom: 16, overflow: 'hidden' }}>
                 {[
-                  { l: 'Online', v: `${onlinePeers.length} peer${onlinePeers.length !== 1 ? 's' : ''}`, c: onlinePeers.length ? T.green : T.null_ },
-                  { l: 'Total known', v: `${peers.length} peer${peers.length !== 1 ? 's' : ''}`, c: T.textMid },
+                  { l: 'Online', v: `${onlinePeers.length} peer${onlinePeers.length !== 1 ? 's' : ''} `, c: onlinePeers.length ? T.green : T.null_ },
+                  { l: 'Total known', v: `${peers.length} peer${peers.length !== 1 ? 's' : ''} `, c: T.textMid },
                   { l: 'Session uptime', v: fmt(uptime), c: T.textMid },
                 ].map(r => (
-                  <div key={r.l} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border}` }}>
+                  <div key={r.l} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border} ` }}>
                     <span style={{ fontSize: 12, color: T.textDim }}>{r.l}</span>
                     <span style={{ fontSize: 12, color: r.c, fontWeight: r.c === T.green ? 700 : 400 }}>{r.v}</span>
                   </div>
                 ))}
               </div>
 
-              <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, padding: '11px 14px', fontSize: 12, color: T.textDim, lineHeight: 1.8 }}>
+              <div style={{ background: T.panel, border: `1px solid ${T.border} `, borderRadius: 6, padding: '11px 14px', fontSize: 12, color: T.textDim, lineHeight: 1.8 }}>
                 <strong style={{ color: T.amber }}>About local IP:</strong> Detected using a silent WebRTC ICE probe — no external request is made. Shows your LAN address (e.g. 192.168.x.x). If shown as N/A, your browser's privacy settings block this.
               </div>
             </div>
@@ -1123,7 +1316,7 @@ export default function App() {
                 <div style={{
                   marginBottom: 14, padding: '10px 14px', borderRadius: 6, fontSize: 12, lineHeight: 1.6,
                   background: genMode === 'done' ? T.green + '14' : T.amber + '0a',
-                  border: `1px solid ${genMode === 'done' ? T.green + '50' : T.amber + '30'}`,
+                  border: `1px solid ${genMode === 'done' ? T.green + '50' : T.amber + '30'} `,
                   color: genMode === 'done' ? T.green : T.amber
                 }}>
                   {genMode === 'loading' && '⟳ Generating — gathering ICE candidates (STUN + TURN, up to 12 sec)…'}
@@ -1156,7 +1349,7 @@ export default function App() {
                     <div>
                       <div style={{ fontSize: 10, color: T.textDim, marginBottom: 5, letterSpacing: 1 }}>YOUR OFFER — copy & share this</div>
                       <textarea readOnly value={initiatorCode} rows={4}
-                        style={{ width: '100%', background: T.bg, border: `1px solid ${T.border}`, borderRadius: 5, padding: '8px 10px', color: T.accentDim, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 4 }}
+                        style={{ width: '100%', background: T.bg, border: `1px solid ${T.border} `, borderRadius: 5, padding: '8px 10px', color: T.accentDim, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 4 }}
                         onClick={e => e.target.select()} />
                       <button onClick={() => { navigator.clipboard?.writeText(initiatorCode); notify('Copied!', 'ok') }}
                         className="btn btn-accent" style={{ marginBottom: 10, width: '100%', padding: 10, fontSize: 13, letterSpacing: 0.5 }}>
@@ -1166,7 +1359,7 @@ export default function App() {
                       <div style={{ fontSize: 10, color: T.textDim, marginBottom: 5, letterSpacing: 1 }}>PASTE PEER'S ANSWER</div>
                       <textarea value={ansBox} onChange={e => setAnsBox(e.target.value)} rows={4}
                         placeholder="Paste peer's answer string here…"
-                        style={{ width: '100%', background: T.bg, border: `1px solid ${T.border}`, borderRadius: 5, padding: '8px 10px', color: T.text, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 10 }} />
+                        style={{ width: '100%', background: T.bg, border: `1px solid ${T.border} `, borderRadius: 5, padding: '8px 10px', color: T.text, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 10 }} />
                       <button onClick={doFinalize} className="btn btn-green" style={{ width: '100%', padding: 10 }}
                         disabled={!ansBox.trim()}>
                         ✓ Finalize Connection
@@ -1187,7 +1380,7 @@ export default function App() {
                   <div style={{ fontSize: 10, color: T.textDim, marginBottom: 5, letterSpacing: 1 }}>PASTE INITIATOR'S OFFER</div>
                   <textarea value={offerBox} onChange={e => setOfferBox(e.target.value)} rows={4}
                     placeholder="Paste offer string here…"
-                    style={{ width: '100%', background: T.bg, border: `1px solid ${T.border}`, borderRadius: 5, padding: '8px 10px', color: T.text, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 10 }} />
+                    style={{ width: '100%', background: T.bg, border: `1px solid ${T.border} `, borderRadius: 5, padding: '8px 10px', color: T.text, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 10 }} />
                   <button onClick={doAnswer} className="btn btn-purple" style={{ width: '100%', padding: 10 }}
                     disabled={genMode === 'loading' || !offerBox.trim() || (genMode === 'offering' || genMode === 'done')}>
                     {genMode === 'loading' ? 'Generating…' : 'Generate Answer →'}
@@ -1197,7 +1390,7 @@ export default function App() {
                     <div style={{ marginTop: 12 }}>
                       <div style={{ fontSize: 10, color: T.textDim, marginBottom: 5, letterSpacing: 1 }}>YOUR ANSWER — copy & send back</div>
                       <textarea readOnly value={responderCode} rows={4}
-                        style={{ width: '100%', background: T.bg, border: `1px solid ${T.border}`, borderRadius: 5, padding: '8px 10px', color: T.purple, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 4 }}
+                        style={{ width: '100%', background: T.bg, border: `1px solid ${T.border} `, borderRadius: 5, padding: '8px 10px', color: T.purple, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 4 }}
                         onClick={e => e.target.select()} />
                       <button onClick={() => { navigator.clipboard?.writeText(responderCode); notify('Copied!', 'ok') }}
                         className="btn btn-accent" style={{ width: '100%', padding: 10, fontSize: 13, letterSpacing: 0.5 }}>
@@ -1209,7 +1402,7 @@ export default function App() {
               </div>
 
               {/* How it works + TURN explanation */}
-              <div style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, padding: '12px 16px', fontSize: 12, color: T.textDim, lineHeight: 1.9 }}>
+              <div style={{ background: T.panel, border: `1px solid ${T.border} `, borderRadius: 6, padding: '12px 16px', fontSize: 12, color: T.textDim, lineHeight: 1.9 }}>
                 <div style={{ color: T.textMid, marginBottom: 6, fontWeight: 600 }}>Why this works across different networks</div>
                 <div>The connection uses <span style={{ color: T.blue }}>WebRTC</span> with <span style={{ color: T.accent }}>STUN + TURN</span> servers.
                   STUN discovers your public IP. If direct P2P fails (strict NAT, mobile data, different ISPs),
@@ -1223,35 +1416,29 @@ export default function App() {
           {tab === 'history' && (
             <div style={{ flex: 1, padding: 20, overflowY: 'auto' }} className="fadein">
               <div style={{ fontSize: 12, color: T.accentDim, letterSpacing: 3, marginBottom: 14, fontWeight: 700 }}>◷ SESSION HISTORY</div>
-              <div style={{ fontSize: 12, color: T.amber, background: T.amber + '0a', border: `1px solid ${T.amber}22`, borderRadius: 6, padding: 11, marginBottom: 16 }}>⚠ Memory only — data is permanently lost on refresh or tab close</div>
+              <div style={{ fontSize: 12, color: T.amber, background: T.amber + '0a', border: `1px solid ${T.amber} 22`, borderRadius: 6, padding: 11, marginBottom: 16 }}>⚠ Memory only — data is permanently lost on refresh or tab close</div>
               {(() => {
-                // Only show meaningful events: peer connect/disconnect, messages sent by me, files sent/received — no internal sys noise
+                // Filter out chat text, folders, and standard files — show ONLY system, security, and errors
                 const events = Object.entries(msgs)
-                  .flatMap(([pid, ms]) => ms
-                    .filter(m => {
-                      if (m.type === 'sys') return m.text.includes('channel open') || m.text.includes('closed') // only connection events
-                      if (m.type === 'text') return true
-                      if (['file_out', 'file_done'].includes(m.type)) return true
-                      if (m.type === 'folder') return true
-                      return false
-                    })
-                    .map(m => ({ ...m, pid }))
-                  )
-                  .sort((a, b) => a.id - b.id)
-                if (!events.length) return <div style={{ color: T.null_, fontSize: 13, textAlign: 'center', marginTop: 48 }}>No history yet.</div>
+                  .flatMap(([pid, ms]) => ms.map(m => ({ ...m, pid })))
+                  .filter(m => m.type === 'sys' || m.type === 'err' || m.type === 'handshake')
+                  .sort((a, b) => b.id - a.id)
+
+                if (!events.length) return <div style={{ color: T.null_, fontSize: 13, textAlign: 'center', marginTop: 48 }}>No system or security logs yet.</div>
+
                 return events.map((ev, i) => {
-                  const dot = ev.type === 'sys' ? T.accent : ev.from === 'me' ? T.blue : T.green
-                  let label
-                  if (ev.type === 'sys') label = ev.text.includes('open') ? `Connected to peer [${ev.pid}]` : `Disconnected from peer [${ev.pid}]`
-                  else if (ev.type === 'text') label = ev.from === 'me' ? `You → [${ev.pid}]:  ${ev.text.slice(0, 80)}${ev.text.length > 80 ? '…' : ''}` : `[${ev.pid}] → You:  ${ev.text.slice(0, 80)}${ev.text.length > 80 ? '…' : ''}`
-                  else if (ev.type === 'file_out') label = `You sent file to [${ev.pid}]: ${ev.meta?.name} (${fmtSz(ev.meta?.size || 0)})`
-                  else if (ev.type === 'file_done') label = `Received file from [${ev.pid}]: ${ev.meta?.name} (${fmtSz(ev.meta?.size || 0)})`
-                  else if (ev.type === 'folder') label = ev.from === 'me' ? `You shared folder to [${ev.pid}]: ${ev.folder?.name}` : `[${ev.pid}] shared folder: ${ev.folder?.name}`
+                  const dot = ev.type === 'err' ? T.red : T.accent
+                  let label = ev.text || 'System event'
+                  // If connection event, format cleanly:
+                  if (ev.type === 'sys') {
+                    if (label.includes('channel open')) label = `Connected + Authenticated`
+                    else if (label.includes('disconnected') || label.includes('closed')) label = `Connection Dropped`
+                  }
                   return (
                     <div key={i} className="card" style={{ display: 'flex', gap: 12, padding: '10px 16px', marginBottom: 5 }}>
                       <span style={{ fontSize: 11, color: T.textDim, flexShrink: 0, width: 68, fontVariantNumeric: 'tabular-nums' }}>{ev.time}</span>
                       <div style={{ width: 6, height: 6, borderRadius: '50%', background: dot, marginTop: 5, flexShrink: 0 }} />
-                      <span style={{ fontSize: 12, color: T.textMid, flex: 1, wordBreak: 'break-word' }}>{label}</span>
+                      <span style={{ fontSize: 12, color: T.textMid, flex: 1, wordBreak: 'break-word' }}>[Peer {ev.pid}] — {label}</span>
                     </div>
                   )
                 })
@@ -1267,7 +1454,8 @@ export default function App() {
                 {[
                   { l: 'Display Name', v: account?.name },
                   { l: 'Node ID', v: myId.current, c: T.accent },
-                  { l: 'Local IP', v: localIP === 'detecting…' ? 'Detecting…' : localIP, c: T.accent },
+                  { l: 'Public IP', v: publicIP === 'detecting…' ? 'Detecting…' : publicIP, c: T.accent },
+                  { l: 'Local IP', v: localIP === 'detecting…' ? 'Detecting…' : localIP, c: T.text },
                   { l: 'MAC Address', v: 'N/A  (browsers block MAC access for privacy)', c: T.null_ },
                   { l: 'ECDH Public Key', v: (keyRef.current?.pub || '').slice(0, 52) + '…', c: T.textDim },
                   { l: 'Session Crypto', v: 'ECDH P-256 + AES-GCM-256', c: T.green },
@@ -1275,7 +1463,7 @@ export default function App() {
                   { l: 'Password', v: '✓ set (hidden)', c: T.green },
                   { l: 'Session started', v: new Date(Date.now() - uptime * 1000).toLocaleTimeString() },
                 ].map(d => (
-                  <div key={d.l} style={{ display: 'grid', gridTemplateColumns: '170px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border}` }}>
+                  <div key={d.l} style={{ display: 'grid', gridTemplateColumns: '170px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border} ` }}>
                     <span style={{ fontSize: 12, color: T.textDim }}>{d.l}</span>
                     <span style={{ fontSize: 12, color: d.c || T.text, wordBreak: 'break-all' }}>{d.v}</span>
                   </div>
@@ -1305,7 +1493,7 @@ export default function App() {
                         <span style={{ fontSize: 13, color: T.text }}>{t.name}</span>
                         <span style={{ fontSize: 12, color: T.accent }}>{Math.round(t.pct * 100)}%</span>
                       </div>
-                      <div className="prog-track"><div className="prog-fill" style={{ width: `${t.pct * 100}%` }} /></div>
+                      <div className="prog-track"><div className="prog-fill" style={{ width: `${t.pct * 100}% ` }} /></div>
                     </div>
                   ))}
                 </div>
@@ -1318,8 +1506,8 @@ export default function App() {
             <div style={{ flex: 1, padding: 20, overflowY: 'auto' }} className="fadein">
               <div style={{ fontSize: 12, color: T.accentDim, letterSpacing: 3, marginBottom: 16, fontWeight: 700 }}>⚙ SYSTEM / DEV INFO</div>
               <div className="card" style={{ padding: 18 }}>
-                {[{ l: 'Browser', v: navigator.userAgent.slice(0, 60) + '…' }, { l: 'WebRTC', v: typeof RTCPeerConnection !== 'undefined' ? '✓ Supported' : '✗ Unsupported', c: typeof RTCPeerConnection !== 'undefined' ? T.green : T.red }, { l: 'WebCrypto', v: typeof crypto.subtle !== 'undefined' ? '✓ Supported' : '✗ Unsupported', c: typeof crypto.subtle !== 'undefined' ? T.green : T.red }, { l: 'DataChannel', v: 'Ordered SCTP (reliable)' }, { l: 'STUN Servers', v: 'Google, Cloudflare, STUNProtocol' }, { l: 'Chunk Size', v: fmtSz(settings.chunkSize) }, { l: 'Spam Limit', v: `${settings.spamLimit} msgs/min/peer` }, { l: 'Code Execution', v: 'Disabled — display only' }, { l: 'Persistence', v: 'None — memory only' }, { l: 'Archive Sandbox', v: settings.archiveWarn ? 'Enabled' : 'Disabled' }].map(d => (
-                  <div key={d.l} style={{ display: 'flex', gap: 14, padding: '9px 0', borderBottom: `1px solid ${T.border}` }}>
+                {[{ l: 'Browser', v: navigator.userAgent.slice(0, 60) + '…' }, { l: 'WebRTC', v: typeof RTCPeerConnection !== 'undefined' ? '✓ Supported' : '✗ Unsupported', c: typeof RTCPeerConnection !== 'undefined' ? T.green : T.red }, { l: 'WebCrypto', v: typeof crypto.subtle !== 'undefined' ? '✓ Supported' : '✗ Unsupported', c: typeof crypto.subtle !== 'undefined' ? T.green : T.red }, { l: 'DataChannel', v: 'Ordered SCTP (reliable)' }, { l: 'STUN Servers', v: 'Google, Cloudflare, STUNProtocol' }, { l: 'Chunk Size', v: fmtSz(settings.chunkSize) }, { l: 'Spam Limit', v: `${settings.spamLimit} msgs / min / peer` }, { l: 'Code Execution', v: 'Disabled — display only' }, { l: 'Persistence', v: 'None — memory only' }, { l: 'Archive Sandbox', v: settings.archiveWarn ? 'Enabled' : 'Disabled' }].map(d => (
+                  <div key={d.l} style={{ display: 'flex', gap: 14, padding: '9px 0', borderBottom: `1px solid ${T.border} ` }}>
                     <div style={{ fontSize: 11, color: T.textDim, width: 150, flexShrink: 0 }}>{d.l}</div>
                     <div style={{ fontSize: 12, color: d.c || T.text }}>{d.v}</div>
                   </div>
@@ -1335,7 +1523,7 @@ export default function App() {
               <div className="card" style={{ padding: 18, marginBottom: 12 }}>
                 <div style={{ fontSize: 11, color: T.textDim, letterSpacing: 2, marginBottom: 12, fontWeight: 700 }}>SECURITY</div>
                 {[{ k: 'lockTimeout', l: 'Auto-lock timeout (minutes)', min: 1, max: 60, step: 1 }, { k: 'maxAttempts', l: 'Max unlock attempts before wipe', min: 1, max: 10, step: 1 }].map(s => (
-                  <div key={s.k} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 0', borderBottom: `1px solid ${T.border}` }}>
+                  <div key={s.k} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 0', borderBottom: `1px solid ${T.border} ` }}>
                     <div style={{ flex: 1, fontSize: 13, color: T.text }}>{s.l}</div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <button onClick={() => setSett(s.k, Math.max(s.min, settings[s.k] - s.step))} className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 15 }}>−</button>
@@ -1348,12 +1536,12 @@ export default function App() {
               <div className="card" style={{ padding: 18, marginBottom: 12 }}>
                 <div style={{ fontSize: 11, color: T.textDim, letterSpacing: 2, marginBottom: 12, fontWeight: 700 }}>TRANSFER</div>
                 {[{ k: 'chunkSize', l: 'Chunk size', opts: [8192, 16384, 32768, 65536], fmt: v => fmtSz(v) }, { k: 'spamLimit', l: 'Spam limit (msgs/min/peer)', opts: [50, 100, 200, 500], fmt: v => String(v) }].map(s => (
-                  <div key={s.k} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 0', borderBottom: `1px solid ${T.border}` }}>
+                  <div key={s.k} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 0', borderBottom: `1px solid ${T.border} ` }}>
                     <div style={{ flex: 1, fontSize: 13, color: T.text }}>{s.l}</div>
                     <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                       {s.opts.map(o => (
                         <button key={o} onClick={() => setSett(s.k, o)} className="btn btn-xs"
-                          style={{ background: settings[s.k] === o ? T.accent + '22' : 'transparent', border: `1px solid ${settings[s.k] === o ? T.accent : T.border}`, color: settings[s.k] === o ? T.accent : T.textDim }}>
+                          style={{ background: settings[s.k] === o ? T.accent + '22' : 'transparent', border: `1px solid ${settings[s.k] === o ? T.accent : T.border} `, color: settings[s.k] === o ? T.accent : T.textDim, minWidth: 44 }}>
                           {s.fmt(o)}
                         </button>
                       ))}
@@ -1364,10 +1552,10 @@ export default function App() {
               <div className="card" style={{ padding: 18, marginBottom: 20 }}>
                 <div style={{ fontSize: 11, color: T.textDim, letterSpacing: 2, marginBottom: 12, fontWeight: 700 }}>FEATURES</div>
                 {[{ k: 'mdRender', l: 'Markdown rendering in chat' }, { k: 'linkWarn', l: 'External link warnings' }, { k: 'archiveWarn', l: 'Archive sandbox warnings' }].map(s => (
-                  <div key={s.k} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 0', borderBottom: `1px solid ${T.border}` }}>
+                  <div key={s.k} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 0', borderBottom: `1px solid ${T.border} ` }}>
                     <div style={{ flex: 1, fontSize: 13, color: T.text }}>{s.l}</div>
                     <button onClick={() => setSett(s.k, !settings[s.k])} className="btn btn-xs"
-                      style={{ background: settings[s.k] ? T.accent + '18' : 'transparent', border: `1px solid ${settings[s.k] ? T.accent : T.border}`, color: settings[s.k] ? T.accent : T.textDim, minWidth: 44 }}>
+                      style={{ background: settings[s.k] ? T.accent + '18' : 'transparent', border: `1px solid ${settings[s.k] ? T.accent : T.border} `, color: settings[s.k] ? T.accent : T.textDim, minWidth: 44 }}>
                       {settings[s.k] ? 'ON' : 'OFF'}
                     </button>
                   </div>
@@ -1379,12 +1567,12 @@ export default function App() {
         </div>
 
         {/* RIGHT PANEL — full-screen when peer selected, narrow peer list otherwise */}
-        <div className="rpanel" style={{ width: selPeer ? '100%' : 300, borderLeft: `1px solid ${T.border}`, display: 'flex', flexDirection: 'column', background: T.surface, transition: 'width .2s ease', overflow: 'hidden' }}>
+        <div className="rpanel" style={{ width: selPeer ? '100%' : 300, borderLeft: `1px solid ${T.border} `, display: 'flex', flexDirection: 'column', background: T.surface, transition: 'width .2s ease', overflow: 'hidden' }}>
 
           {/* PEERS LIST */}
           {!selPeer ? (
             <>
-              <div style={{ padding: '14px 16px', borderBottom: `1px solid ${T.border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+              <div style={{ padding: '14px 16px', borderBottom: `1px solid ${T.border} `, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
                 <div style={{ fontSize: 13, color: T.accentDim, fontWeight: 700, letterSpacing: 1 }}>PEERS</div>
                 <div style={{ fontSize: 11, color: T.textDim }}>{onlinePeers.length} online · {peers.length} total</div>
               </div>
@@ -1403,7 +1591,7 @@ export default function App() {
                           : T.null_
                   const stateLabel = peer.iceState || peer.state || 'idle'
                   return (
-                    <div key={peer.id} className={`prow ${selPeer?.id === peer.id ? 'sel' : ''}`} style={{ position: 'relative' }}>
+                    <div key={peer.id} className={`prow ${selPeer?.id === peer.id ? 'sel' : ''} `} style={{ position: 'relative' }}>
                       <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 12 }} onClick={() => setSelPeer(peer)}>
                         <Avatar name={peer.name} id={peer.id} size={44} online={peer.online} />
                         <div style={{ flex: 1, minWidth: 0 }}>
@@ -1411,18 +1599,18 @@ export default function App() {
                             {peer.name || 'Anonymous'}
                           </div>
                           <div style={{ fontSize: 10, color: iceCol, marginTop: 2, display: 'flex', alignItems: 'center', gap: 5 }}>
-                            <span style={{ background: iceCol + '18', border: `1px solid ${iceCol}40`, borderRadius: 3, padding: '1px 5px' }}>{stateLabel}</span>
+                            <span style={{ background: iceCol + '18', border: `1px solid ${iceCol} 40`, borderRadius: 3, padding: '1px 5px' }}>{stateLabel}</span>
                             {peer.fingerprint && <span style={{ color: T.null_, fontFamily: 'monospace', letterSpacing: 0 }}>🔑 {peer.fingerprint}</span>}
                           </div>
                         </div>
                         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
-                          <div className={`dot ${peer.online ? 'dot-on' : 'dot-off'}`} />
+                          <div className={`dot ${peer.online ? 'dot-on' : 'dot-off'} `} />
                           <div style={{ fontSize: 10, color: peer.online ? T.green : T.null_ }}>{peer.online ? 'LIVE' : 'OFF'}</div>
                         </div>
                       </div>
                       <button onClick={e => { e.stopPropagation(); doDeletePeer(peer.id) }}
                         title="Remove peer"
-                        style={{ marginLeft: 8, background: 'transparent', border: `1px solid ${T.border}`, color: T.red, borderRadius: 4, padding: '3px 7px', fontSize: 11, flexShrink: 0, cursor: 'pointer', opacity: .7 }}
+                        style={{ marginLeft: 8, background: 'transparent', border: `1px solid ${T.border} `, color: T.red, borderRadius: 4, padding: '3px 7px', fontSize: 11, flexShrink: 0, cursor: 'pointer', opacity: .7 }}
                         onMouseEnter={e => e.currentTarget.style.opacity = '1'}
                         onMouseLeave={e => e.currentTarget.style.opacity = '.7'}>
                         ✕
@@ -1436,7 +1624,7 @@ export default function App() {
             /* CHAT PANEL — FULL WhatsApp STYLE */
             <>
               {/* Chat header */}
-              <div style={{ padding: '11px 16px', borderBottom: `1px solid ${T.border}`, display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0, background: T.panel }}>
+              <div style={{ padding: '11px 16px', borderBottom: `1px solid ${T.border} `, display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0, background: T.panel }}>
                 <button onClick={() => setSelPeer(null)} style={{ background: 'none', border: 'none', color: T.textDim, fontSize: 20, padding: '2px 4px', lineHeight: 1 }}>←</button>
                 <Avatar name={selPeer.name} id={selPeer.id} size={42} online={selPeer.online} />
                 <div style={{ flex: 1, minWidth: 0 }}>
@@ -1450,7 +1638,7 @@ export default function App() {
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                  {selPeer.online && <div style={{ fontSize: 10, color: T.green, background: T.green + '12', border: `1px solid ${T.green}30`, borderRadius: 4, padding: '3px 8px' }}>● LIVE</div>}
+                  {selPeer.online && <div style={{ fontSize: 10, color: T.green, background: T.green + '12', border: `1px solid ${T.green} 30`, borderRadius: 4, padding: '3px 8px' }}>● LIVE</div>}
                   <button onClick={() => doDeletePeer(selPeer.id)}
                     title="Remove this peer"
                     className="btn btn-danger btn-sm"
@@ -1466,7 +1654,7 @@ export default function App() {
                   <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.from === 'me' ? 'flex-end' : msg.from === 'sys' ? 'center' : 'flex-start' }} className="fadein">
                     {msg.type === 'sys' && <div className="bub bub-sys">{msg.text}</div>}
                     {msg.type === 'text' && (
-                      <div className={`bub ${msg.from === 'me' ? 'bub-me' : 'bub-them'}`}>
+                      <div className={`bub ${msg.from === 'me' ? 'bub-me' : 'bub-them'} `}>
                         <div style={{ color: T.text }} dangerouslySetInnerHTML={{ __html: settings.mdRender ? renderMD(msg.text) : escH(msg.text).replace(/\n/g, '<br>') }} />
                         <div style={{ fontSize: 10, color: T.textDim, marginTop: 5, textAlign: 'right', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 5 }}>
                           {msg.time}
@@ -1474,8 +1662,8 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                    {['file_out', 'file_in', 'file_done'].includes(msg.type) && <FileMsg msg={msg} onSandbox={(m) => setSandboxFile(m)} />}
-                    {msg.type === 'folder' && <FolderMsg msg={msg} onOpen={() => setFolderView(msg.folder)} />}
+                    {['file_out', 'file_in', 'file_done'].includes(msg.type) && <FileMsg msg={msg} onSandbox={(m) => setSandboxFile(m)} onRevoke={doRevoke} />}
+                    {msg.type === 'folder' && <FolderMsg msg={msg} onOpen={() => setFolderView(msg.folder)} onRevoke={doRevoke} />}
                   </div>
                 ))}
                 <div ref={chatEnd} />
@@ -1483,22 +1671,22 @@ export default function App() {
 
               {/* Active in-progress transfers for this peer */}
               {Object.values(transfers).filter(t => t.pid === selPeer?.id).map(t => (
-                <div key={t.name} style={{ padding: '6px 14px', background: T.surface, borderTop: `1px solid ${T.border}` }}>
+                <div key={t.name} style={{ padding: '6px 14px', background: T.surface, borderTop: `1px solid ${T.border} ` }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
                     <span style={{ fontSize: 11, color: T.textDim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '75%' }}>{t.name}</span>
                     <span style={{ fontSize: 11, color: T.accent, fontVariantNumeric: 'tabular-nums' }}>{Math.round(t.pct * 100)}%</span>
                   </div>
-                  <div className="prog-track"><div className="prog-fill" style={{ width: `${t.pct * 100}%` }} /></div>
+                  <div className="prog-track"><div className="prog-fill" style={{ width: `${t.pct * 100}% ` }} /></div>
                 </div>
               ))}
 
               {/* Input area */}
-              <div style={{ padding: '10px 12px', borderTop: `1px solid ${T.border}`, background: T.surface, flexShrink: 0 }}>
+              <div style={{ padding: '10px 12px', borderTop: `1px solid ${T.border} `, background: T.surface, flexShrink: 0 }}>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', position: 'relative' }}>
                   {/* ATTACH BUTTON */}
                   <div style={{ position: 'relative', flexShrink: 0 }}>
                     <button onClick={() => setShowAttach(a => !a)}
-                      style={{ width: 40, height: 40, borderRadius: 10, background: showAttach ? T.accent + '22' : T.panel, border: `1px solid ${showAttach ? T.accent : T.border}`, color: showAttach ? T.accent : T.textDim, fontSize: 22, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all .15s' }}>
+                      style={{ width: 40, height: 40, borderRadius: 10, background: showAttach ? T.accent + '22' : T.panel, border: `1px solid ${showAttach ? T.accent : T.border} `, color: showAttach ? T.accent : T.textDim, fontSize: 22, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all .15s' }}>
                       ⊕
                     </button>
                     {showAttach && (
@@ -1514,12 +1702,12 @@ export default function App() {
                   <textarea value={input} onChange={e => setInput(e.target.value)}
                     onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend() } }}
                     placeholder="Message… Markdown supported · Shift+Enter for newline" rows={2}
-                    style={{ flex: 1, background: T.bg, border: `1px solid ${T.border}`, borderRadius: 10, padding: '10px 14px', color: T.text, fontFamily: 'inherit', fontSize: 13, resize: 'none', lineHeight: 1.5, transition: 'border-color .15s' }}
+                    style={{ flex: 1, background: T.bg, border: `1px solid ${T.border} `, borderRadius: 10, padding: '10px 14px', color: T.text, fontFamily: 'inherit', fontSize: 13, resize: 'none', lineHeight: 1.5, transition: 'border-color .15s' }}
                     onFocus={e => e.target.style.borderColor = T.accentDim} onBlur={e => e.target.style.borderColor = T.border} />
 
                   {/* SEND BUTTON */}
                   <button onClick={doSend}
-                    style={{ width: 40, height: 40, borderRadius: 10, background: input.trim() ? T.accent : T.panel, border: `1px solid ${input.trim() ? T.accent : T.border}`, color: input.trim() ? T.bg : T.textDim, fontSize: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, transition: 'all .15s', fontWeight: 700 }}>
+                    style={{ width: 40, height: 40, borderRadius: 10, background: input.trim() ? T.accent : T.panel, border: `1px solid ${input.trim() ? T.accent : T.border} `, color: input.trim() ? T.bg : T.textDim, fontSize: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, transition: 'all .15s', fontWeight: 700 }}>
                     ↑
                   </button>
                 </div>
