@@ -74,3 +74,15 @@ export const toB64 = (buf) =>
 
 export const fromB64 = (b64) =>
   Uint8Array.from(atob(b64), c => c.charCodeAt(0))
+
+/**
+ * Compute a short SHA-256 fingerprint of an exported ECDH public key (base-64).
+ * Returned as "XX:XX:XX:XX:XX:XX:XX:XX" (first 8 bytes of sha-256, colon-separated hex).
+ * Every session generates a fresh key pair → the fingerprint is always unique.
+ */
+export async function keyFingerprint(pubKeyB64) {
+  const raw = fromB64(pubKeyB64)
+  const digest = await crypto.subtle.digest('SHA-256', raw)
+  const bytes = Array.from(new Uint8Array(digest)).slice(0, 8)
+  return bytes.map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(':')
+}

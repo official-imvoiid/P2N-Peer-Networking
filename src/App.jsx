@@ -640,7 +640,14 @@ export default function App() {
         setPeers(ps => ps.map(p => p.id === pid ? { ...p, online: false, state: 'disconnected' } : p))
         pushMsg(pid, { id: Date.now(), from: 'sys', text: 'Peer disconnected.', time: now8(), type: 'sys' })
       },
-      onState(pid, state) { setPeers(ps => ps.map(p => p.id === pid ? { ...p, state } : p)) },
+      onState(pid, state) {
+        // ICE connection state — show in peer row
+        setPeers(ps => ps.map(p => p.id === pid ? { ...p, iceState: state } : p))
+      },
+      onConnState(pid, state) {
+        // RTCPeerConnection overall state
+        setPeers(ps => ps.map(p => p.id === pid ? { ...p, connState: state } : p))
+      },
       onMsg(pid, msg) {
         if (msg.type === 'folder_share') pushMsg(pid, { id: Date.now(), from: 'them', type: 'folder', folder: msg.folder, time: now8() })
         else pushMsg(pid, { id: Date.now(), from: 'them', text: msg.text, time: now8(), type: 'text' })
@@ -715,8 +722,10 @@ export default function App() {
   const doOffer = async () => {
     setGenMode('loading')
     try {
-      const { tempId, offerB64 } = await p2pRef.current.createOffer(keyRef.current.keyPair, myId.current)
+      const { tempId, offerB64, fingerprint } = await p2pRef.current.createOffer(keyRef.current.keyPair, myId.current)
       setPendId(tempId); setGenCode(offerB64); setInitiatorCode(offerB64); setGenMode('offering')
+      // Add a pending peer entry with fingerprint
+      setPeers(ps => [...ps.filter(p => p.id !== tempId), { id: tempId, name: '', online: false, since: now8(), state: 'offering', fingerprint }])
       notify('Offer ready — share with peer', 'info')
     } catch (e) { notify('Offer failed: ' + e.message, 'err'); setGenMode('idle') }
   }
@@ -725,9 +734,9 @@ export default function App() {
     if (!offerBox.trim()) { notify('Paste the offer first', 'err'); return }
     setGenMode('loading')
     try {
-      const { peerId, answerB64 } = await p2pRef.current.createAnswer(offerBox.trim(), keyRef.current.keyPair, myId.current)
+      const { peerId, answerB64, fingerprint } = await p2pRef.current.createAnswer(offerBox.trim(), keyRef.current.keyPair, myId.current)
       setGenCode(answerB64); setResponderCode(answerB64)
-      setPeers(ps => [...ps.filter(p => p.id !== peerId), { id: peerId, name: '', online: false, since: now8(), state: 'answering' }])
+      setPeers(ps => [...ps.filter(p => p.id !== peerId), { id: peerId, name: '', online: false, since: now8(), state: 'answering', fingerprint }])
       setGenMode('answering')
       notify('Answer ready — send back to peer', 'info')
     } catch (e) { notify('Answer failed: ' + e.message, 'err'); setGenMode('idle') }
@@ -1015,8 +1024,8 @@ export default function App() {
           {!sideSmall && <div style={{ padding: '8px 14px', borderTop: `1px solid ${T.border}`, fontSize: 10, color: T.null_, lineHeight: 1.8 }}>◈ WebRTC Direct P2P<br />◈ ECDH P-256 + AES-GCM-256</div>}
         </div>
 
-        {/* CENTER */}
-        <div className="cpanel" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        {/* CENTER — hidden when chat is open full-screen */}
+        <div className="cpanel" style={{ flex: 1, display: selPeer ? 'none' : 'flex', flexDirection: 'column', overflow: 'hidden' }}>
 
           {/* NETWORK */}
           {tab === 'network' && (
@@ -1125,7 +1134,10 @@ export default function App() {
                       <textarea readOnly value={initiatorCode} rows={4}
                         style={{ width: '100%', background: T.bg, border: `1px solid ${T.border}`, borderRadius: 5, padding: '8px 10px', color: T.accentDim, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 4 }}
                         onClick={e => e.target.select()} />
-                      <button onClick={() => { navigator.clipboard?.writeText(initiatorCode); notify('Offer copied to clipboard', 'ok') }} className="btn btn-ghost btn-xs" style={{ marginBottom: 10, width: '100%' }}>⎘ Copy to Clipboard</button>
+                      <button onClick={() => { navigator.clipboard?.writeText(initiatorCode); notify('Copied!', 'ok') }}
+                        className="btn btn-accent" style={{ marginBottom: 10, width: '100%', padding: 10, fontSize: 13, letterSpacing: 0.5 }}>
+                        ⎘ Copy Offer Code
+                      </button>
                       <div style={{ marginBottom: 12 }}><QR value={initiatorCode.slice(0, 180)} sz={8} /></div>
                       <div style={{ fontSize: 10, color: T.textDim, marginBottom: 5, letterSpacing: 1 }}>PASTE PEER'S ANSWER</div>
                       <textarea value={ansBox} onChange={e => setAnsBox(e.target.value)} rows={4}
@@ -1163,7 +1175,10 @@ export default function App() {
                       <textarea readOnly value={responderCode} rows={4}
                         style={{ width: '100%', background: T.bg, border: `1px solid ${T.border}`, borderRadius: 5, padding: '8px 10px', color: T.purple, fontSize: 10, resize: 'vertical', fontFamily: 'inherit', marginBottom: 4 }}
                         onClick={e => e.target.select()} />
-                      <button onClick={() => { navigator.clipboard?.writeText(responderCode); notify('Answer copied to clipboard', 'ok') }} className="btn btn-ghost btn-xs" style={{ width: '100%' }}>⎘ Copy to Clipboard</button>
+                      <button onClick={() => { navigator.clipboard?.writeText(responderCode); notify('Copied!', 'ok') }}
+                        className="btn btn-accent" style={{ width: '100%', padding: 10, fontSize: 13, letterSpacing: 0.5 }}>
+                        ⎘ Copy Answer Code
+                      </button>
                     </div>
                   )}
                 </div>
@@ -1339,8 +1354,8 @@ export default function App() {
           )}
         </div>
 
-        {/* RIGHT PANEL — WHATSAPP STYLE */}
-        <div className="rpanel" style={{ width: selPeer ? 420 : 300, borderLeft: `1px solid ${T.border}`, display: 'flex', flexDirection: 'column', background: T.surface, transition: 'width .2s ease' }}>
+        {/* RIGHT PANEL — full-screen when peer selected, narrow peer list otherwise */}
+        <div className="rpanel" style={{ width: selPeer ? '100%' : 300, borderLeft: `1px solid ${T.border}`, display: 'flex', flexDirection: 'column', background: T.surface, transition: 'width .2s ease', overflow: 'hidden' }}>
 
           {/* PEERS LIST */}
           {!selPeer ? (
@@ -1356,30 +1371,41 @@ export default function App() {
                     <span style={{ fontSize: 12 }}>Use "Connect Peer" tab<br />to establish P2P.</span>
                   </div>
                 )}
-                {peers.map(peer => (
-                  <div key={peer.id} className={`prow ${selPeer?.id === peer.id ? 'sel' : ''}`} style={{ position: 'relative' }}>
-                    <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 12 }} onClick={() => setSelPeer(peer)}>
-                      <Avatar name={peer.name} id={peer.id} size={44} online={peer.online} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 14, color: peer.name ? T.text : T.null_, fontWeight: peer.name ? 600 : 400, fontStyle: peer.name ? 'normal' : 'italic', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {peer.name || 'Anonymous'}
+                {peers.map(peer => {
+                  const iceCol = peer.iceState === 'connected' || peer.iceState === 'completed' ? T.green
+                    : peer.iceState === 'checking' ? T.amber
+                      : peer.iceState === 'failed' ? T.red
+                        : peer.iceState === 'disconnected' ? T.amber
+                          : T.null_
+                  const stateLabel = peer.iceState || peer.state || 'idle'
+                  return (
+                    <div key={peer.id} className={`prow ${selPeer?.id === peer.id ? 'sel' : ''}`} style={{ position: 'relative' }}>
+                      <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 12 }} onClick={() => setSelPeer(peer)}>
+                        <Avatar name={peer.name} id={peer.id} size={44} online={peer.online} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 14, color: peer.name ? T.text : T.null_, fontWeight: peer.name ? 600 : 400, fontStyle: peer.name ? 'normal' : 'italic', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {peer.name || 'Anonymous'}
+                          </div>
+                          <div style={{ fontSize: 10, color: iceCol, marginTop: 2, display: 'flex', alignItems: 'center', gap: 5 }}>
+                            <span style={{ background: iceCol + '18', border: `1px solid ${iceCol}40`, borderRadius: 3, padding: '1px 5px' }}>{stateLabel}</span>
+                            {peer.fingerprint && <span style={{ color: T.null_, fontFamily: 'monospace', letterSpacing: 0 }}>🔑 {peer.fingerprint}</span>}
+                          </div>
                         </div>
-                        <div style={{ fontSize: 11, color: T.textDim, marginTop: 1 }}>{peer.id} · {peer.state}</div>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+                          <div className={`dot ${peer.online ? 'dot-on' : 'dot-off'}`} />
+                          <div style={{ fontSize: 10, color: peer.online ? T.green : T.null_ }}>{peer.online ? 'LIVE' : 'OFF'}</div>
+                        </div>
                       </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
-                        <div className={`dot ${peer.online ? 'dot-on' : 'dot-off'}`} />
-                        <div style={{ fontSize: 10, color: peer.online ? T.green : T.null_ }}>{peer.online ? 'LIVE' : 'OFF'}</div>
-                      </div>
+                      <button onClick={e => { e.stopPropagation(); doDeletePeer(peer.id) }}
+                        title="Remove peer"
+                        style={{ marginLeft: 8, background: 'transparent', border: `1px solid ${T.border}`, color: T.red, borderRadius: 4, padding: '3px 7px', fontSize: 11, flexShrink: 0, cursor: 'pointer', opacity: .7 }}
+                        onMouseEnter={e => e.currentTarget.style.opacity = '1'}
+                        onMouseLeave={e => e.currentTarget.style.opacity = '.7'}>
+                        ✕
+                      </button>
                     </div>
-                    <button onClick={e => { e.stopPropagation(); doDeletePeer(peer.id) }}
-                      title="Remove peer"
-                      style={{ marginLeft: 8, background: 'transparent', border: `1px solid ${T.border}`, color: T.red, borderRadius: 4, padding: '3px 7px', fontSize: 11, flexShrink: 0, cursor: 'pointer', opacity: .7 }}
-                      onMouseEnter={e => e.currentTarget.style.opacity = '1'}
-                      onMouseLeave={e => e.currentTarget.style.opacity = '.7'}>
-                      ✕
-                    </button>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             </>
           ) : (
