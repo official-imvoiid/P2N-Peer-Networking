@@ -151,31 +151,59 @@ function renderMD(text) {
 async function detectIP() {
   return new Promise(resolve => {
     try {
-      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      })
       pc.createDataChannel('')
       const ips = new Set()
+      const mdnsHosts = new Set()
+      let resolved = false
+
+      const finish = () => {
+        if (resolved) return
+        resolved = true
+        pc.close()
+        if (ips.size) resolve([...ips].join(', '))
+        else if (mdnsHosts.size) resolve('mDNS (browser hides local IP)')
+        else resolve('N/A')
+      }
+
       pc.onicecandidate = e => {
-        if (!e?.candidate) {
-          pc.close()
-          resolve(ips.size ? [...ips].join(', ') : 'N/A')
-          return
-        }
-        // Match IPv4 in candidate string
-        const m = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/.exec(e.candidate.candidate)
-        if (m) {
-          const ip = m[1]
-          // Keep private/LAN addresses only (not 127.x loopback)
+        if (!e?.candidate) { finish(); return }
+        const cand = e.candidate.candidate
+        // Private IPv4 ranges
+        const m4 = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/.exec(cand)
+        if (m4) {
+          const ip = m4[1]
           if (
-            ip.startsWith('192.168.') ||
-            ip.startsWith('10.') ||
-            ip.startsWith('169.254.') ||
-            /^172\.(1[6-9]|2\d|3[01])\./.test(ip)
+            ip.startsWith('192.168.') || ip.startsWith('10.') ||
+            ip.startsWith('169.254.') || /^172\.(1[6-9]|2\d|3[01])\./.test(ip)
           ) ips.add(ip)
         }
+        // mDNS — Chrome 80+ replaces host IPs with *.local names for privacy
+        const mDNS = /([a-f0-9-]{8,}\.local)/.exec(cand)
+        if (mDNS) mdnsHosts.add(mDNS[1])
       }
-      pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => resolve('N/A'))
-      // Fallback after 5 seconds
-      setTimeout(() => { pc.close(); resolve(ips.size ? [...ips].join(', ') : 'N/A') }, 5000)
+
+      pc.createOffer()
+        .then(o => {
+          // Also scan raw SDP for c= connection lines — some browsers embed IP there
+          const sdpLines = (o.sdp || '').split(/\r?\n/)
+          for (const line of sdpLines) {
+            const m = /^c=IN IP4 (.+)$/.exec(line.trim())
+            if (m && m[1] !== '0.0.0.0') {
+              const ip = m[1]
+              if (ip.startsWith('192.168.') || ip.startsWith('10.') ||
+                  ip.startsWith('169.254.') || /^172\.(1[6-9]|2\d|3[01])\./.test(ip)) {
+                ips.add(ip)
+              }
+            }
+          }
+          return pc.setLocalDescription(o)
+        })
+        .catch(() => finish())
+
+      setTimeout(finish, 5000)
     } catch { resolve('N/A') }
   })
 }
@@ -779,6 +807,8 @@ export default function App() {
   const [uptime, setUptime] = useState(0)
   const [lockTimer, setLockTimer] = useState(900)
   const [sandboxFile, setSandboxFile] = useState(null)
+  const [editingName, setEditingName] = useState(false)
+  const [nameInput, setNameInput] = useState('')
 
   const p2pRef = useRef(null)
   const keyRef = useRef(null)
@@ -794,6 +824,7 @@ export default function App() {
 
   // refresh protection
   const screenRef = useRef(screen)
+  const beforeUnloadHandlerRef = useRef(null)
   useEffect(() => { screenRef.current = screen }, [screen])
   useEffect(() => {
     const h = e => {
@@ -804,9 +835,26 @@ export default function App() {
         return msg
       }
     }
+    beforeUnloadHandlerRef.current = h
     window.addEventListener('beforeunload', h)
     return () => window.removeEventListener('beforeunload', h)
   }, [])  // mount-once — uses ref internally
+
+  // Soft refresh — re-detect IPs, reset stuck UI states, keep all session data intact
+  const doSoftRefresh = useCallback(() => {
+    setLocalIP('detecting…')
+    setPublicIP('detecting…')
+    detectIP().then(setLocalIP)
+    fetch('https://api.ipify.org?format=json').then(r => r.json()).then(d => setPublicIP(d.ip)).catch(() => setPublicIP('Unavailable'))
+    // Reset any stuck connection flow states
+    setGenMode('idle')
+    setGenCode('')
+    setInitiatorCode('')
+    setResponderCode('')
+    setOfferBox('')
+    setAnsBox('')
+    notify('Program refreshed — IPs re-detected, UI state reset', 'ok')
+  }, [notify])
 
   // fetch IPs
   useEffect(() => {
@@ -836,14 +884,14 @@ export default function App() {
   // init P2P
   useEffect(() => {
     p2pRef.current = new P2PNode({
-      onOpen(pid) {
+      onOpen(pid, peerName) {
         setPeers(ps => {
           const ex = ps.find(p => p.id === pid)
-          if (ex) return ps.map(p => p.id === pid ? { ...p, online: true, state: 'connected' } : p)
-          return [...ps, { id: pid, name: '', online: true, since: now8(), state: 'connected' }]
+          if (ex) return ps.map(p => p.id === pid ? { ...p, online: true, state: 'connected', name: p.name || peerName || '' } : p)
+          return [...ps, { id: pid, name: peerName || '', online: true, since: now8(), state: 'connected' }]
         })
-        pushMsg(pid, { id: Date.now(), from: 'sys', text: '🔒 P2P channel open. AES-GCM-256 E2E active.', time: now8(), type: 'sys' })
-        notify('Peer connected — E2E encrypted', 'ok')
+        pushMsg(pid, { id: Date.now(), from: 'sys', text: `🔒 P2P channel open${peerName ? ` · Peer: ${peerName}` : ''}. AES-GCM-256 E2E active.`, time: now8(), type: 'sys' })
+        notify(`${peerName || 'Peer'} connected — E2E encrypted`, 'ok')
       },
       onClose(pid) {
         setPeers(ps => ps.map(p => p.id === pid ? { ...p, online: false, state: 'disconnected' } : p))
@@ -901,7 +949,7 @@ export default function App() {
     const e = {}
     if (!form.name.trim()) e.name = 'Required'
     if (!form.passphrase.trim()) e.passphrase = 'Required — use 🎲 to generate one'
-    if (!form.password || form.password.length < 8) e.password = 'Min 8 chars'
+    if (!form.password || form.password.length < 6) e.password = 'Min 6 chars'
     else if (!/[A-Z]/.test(form.password)) e.password = 'Needs 1 uppercase'
     else if (!/[a-z]/.test(form.password)) e.password = 'Needs 1 lowercase'
     else if (!/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(form.password)) e.password = 'Needs 1 special char'
@@ -1079,8 +1127,20 @@ export default function App() {
     pushMsg(selPeer.id, { id: Date.now(), from: 'me', text: codeBlock, time: now8(), type: 'text' })
   }
 
-  const setPeerName = (id, name) => setPeers(ps => ps.map(p => p.id === id ? { ...p, name } : p))
+  const setPeerName = (id, name) => {
+    setPeers(ps => ps.map(p => p.id === id ? { ...p, name } : p))
+    // Also keep selPeer in sync so the chat header updates immediately
+    setSelPeer(sp => sp?.id === id ? { ...sp, name } : sp)
+  }
   const setSett = (k, v) => setSettings(s => ({ ...s, [k]: v }))
+
+  // Change own display name — updates account + regenerates node ID
+  const doChangeUsername = (newName) => {
+    if (!newName.trim()) return
+    setAccount(a => ({ ...a, name: newName.trim() }))
+    myId.current = makeNodeId(newName.trim())
+    notify('Display name updated', 'ok')
+  }
 
   const onlinePeers = peers.filter(p => p.online)
   const peerMsgs = selPeer ? (msgs[selPeer.id] || []) : []
@@ -1136,12 +1196,13 @@ export default function App() {
           {/* Password — required */}
           <div style={{ marginBottom: 18 }}>
             <div style={{ fontSize: 11, marginBottom: 5, fontWeight: 500, display: 'flex', justifyContent: 'space-between', color: formErr.password ? T.red : T.textDim }}>
-              <span>Password <span style={{ color: T.red }}>*</span> <span style={{ fontWeight: 400, fontSize: 10 }}>(8+ chars: A-Z, a-z, @#$)</span></span>
+              <span>Password <span style={{ color: T.red }}>*</span> <span style={{ fontWeight: 400, fontSize: 10 }}>(6+ chars: A-Z, a-z, special)</span></span>
               {formErr.password && <span style={{ fontSize: 10 }}>{formErr.password}</span>}
             </div>
             <input value={form.password} type="password" placeholder="Second authentication factor" className={`inp${formErr.password ? ' err' : ''} `}
               onChange={e => { setForm(p => ({ ...p, password: e.target.value })); setFormErr(p => ({ ...p, password: '' })) }}
               onKeyDown={e => e.key === 'Enter' && doSetup()} />
+            <div style={{ fontSize: 10, color: T.textDim, marginTop: 4 }}>Must contain uppercase, lowercase &amp; special character. Write it down — it cannot be recovered.</div>
           </div>
           <div style={{ background: T.panel, border: `1px solid ${T.border} `, borderRadius: 6, padding: '10px 12px', marginBottom: 16, fontSize: 11, color: T.textDim, lineHeight: 1.8 }}>
             🔒 Auto-locks after {settings.lockTimeout} min inactivity · {settings.maxAttempts} wrong attempts = full session wipe
@@ -1214,7 +1275,7 @@ export default function App() {
           {onlinePeers.length ? `● ${onlinePeers.length} peer${onlinePeers.length > 1 ? 's' : ''} ` : ' ○ no peers'}
         </div>
         <button onClick={doLock} className="btn btn-amber btn-sm" style={{ gap: 6 }}>🔒 Lock</button>
-        <button onClick={() => setConfirm({ isTypeConfirm: true, targetWord: 'REFRESH', msg: '⚠ REFRESH PROGRAM? All peer connections and unsaved data will be permanently destroyed. This cannot be undone.', onYes: () => window.location.reload() })} className="btn btn-ghost btn-sm" title="Restart FTPS program">↻ Refresh</button>
+        <button onClick={doSoftRefresh} className="btn btn-ghost btn-sm" title="Refresh program — re-detect IPs, reset stuck states (no data lost)">↻ Refresh</button>
         <button onClick={() => setShowReadme(true)} className="btn btn-ghost btn-sm">DOCS</button>
       </div>
 
@@ -1252,16 +1313,38 @@ export default function App() {
               {/* Identity */}
               <div style={{ fontSize: 10, color: T.textDim, letterSpacing: 2, marginBottom: 8, fontWeight: 700 }}>NODE IDENTITY</div>
               <div className="card" style={{ marginBottom: 16, overflow: 'hidden' }}>
-                {[
-                  { l: 'Node ID', v: myId.current, c: T.accent },
-                  { l: 'Display Name', v: account?.name, c: T.text },
-                  { l: 'Session Crypto', v: 'ECDH P-256 key exchange · AES-GCM-256 encryption', c: T.green },
-                ].map(r => (
-                  <div key={r.l} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border} ` }}>
-                    <span style={{ fontSize: 12, color: T.textDim }}>{r.l}</span>
-                    <span style={{ fontSize: 12, color: r.c === T.accent ? T.accent : r.c || T.text, fontWeight: r.c === T.accent ? 700 : 400 }}>{r.v}</span>
+                {/* Node ID row */}
+                <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border}` }}>
+                  <span style={{ fontSize: 12, color: T.textDim }}>Node ID</span>
+                  <span style={{ fontSize: 12, color: T.accent, fontWeight: 700 }}>{myId.current}</span>
+                </div>
+                {/* Editable display name row */}
+                <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border}`, alignItems: 'center' }}>
+                  <span style={{ fontSize: 12, color: T.textDim }}>Display Name</span>
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    {editingName ? (
+                      <>
+                        <input autoFocus value={nameInput} onChange={e => setNameInput(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') { doChangeUsername(nameInput); setEditingName(false) } if (e.key === 'Escape') setEditingName(false) }}
+                          style={{ flex: 1, background: T.bg, border: `1px solid ${T.accentDim}`, borderRadius: 4, padding: '4px 8px', color: T.text, fontSize: 12, fontFamily: 'inherit' }} />
+                        <button onClick={() => { doChangeUsername(nameInput); setEditingName(false) }}
+                          className="btn btn-accent btn-xs">✓</button>
+                        <button onClick={() => setEditingName(false)} className="btn btn-ghost btn-xs">✕</button>
+                      </>
+                    ) : (
+                      <>
+                        <span style={{ fontSize: 12, color: T.text, flex: 1 }}>{account?.name}</span>
+                        <button onClick={() => { setNameInput(account?.name || ''); setEditingName(true) }}
+                          className="btn btn-ghost btn-xs" title="Change display name">✎ Edit</button>
+                      </>
+                    )}
                   </div>
-                ))}
+                </div>
+                {/* Session crypto row */}
+                <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border}` }}>
+                  <span style={{ fontSize: 12, color: T.textDim }}>Session Crypto</span>
+                  <span style={{ fontSize: 12, color: T.green }}>ECDH P-256 key exchange · AES-GCM-256 encryption</span>
+                </div>
               </div>
 
               {/* Network */}
@@ -1269,11 +1352,17 @@ export default function App() {
               <div className="card" style={{ marginBottom: 16, overflow: 'hidden' }}>
                 {[
                   { l: 'Public IP', v: publicIP === 'detecting…' ? 'Detecting via ipify.org…' : publicIP, c: publicIP === 'Unavailable' ? T.null_ : T.accent },
-                  { l: 'Local IP', v: localIP === 'detecting…' ? 'Detecting via WebRTC…' : localIP, c: localIP === 'N/A' || localIP.includes('.local') ? T.null_ : T.text },
+                  {
+                    l: 'Local IP',
+                    v: localIP === 'detecting…' ? 'Detecting via WebRTC…'
+                      : localIP.includes('mDNS') ? 'Hidden by browser (Chrome mDNS privacy mode)'
+                      : localIP,
+                    c: localIP === 'N/A' || localIP.includes('mDNS') || localIP === 'detecting…' ? T.null_ : T.text
+                  },
                   { l: 'MAC Address', v: 'Not accessible — blocked by all browsers (privacy protection)', c: T.null_ },
                   { l: 'Transport', v: 'WebRTC DataChannel (ordered SCTP, reliable)', c: T.blue },
-                  { l: 'Server relay', v: 'None — traffic is direct peer-to-peer', c: T.accent },
-                  { l: 'STUN servers', v: 'Google, Cloudflare, STUNProtocol (NAT discovery only)', c: T.textMid },
+                  { l: 'Relay fallback', v: 'TURN via openrelay + freestun + relay.metered.ca', c: T.textMid },
+                  { l: 'STUN servers', v: 'Google, Cloudflare, STUNProtocol (NAT discovery)', c: T.textMid },
                 ].map(r => (
                   <div key={r.l} style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: 16, padding: '11px 16px', borderBottom: `1px solid ${T.border} ` }}>
                     <span style={{ fontSize: 12, color: T.textDim }}>{r.l}</span>

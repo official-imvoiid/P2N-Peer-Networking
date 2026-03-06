@@ -21,28 +21,34 @@ import {
 } from './crypto.js'
 
 // ── ICE SERVERS ───────────────────────────────────────────────────────────────
-// STUN: discovers public IP for direct P2P (usually enough on most networks)
-// TURN: relay fallback — needed for symmetric NAT / VPNs / strict firewalls
+// STUN: discovers public IP for direct P2P (works on most home/office networks)
+// TURN: relay fallback — required for symmetric NAT, mobile data, corporate firewalls
+// Using multiple independent providers so if one is down the others still work.
 const ICE = [
-  // ── STUN only (no credentials) ────────────────────────────────────────────
+  // ── STUN — multiple providers for redundancy ──────────────────────────────
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' },
   { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'stun:stun.stunprotocol.org:3478' },
 
-  // ── TURN relay — openrelay.metered.ca (verified free public relay) ─────────
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:80?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turns:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  // ── TURN relay — Metered open relay (primary) ─────────────────────────────
+  { urls: 'turn:openrelay.metered.ca:80',              username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:80?transport=tcp',username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443',             username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp',username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turns:openrelay.metered.ca:443',            username: 'openrelayproject', credential: 'openrelayproject' },
 
-  // ── TURN relay — freestun.net (second free public relay, no signup) ─────────
-  { urls: 'turn:freestun.net:3479', username: 'free', credential: 'free' },
-  { urls: 'turn:freestun.net:5350', username: 'free', credential: 'free' },
+  // ── TURN relay — freestun.net (backup #1, no signup) ─────────────────────
+  { urls: 'turn:freestun.net:3479',  username: 'free', credential: 'free' },
+  { urls: 'turn:freestun.net:5350',  username: 'free', credential: 'free' },
   { urls: 'turns:freestun.net:5350', username: 'free', credential: 'free' },
+
+  // ── TURN relay — relay.metered.ca global (backup #2) ─────────────────────
+  { urls: 'turn:relay.metered.ca:80',              username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:relay.metered.ca:80?transport=tcp',username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:relay.metered.ca:443',             username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turns:relay.metered.ca:443',            username: 'openrelayproject', credential: 'openrelayproject' },
 ]
 
 const CHUNK = 65536            // 64 KB chunks — best throughput/latency tradeoff
@@ -144,7 +150,6 @@ export class P2PNode {
     conn.peerName = peerName
 
     // Rename the map entry to the real peer ID BEFORE setRemoteDescription
-    // so that any ICE/channel events that fire during or after see the real ID
     if (peerId !== tempId) {
       this.conns.set(peerId, conn)
       this.conns.delete(tempId)
@@ -157,9 +162,10 @@ export class P2PNode {
     conn.sharedKey = await deriveSharedKey(conn.kp.privateKey, peerPub)
     conn.peerNodeId = peerId
 
-    // If the channel already opened during ICE (race: same-LAN fast connect),
-    // manually fire onOpen so the app knows the connection is live
-    if (conn.ch?.readyState === 'open') {
+    // Fire onOpen now that sharedKey is set.
+    // If channel opened before finalize completed (fast same-LAN), _chanOpen is already true.
+    // If channel hasn't opened yet, _wireChannel.onopen will fire later and see sharedKey is set.
+    if (conn._chanOpen) {
       this.h.onOpen?.(peerId, peerName)
     }
 
@@ -219,12 +225,21 @@ export class P2PNode {
   _wirePeerConn(pc, pid) {
     pc.oniceconnectionstatechange = () => {
       this.h.onState?.(pid, pc.iceConnectionState)
-      if (['disconnected', 'failed', 'closed'].includes(pc.iceConnectionState)) {
-        // Don't immediately delete — 'disconnected' can recover
-        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+      if (pc.iceConnectionState === 'failed') {
+        // Try ICE restart before giving up
+        const conn = this.conns.get(pid)
+        if (conn && !conn._restarting) {
+          conn._restarting = true
+          pc.restartIce?.()
+          setTimeout(() => { if (conn) conn._restarting = false }, 5000)
+        } else {
           this.conns.delete(pid)
           this.h.onClose?.(pid)
         }
+      }
+      if (pc.iceConnectionState === 'closed') {
+        this.conns.delete(pid)
+        this.h.onClose?.(pid)
       }
     }
     pc.onconnectionstatechange = () => {
@@ -242,7 +257,17 @@ export class P2PNode {
     ch.onopen = () => {
       // Always look up real current peerId in case it was renamed after offer/answer
       const realPid = this._findPidFor(ch) || pid
-      this.h.onOpen?.(realPid)
+      const conn = this.conns.get(realPid)
+      if (!conn) return
+      // Mark channel as open so finalizeOffer can fire onOpen after setting sharedKey
+      conn._chanOpen = true
+      // Responder: sharedKey is already derived in createAnswer → safe to fire now
+      // Initiator: sharedKey is NOT set yet (set during finalizeOffer) → defer
+      // Without this check, initiator gets an onOpen with empty peerName before finalize
+      if (conn.sharedKey) {
+        this.h.onOpen?.(realPid, conn.peerName || '')
+      }
+      // Initiator path: finalizeOffer will fire onOpen after setting sharedKey + peerName
     }
     ch.onclose = () => {
       const realPid = this._findPidFor(ch) || pid
@@ -332,12 +357,11 @@ export class P2PNode {
     return new Promise(res => {
       if (pc.iceGatheringState === 'complete') { res(); return }
       const done = () => { pc.onicegatheringstatechange = null; res() }
-      // Use property assignment (more universally supported than addEventListener for this)
       pc.onicegatheringstatechange = () => {
         if (pc.iceGatheringState === 'complete') done()
       }
-      // 8 seconds max: STUN ~1s, TURN ~3-5s; if not done by 8s, use what we have
-      setTimeout(done, 8000)
+      // 12 seconds max: STUN ~1-2s, TURN ~3-6s on slow networks
+      setTimeout(done, 12000)
     })
   }
 }
