@@ -141,19 +141,34 @@ function renderMD(text) {
 }
 
 async function detectIP() {
-  return new Promise(r => {
+  return new Promise(resolve => {
     try {
-      const pc = new RTCPeerConnection({ iceServers: [] })
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
       pc.createDataChannel('')
-      pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => r('N/A'))
       const ips = new Set()
       pc.onicecandidate = e => {
-        if (!e?.candidate) { pc.close(); r(ips.size ? [...ips].join(', ') : 'N/A'); return }
-        const m = /(\d{1,3}(?:\.\d{1,3}){3})/.exec(e.candidate.candidate)
-        if (m && !m[1].startsWith('0.')) ips.add(m[1])
+        if (!e?.candidate) {
+          pc.close()
+          resolve(ips.size ? [...ips].join(', ') : 'N/A')
+          return
+        }
+        // Match IPv4 in candidate string
+        const m = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/.exec(e.candidate.candidate)
+        if (m) {
+          const ip = m[1]
+          // Keep private/LAN addresses only (not 127.x loopback)
+          if (
+            ip.startsWith('192.168.') ||
+            ip.startsWith('10.') ||
+            ip.startsWith('169.254.') ||
+            /^172\.(1[6-9]|2\d|3[01])\./.test(ip)
+          ) ips.add(ip)
+        }
       }
-      setTimeout(() => { pc.close(); r(ips.size ? [...ips].join(', ') : 'N/A') }, 3500)
-    } catch { r('N/A') }
+      pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => resolve('N/A'))
+      // Fallback after 5 seconds
+      setTimeout(() => { pc.close(); resolve(ips.size ? [...ips].join(', ') : 'N/A') }, 5000)
+    } catch { resolve('N/A') }
   })
 }
 
@@ -597,12 +612,21 @@ export default function App() {
   const pushMsg = useCallback((pid, m) => setMsgs(prev => ({ ...prev, [pid]: [...(prev[pid] || []), m] })), [])
   const updMsg = useCallback((pid, id, patch) => setMsgs(prev => ({ ...prev, [pid]: (prev[pid] || []).map(m => m.id === id ? { ...m, ...patch } : m) })), [])
 
-  // refresh protection
+  // Refresh protection — use a ref so the handler always sees current screen
+  // (avoids stale closure from useEffect dependency)
+  const screenRef = useRef(screen)
+  useEffect(() => { screenRef.current = screen }, [screen])
   useEffect(() => {
-    const h = e => { if (screen === 'main' || screen === 'locked') { e.preventDefault(); e.returnValue = 'FTPS: All data will be permanently lost.'; return e.returnValue } }
+    const h = e => {
+      if (screenRef.current === 'main' || screenRef.current === 'locked') {
+        e.preventDefault()
+        e.returnValue = ''
+        return ''
+      }
+    }
     window.addEventListener('beforeunload', h)
     return () => window.removeEventListener('beforeunload', h)
-  }, [screen])
+  }, [])  // mount-once — uses ref internally
 
   useEffect(() => { detectIP().then(setLocalIP) }, [])
 
