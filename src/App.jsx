@@ -1,0 +1,1376 @@
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { generateKeyPair, exportPublicKey } from './lib/crypto.js'
+import { P2PNode } from './lib/webrtc.js'
+
+// ── THEME ─────────────────────────────────────────────────────────────────────
+const T = {
+  bg:'#07090b', surface:'#0d1117', panel:'#111820', border:'#1e2d3d',
+  borderHi:'#2a3f54', accent:'#1aff8c', accentDim:'#0d7a45', accentFaint:'#1aff8c12',
+  blue:'#58ccff', amber:'#f0b429', red:'#ff5c5c', green:'#2dd4a0',
+  purple:'#b39ddb', text:'#cdd9e5', textDim:'#7a99ad', textMid:'#9bbccc', null_:'#2c3e50',
+}
+
+// ── GLOBAL CSS ────────────────────────────────────────────────────────────────
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,700;1,400&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body,#root{height:100%;background:${T.bg}}
+body{font-family:'JetBrains Mono',monospace;color:${T.text};overflow:hidden;font-size:14px}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:${T.bg}}
+::-webkit-scrollbar-thumb{background:${T.border};border-radius:3px}
+input,textarea,button,select{font-family:inherit;font-size:inherit}
+input:focus,textarea:focus,select:focus{outline:none}
+button{cursor:pointer}
+button:active:not(:disabled){transform:scale(.97)}
+
+@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes slideR{from{transform:translateX(100%)}to{transform:translateX(0)}}
+
+.fadeup{animation:fadeUp .28s ease both}
+.fadein{animation:fadeIn .18s ease both}
+.pulseAnim{animation:pulse 2.5s ease infinite}
+.blinkAnim{animation:blink 1s step-end infinite}
+.spin{animation:spin 1s linear infinite}
+
+/* CARD */
+.card{background:${T.surface};border:1px solid ${T.border};border-radius:8px}
+
+/* INPUTS */
+.inp{width:100%;background:#060a0d;border:1px solid ${T.border};border-radius:6px;padding:11px 14px;color:${T.text};font-size:13px;font-family:inherit;transition:border-color .15s;line-height:1.4}
+.inp:focus{border-color:${T.accentDim}}
+.inp.err{border-color:${T.red}!important}
+.inp::placeholder{color:${T.null_}}
+
+/* BUTTONS */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:none;border-radius:6px;padding:9px 18px;font-size:12px;font-weight:500;letter-spacing:.4px;transition:opacity .12s,filter .12s;cursor:pointer}
+.btn:hover{filter:brightness(1.1)}
+.btn-accent{background:${T.accent};color:#07090b;font-weight:700}
+.btn-ghost{background:transparent;border:1px solid ${T.border};color:${T.textDim}}
+.btn-ghost:hover{border-color:${T.borderHi};color:${T.textMid}}
+.btn-danger{background:${T.red}18;border:1px solid ${T.red}50;color:${T.red}}
+.btn-blue{background:${T.blue}18;border:1px solid ${T.blue}50;color:${T.blue}}
+.btn-amber{background:${T.amber}18;border:1px solid ${T.amber}50;color:${T.amber}}
+.btn-green{background:${T.green}18;border:1px solid ${T.green}50;color:${T.green}}
+.btn-purple{background:${T.purple}18;border:1px solid ${T.purple}50;color:${T.purple}}
+.btn-sm{padding:5px 10px;font-size:11px}
+.btn-xs{padding:3px 8px;font-size:10px}
+
+/* SIDEBAR */
+.sbtn{display:flex;align-items:center;gap:12px;width:100%;padding:12px 16px;background:transparent;border:none;border-left:3px solid transparent;color:${T.textDim};font-size:13px;font-family:inherit;text-align:left;cursor:pointer;transition:all .12s}
+.sbtn:hover{background:${T.panel};color:${T.textMid}}
+.sbtn.act{background:${T.accentFaint};border-left-color:${T.accent};color:${T.accent}}
+
+/* PEER ROW */
+.prow{display:flex;align-items:center;gap:12px;padding:12px 14px;cursor:pointer;transition:background .12s;border-bottom:1px solid ${T.border}}
+.prow:hover{background:${T.panel}}
+.prow.sel{background:${T.accentFaint}}
+
+/* MSG BUBBLES */
+.bub{max-width:72%;border-radius:10px;padding:10px 14px;font-size:13px;line-height:1.6;word-break:break-word;position:relative}
+.bub-me{background:${T.accent}1a;border:1px solid ${T.accent}40}
+.bub-them{background:${T.surface};border:1px solid ${T.border}}
+.bub-sys{background:transparent;border:1px solid ${T.accentDim}25;color:${T.accentDim};font-size:11px;border-radius:20px;padding:4px 14px;max-width:100%;text-align:center}
+
+/* CODE EDITOR */
+.code-editor{background:#02060a;border:1px solid ${T.border};border-radius:6px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:13px;color:#7ee787;resize:vertical;width:100%;min-height:260px;line-height:1.7;tab-size:2}
+.code-editor:focus{border-color:${T.accentDim};outline:none}
+
+/* CODE BLOCK IN CHAT */
+.codeblock{background:#020507;border:1px solid ${T.border};border-left:3px solid ${T.accentDim};border-radius:6px;padding:12px 14px;margin:6px 0;overflow-x:auto}
+.codeblock pre{font-family:inherit;font-size:12px;color:#7ee787;white-space:pre;margin:0}
+.codeblock-lang{font-size:9px;color:${T.textDim};text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:4px}
+.icode{background:#0a1520;padding:1px 6px;border-radius:3px;color:${T.blue};font-size:12px}
+.linkwarn{color:${T.amber};text-decoration:underline dashed;cursor:pointer}
+
+/* TAB BAR */
+.tabbar{display:flex;border-bottom:1px solid ${T.border};background:${T.surface}}
+.tab{padding:11px 16px;font-size:12px;border:none;background:transparent;color:${T.textDim};border-bottom:2px solid transparent;cursor:pointer;letter-spacing:.3px;transition:all .12s}
+.tab:hover{color:${T.textMid}}
+.tab.act{color:${T.accent};border-bottom-color:${T.accent}}
+
+/* STATUS DOT */
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-on{background:${T.green};animation:pulse 2.5s ease infinite}
+.dot-off{background:${T.null_}}
+
+/* SANDBOX FRAME */
+.sandbox-frame{border:0;width:100%;height:100%;background:#02060a;border-radius:6px}
+
+/* PROGRESS BAR */
+.prog-track{height:4px;background:${T.border};border-radius:2px;overflow:hidden}
+.prog-fill{height:100%;border-radius:2px;transition:width .3s ease;background:${T.accent}}
+.prog-fill-blue{background:${T.blue}}
+
+/* ATTACH MENU */
+.attach-item{display:flex;align-items:center;gap:12px;padding:13px 16px;cursor:pointer;font-size:13px;color:${T.text};border-bottom:1px solid ${T.border};background:transparent;border:none;width:100%;text-align:left}
+.attach-item:hover{background:${T.panel}}
+.attach-item:last-child{border-bottom:none}
+.attach-icon{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+
+/* MODAL OVERLAY */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:100;display:flex;align-items:center;justify-content:center;padding:16px}
+
+/* STATUS TAGS */
+.stag{font-size:10px;letter-spacing:.3px;padding:1px 6px;border-radius:3px}
+
+@media(max-width:900px){.hide-md{display:none!important}}
+@media(max-width:640px){.hide-sm{display:none!important};.rpanel{position:absolute!important;z-index:40;inset-y:0;right:0;width:100%!important}}
+`
+
+// ── UTILS ─────────────────────────────────────────────────────────────────────
+const fmt    = s=>`${String(Math.floor(s/3600)).padStart(2,'0')}:${String(Math.floor((s%3600)/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`
+const fmtMin = s=>`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`
+const fmtSz  = b=>b>=1e9?(b/1e9).toFixed(2)+' GB':b>=1e6?(b/1e6).toFixed(1)+' MB':b>=1e3?(b/1e3).toFixed(0)+' KB':b+' B'
+const now8   = ()=>new Date().toTimeString().slice(0,8)
+const escH   = s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+
+function renderMD(text){
+  return text
+    .replace(/```(\w*)\n?([\s\S]*?)```/g,(_,l,c)=>`<div class="codeblock"><span class="codeblock-lang">${l||'code'}</span><pre>${escH(c.trim())}</pre></div>`)
+    .replace(/`([^`]+)`/g,'<code class="icode">$1</code>')
+    .replace(/\*\*(.+?)\*\*/g,'<strong style="color:${T.text}">$1</strong>')
+    .replace(/\*(.+?)\*/g,'<em>$1</em>')
+    .replace(/^#{3}\s(.+)$/gm,'<div style="color:${T.accent};font-weight:700;margin:8px 0 4px">$1</div>')
+    .replace(/^#{2}\s(.+)$/gm,'<div style="color:${T.accent};font-weight:700;font-size:15px;margin:8px 0 4px">$1</div>')
+    .replace(/^#\s(.+)$/gm,'<div style="color:${T.accent};font-weight:700;font-size:16px;margin:8px 0 4px">$1</div>')
+    .replace(/(https?:\/\/[^\s<]+)/g,'<span class="linkwarn" title="⚠ External link — verify before opening">⚠ $1</span>')
+    .replace(/\n/g,'<br>')
+}
+
+async function detectIP(){
+  return new Promise(r=>{
+    try{
+      const pc=new RTCPeerConnection({iceServers:[]})
+      pc.createDataChannel('')
+      pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>r('N/A'))
+      const ips=new Set()
+      pc.onicecandidate=e=>{
+        if(!e?.candidate){pc.close();r(ips.size?[...ips].join(', '):'N/A');return}
+        const m=/(\d{1,3}(?:\.\d{1,3}){3})/.exec(e.candidate.candidate)
+        if(m&&!m[1].startsWith('0.'))ips.add(m[1])
+      }
+      setTimeout(()=>{pc.close();r(ips.size?[...ips].join(', '):'N/A')},3500)
+    }catch{r('N/A')}
+  })
+}
+
+function makeNodeId(name){
+  const h=[...name].reduce((a,c,i)=>((a<<5)-a+c.charCodeAt(0)*(i+7))|0,0)
+  return '#'+Math.abs(h).toString(16).padStart(4,'0').toUpperCase()
+}
+
+// ── MINI QR ───────────────────────────────────────────────────────────────────
+function QR({value,sz=9}){
+  const n=19,seed=[...value].reduce((a,c,i)=>a^(c.charCodeAt(0)*(i+7)),42)
+  const cells=Array.from({length:n*n},(_,i)=>{
+    const r=Math.floor(i/n),c=i%n
+    const corner=(r<5&&c<5)||(r<5&&c>=n-5)||(r>=n-5&&c<5)
+    if(corner)return(r===0||r===4||c===0||c===4||(r===2&&c===2))?1:0
+    return((seed*(r+3)^(c*13))%3===0)?1:0
+  })
+  return <div style={{background:'#fff',padding:7,borderRadius:5,display:'inline-block'}}><div style={{display:'grid',gridTemplateColumns:`repeat(${n},${sz}px)`}}>{cells.map((b,i)=><div key={i} style={{width:sz,height:sz,background:b?'#020507':'#fff'}}/>)}</div></div>
+}
+
+// ── NOTIF ─────────────────────────────────────────────────────────────────────
+function Notif({n}){
+  if(!n)return null
+  const c=n.t==='ok'?T.green:n.t==='err'?T.red:T.blue
+  return <div style={{position:'fixed',top:16,right:16,zIndex:600,background:T.surface,border:`1px solid ${c}70`,borderRadius:8,padding:'11px 16px',color:c,fontSize:13,maxWidth:320,animation:'fadeIn .2s ease',boxShadow:'0 6px 24px rgba(0,0,0,.6)',lineHeight:1.5}}>{n.msg}</div>
+}
+
+// ── AVATAR ────────────────────────────────────────────────────────────────────
+function Avatar({name,id,size=40,online}){
+  // Always show meaningful initials — never show ? (looks like incognito)
+  const raw = name?.trim() || ''
+  const initials = raw.length >= 2
+    ? (raw[0]+raw[raw.length-1]).toUpperCase()
+    : raw.length === 1
+    ? raw[0].toUpperCase()
+    : (id||'').replace(/[^a-zA-Z0-9]/g,'').slice(0,2).toUpperCase() || 'P'
+  const hue = Math.abs([...(name||id||'X')].reduce((a,c)=>a+c.charCodeAt(0),0)) % 360
+  return(
+    <div style={{width:size,height:size,borderRadius:'50%',background:`hsl(${hue},28%,18%)`,border:`2px solid ${online?T.accent:T.null_}`,display:'flex',alignItems:'center',justifyContent:'center',fontWeight:700,color:online?`hsl(${hue},70%,72%)`:T.textDim,fontSize:Math.round(size*0.36),flexShrink:0,position:'relative',letterSpacing:'-0.5px'}}>
+      {initials}
+      {online!==undefined&&<div className={`dot ${online?'dot-on':'dot-off'}`} style={{position:'absolute',bottom:1,right:1,width:Math.round(size*0.22),height:Math.round(size*0.22)}}/>}
+    </div>
+  )
+}
+
+// ── SANDBOX FOLDER BROWSER ────────────────────────────────────────────────────
+function SandboxFolder({folder,onClose}){
+  const [path,setPath]=useState([])
+  const [sel,setSel]=useState(null)
+  const extC={pdf:'#ff6b6b',md:T.blue,py:T.amber,js:'#fbbf24',ts:'#4db8ff',jpg:T.purple,png:T.purple,jpeg:T.purple,gif:T.purple,zip:'#f97316',gz:'#f97316',tar:'#f97316',rar:'#f97316',docx:'#3b82f6',xlsx:'#22c55e',pptx:'#f97316',txt:T.textMid,csv:T.green,html:T.amber,css:T.blue,json:T.amber,sh:T.red}
+  const cur=path.reduce((node,seg)=>node?.children?.[seg],folder)
+  const entries=Object.entries(cur?.children??folder?.children??{})
+
+  const download=(name,node)=>{
+    if(node.blob){const a=document.createElement('a');a.href=URL.createObjectURL(node.blob);a.download=name;document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(a.href)}
+    else if(node.content){const b=new Blob([node.content],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name;document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(a.href)}
+    else alert('File data not available — only the file tree was shared, not the actual bytes.\nTo send actual file bytes, use "Send File" instead.')
+  }
+
+  return(
+    <div className="overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="card fadeup" style={{width:'min(680px,96vw)',height:'min(560px,90vh)',display:'flex',flexDirection:'column',overflow:'hidden',boxShadow:'0 20px 60px rgba(0,0,0,.7)'}}>
+        {/* Header */}
+        <div style={{padding:'13px 18px',borderBottom:`1px solid ${T.border}`,background:T.panel,display:'flex',alignItems:'center',justifyContent:'space-between',flexShrink:0}}>
+          <div>
+            <div style={{fontSize:13,color:T.accent,fontWeight:700}}>🔒 SANDBOXED FOLDER BROWSER</div>
+            <div style={{fontSize:11,color:T.textDim,marginTop:2}}>Read-only · Isolated · No scripts run · Only granted folder accessible</div>
+          </div>
+          <button onClick={onClose} className="btn btn-ghost btn-sm">✕ Close</button>
+        </div>
+        {/* Breadcrumb */}
+        <div style={{padding:'8px 16px',borderBottom:`1px solid ${T.border}`,display:'flex',gap:6,flexWrap:'wrap',alignItems:'center',background:T.surface,flexShrink:0}}>
+          <span style={{fontSize:11,color:T.textDim,marginRight:4}}>📂</span>
+          <button onClick={()=>{setPath([]);setSel(null)}} style={{background:'none',border:'none',color:T.blue,fontSize:13,cursor:'pointer',padding:0}}>{folder.name||'root'}</button>
+          {path.map((seg,i)=>(
+            <span key={i} style={{display:'flex',gap:6,alignItems:'center'}}>
+              <span style={{color:T.null_,fontSize:12}}>›</span>
+              <button onClick={()=>{setPath(path.slice(0,i+1));setSel(null)}} style={{background:'none',border:'none',color:i===path.length-1?T.accent:T.blue,fontSize:13,cursor:'pointer',padding:0}}>{seg}</button>
+            </span>
+          ))}
+        </div>
+        {/* File list */}
+        <div style={{flex:1,overflowY:'auto',padding:8}}>
+          {path.length>0&&(
+            <div onClick={()=>{setPath(p=>p.slice(0,-1));setSel(null)}} style={{display:'flex',alignItems:'center',gap:10,padding:'10px 14px',borderRadius:6,cursor:'pointer',marginBottom:2,color:T.textDim,fontSize:13}} onMouseEnter={e=>e.currentTarget.style.background=T.panel} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+              <span style={{fontSize:18}}>↩</span><span>..</span>
+            </div>
+          )}
+          {entries.map(([name,node])=>{
+            const ext=name.split('.').pop().toLowerCase()
+            const col=extC[ext]||T.textDim
+            const isDir=node.type==='folder'
+            const isSel=sel===name
+            return(
+              <div key={name} onClick={()=>{if(isDir){setPath(p=>[...p,name]);setSel(null)}else setSel(isSel?null:name)}}
+                style={{display:'flex',alignItems:'center',gap:12,padding:'11px 14px',borderRadius:6,cursor:'pointer',marginBottom:2,background:isSel?T.accentFaint:'transparent',border:`1px solid ${isSel?T.accent+'40':'transparent'}`}}
+                onMouseEnter={e=>{if(!isSel)e.currentTarget.style.background=T.panel}} onMouseLeave={e=>{if(!isSel)e.currentTarget.style.background='transparent'}}>
+                <span style={{fontSize:20}}>{isDir?'📂':'📄'}</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,color:isDir?T.amber:T.text,fontWeight:isDir?600:400,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{name}</div>
+                  {node.size&&<div style={{fontSize:11,color:T.textDim}}>{node.size}</div>}
+                </div>
+                {!isDir&&<span style={{fontSize:10,fontWeight:700,padding:'2px 6px',borderRadius:4,border:`1px solid ${col}40`,color:col}}>{ext.toUpperCase()}</span>}
+                {!isDir&&<button onClick={e=>{e.stopPropagation();download(name,node)}} className="btn btn-green btn-xs" style={{flexShrink:0}}>⬇ Download</button>}
+              </div>
+            )
+          })}
+          {entries.length===0&&<div style={{textAlign:'center',padding:40,color:T.null_,fontSize:13}}>Empty folder</div>}
+        </div>
+        {/* Security banner */}
+        <div style={{padding:'8px 16px',borderTop:`1px solid ${T.border}`,background:T.panel,fontSize:11,color:T.textDim,display:'flex',gap:16,flexShrink:0}}>
+          <span style={{color:T.green}}>🔒 Sandboxed</span>
+          <span>|</span>
+          <span>No scripts run</span>
+          <span>|</span>
+          <span>No external requests</span>
+          <span>|</span>
+          <span>Sender's other files: inaccessible</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── CODE EDITOR MODAL ─────────────────────────────────────────────────────────
+function CodeEditor({onSend,onClose}){
+  const [lang,setLang]=useState('python')
+  const [code,setCode]=useState('')
+  const langs=['python','javascript','typescript','java','c','cpp','rust','go','bash','sql','html','css','json','yaml','markdown']
+  const send=()=>{ if(!code.trim())return; onSend('```'+lang+'\n'+code+'\n```'); onClose() }
+  return(
+    <div className="overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="card fadeup" style={{width:'min(700px,96vw)',height:'min(520px,90vh)',display:'flex',flexDirection:'column',overflow:'hidden',boxShadow:'0 20px 60px rgba(0,0,0,.7)'}}>
+        <div style={{padding:'12px 18px',borderBottom:`1px solid ${T.border}`,background:T.panel,display:'flex',alignItems:'center',gap:12,flexShrink:0}}>
+          <div style={{fontSize:13,color:T.accent,fontWeight:700,flex:1}}>{'</>'}  CODE EDITOR</div>
+          <div style={{fontSize:11,color:T.red,background:T.red+'12',border:`1px solid ${T.red}30`,borderRadius:4,padding:'3px 8px'}}>⚠ NOT EXECUTABLE — display only</div>
+          <select value={lang} onChange={e=>setLang(e.target.value)} style={{background:T.bg,border:`1px solid ${T.border}`,borderRadius:5,padding:'5px 10px',color:T.text,fontSize:12,cursor:'pointer'}}>
+            {langs.map(l=><option key={l} value={l}>{l}</option>)}
+          </select>
+          <button onClick={onClose} className="btn btn-ghost btn-sm">✕</button>
+        </div>
+        <div style={{flex:1,padding:12,overflow:'hidden',display:'flex',flexDirection:'column',gap:8}}>
+          <div style={{fontSize:11,color:T.textDim}}>Write code below · Tab = 2 spaces · Will be sent as a syntax-highlighted code block</div>
+          <textarea className="code-editor" value={code} onChange={e=>setCode(e.target.value)}
+            onKeyDown={e=>{if(e.key==='Tab'){e.preventDefault();const s=e.target.selectionStart,end=e.target.selectionEnd;const v=code.substring(0,s)+'  '+code.substring(end);setCode(v);setTimeout(()=>{e.target.selectionStart=e.target.selectionEnd=s+2},0)}}}
+            placeholder={`// Start typing your ${lang} code here…\n// This will be sent as a formatted code block\n// The recipient cannot execute it`}
+            style={{flex:1}}/>
+        </div>
+        <div style={{padding:'10px 18px',borderTop:`1px solid ${T.border}`,display:'flex',justifyContent:'space-between',alignItems:'center',flexShrink:0}}>
+          <div style={{fontSize:11,color:T.textDim}}>{code.split('\n').length} lines · {code.length} chars</div>
+          <div style={{display:'flex',gap:8}}>
+            <button onClick={()=>setCode('')} className="btn btn-ghost btn-sm">Clear</button>
+            <button onClick={send} className="btn btn-accent btn-sm" disabled={!code.trim()}>Send Code Block</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── README MODAL ──────────────────────────────────────────────────────────────
+function ReadmeModal({onClose}){
+  const [tab,setTab]=useState('about')
+  const Row=({label,value,col})=>(
+    <div style={{display:'grid',gridTemplateColumns:'180px 1fr',gap:16,padding:'10px 0',borderBottom:`1px solid ${T.border}`}}>
+      <span style={{fontSize:12,color:T.textDim,letterSpacing:.3}}>{label}</span>
+      <span style={{fontSize:12,color:col||T.text}}>{value}</span>
+    </div>
+  )
+  const Feature=({text})=>(
+    <div style={{display:'flex',gap:10,padding:'6px 0',borderBottom:`1px solid ${T.border}22`}}>
+      <span style={{color:T.accentDim,flexShrink:0,fontSize:11}}>✓</span>
+      <span style={{fontSize:12,color:T.textMid}}>{text}</span>
+    </div>
+  )
+  const Step=({n,col,title,body})=>(
+    <div style={{display:'flex',gap:14,marginBottom:18}}>
+      <div style={{width:26,height:26,borderRadius:'50%',background:`${col}18`,border:`1px solid ${col}50`,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,fontSize:11,fontWeight:700,color:col}}>{n}</div>
+      <div>
+        <div style={{fontSize:13,fontWeight:600,color:col,marginBottom:4}}>{title}</div>
+        <div style={{fontSize:12,color:T.textMid,lineHeight:1.7}}>{body}</div>
+      </div>
+    </div>
+  )
+  return(
+    <div className="overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="card fadeup" style={{width:'min(680px,96vw)',height:'min(74vh,660px)',display:'flex',flexDirection:'column',overflow:'hidden',boxShadow:'0 20px 60px rgba(0,0,0,.7)'}}>
+        <div style={{padding:'14px 20px',borderBottom:`1px solid ${T.border}`,background:T.panel,display:'flex',alignItems:'center',justifyContent:'space-between',flexShrink:0}}>
+          <div>
+            <div style={{fontSize:14,color:T.accent,fontWeight:700,letterSpacing:.5}}>FTPS — DOCUMENTATION</div>
+            <div style={{fontSize:11,color:T.textDim,marginTop:2}}>File Transfer Protocol Service · P2P · E2E-AES256 · No Server</div>
+          </div>
+          <button onClick={onClose} className="btn btn-ghost btn-sm">✕ Close</button>
+        </div>
+        <div className="tabbar" style={{flexShrink:0}}>
+          <button className={`tab ${tab==='about'?'act':''}`} onClick={()=>setTab('about')}>PROJECT DETAILS</button>
+          <button className={`tab ${tab==='connect'?'act':''}`} onClick={()=>setTab('connect')}>HOW TO CONNECT PEERS</button>
+        </div>
+        <div style={{flex:1,overflowY:'auto',padding:'20px 24px'}} className="fadein">
+          {tab==='about'&&(
+            <div>
+              <p style={{fontSize:13,color:T.textMid,lineHeight:1.8,marginBottom:24}}>
+                FTPS is a serverless, domain-free peer-to-peer application for secure file transfer and chat. After an initial manual handshake, all data travels directly between browsers. No server ever sees your messages, files, or cryptographic keys.
+              </p>
+
+              <div style={{fontSize:11,color:T.accentDim,letterSpacing:2,fontWeight:700,marginBottom:12}}>SECURITY ARCHITECTURE</div>
+              <div style={{marginBottom:24}}>
+                <Row label="Key Exchange"    value="ECDH P-256 via WebCrypto API — ephemeral per session" col={T.green}/>
+                <Row label="Encryption"      value="AES-GCM-256 — every message and every file chunk"    col={T.green}/>
+                <Row label="IV / Nonce"      value="12-byte random per message — replay-attack proof"    col={T.green}/>
+                <Row label="Transport"       value="WebRTC DataChannel — direct browser-to-browser"      col={T.blue}/>
+                <Row label="STUN servers"    value="NAT IP discovery only — never relay your data"        col={T.textMid}/>
+                <Row label="Data storage"    value="Memory only — no server, no database, no disk write" col={T.amber}/>
+              </div>
+
+              <div style={{fontSize:11,color:T.accentDim,letterSpacing:2,fontWeight:700,marginBottom:12}}>FEATURES</div>
+              <div style={{marginBottom:20}}>
+                {['All 3 setup fields required — name, passphrase, and password',
+                  'Auto-lock on inactivity — timer resets on any mouse or keyboard activity',
+                  'Configurable lock timeout (1–60 min) and max unlock attempts (1–10)',
+                  '5 wrong unlock attempts (default) = full session data wipe',
+                  'Browser warns before refresh or tab close (beforeunload protection)',
+                  'Refresh or close tab = all data permanently gone — no persistence by design',
+                  'Real WebRTC P2P DataChannel — no server relay after initial handshake',
+                  'Real ECDH P-256 key exchange using browser WebCrypto API',
+                  'Real AES-GCM-256 encryption on every message and every file byte',
+                  'Chunked file transfer — no file size limit (16 KB chunks by default)',
+                  'Folder sharing with sandboxed read-only file browser',
+                  'Markdown rendering in chat — code displayed with syntax highlight, never executed',
+                  'External link warnings — all URLs flagged before opening',
+                  'Anti-spam configurable rate limit per peer',
+                  'Archive file security warning on receipt',
+                  'Fully customizable settings panel',
+                  'Responsive layout — works on mobile',
+                ].map((f,i)=><Feature key={i} text={f}/>)}
+              </div>
+
+              <div style={{background:T.panel,border:`1px solid ${T.border}`,borderRadius:6,padding:'12px 16px',fontSize:12,color:T.textDim,lineHeight:1.8}}>
+                <strong style={{color:T.amber}}>MAC Address:</strong> All browsers permanently block MAC address access for user privacy. This applies to every web application — it is not a limitation of FTPS. Your MAC address is not required for any P2P function.
+              </div>
+            </div>
+          )}
+          {tab==='connect'&&(
+            <div>
+              <p style={{fontSize:13,color:T.textMid,lineHeight:1.8,marginBottom:24}}>
+                Since there is no signaling server, the initial WebRTC handshake is performed manually by exchanging two short strings between peers — via any channel (WhatsApp, email, SMS). After that single exchange, the connection is fully serverless and direct.
+              </p>
+
+              <div style={{fontSize:11,color:T.accentDim,letterSpacing:2,fontWeight:700,marginBottom:18}}>STEP-BY-STEP CONNECTION GUIDE</div>
+
+              <Step n="1" col={T.blue}   title="Person A — Generate Offer"     body="Open the Connect tab → click Generate Offer. You receive a base64 string containing your SDP description and ECDH public key. Copy this string."/>
+              <Step n="2" col={T.amber}  title="A sends offer to B"            body="Send the string to Person B via any channel — WhatsApp, email, SMS, QR code. The string contains only your public key and connection description. It is safe to share."/>
+              <Step n="3" col={T.purple} title="Person B — Generate Answer"    body="Person B opens the Connect tab → pastes the offer string → clicks Generate Answer. B receives their own base64 string. Copy it."/>
+              <Step n="4" col={T.amber}  title="B sends answer to A"           body="Person B sends the answer string back to Person A using any channel."/>
+              <Step n="5" col={T.green}  title="Person A — Finalize"           body="Person A pastes B's answer string → clicks Finalize Connection. The WebRTC DataChannel opens directly between both browsers. No server is involved from this point forward."/>
+              <Step n="6" col={T.accent} title="Connected"                     body="Both peers show as ONLINE. The shared AES-256 key is computed locally on each side using ECDH — it is never transmitted over any network. All subsequent traffic is encrypted direct P2P."/>
+
+              <div style={{background:T.panel,border:`1px solid ${T.amber}30`,borderRadius:6,padding:'12px 16px',marginTop:8,fontSize:12,color:T.amber,lineHeight:1.8}}>
+                <strong>Note on strict NAT / firewalls:</strong> If both peers are behind symmetric NAT or strict corporate firewalls, the direct WebRTC connection may fail. In that case, a TURN relay server is required. Add TURN server credentials to <code style={{color:T.blue,background:T.bg,padding:'1px 5px',borderRadius:3}}>ICE_SERVERS</code> in <code style={{color:T.blue,background:T.bg,padding:'1px 5px',borderRadius:3}}>src/lib/webrtc.js</code>.
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── CONFIRM MODAL ─────────────────────────────────────────────────────────────
+function ConfirmModal({msg,onYes,onNo}){
+  return(
+    <div className="overlay">
+      <div className="card fadeup" style={{width:'min(380px,96vw)',padding:28,boxShadow:'0 20px 60px rgba(0,0,0,.7)'}}>
+        <div style={{fontSize:14,color:T.amber,marginBottom:20,lineHeight:1.7}}>{msg}</div>
+        <div style={{display:'flex',gap:10,justifyContent:'flex-end'}}>
+          <button onClick={onNo} className="btn btn-ghost">Cancel</button>
+          <button onClick={onYes} className="btn btn-danger">Confirm Wipe</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── FILE MSG COMPONENT ────────────────────────────────────────────────────────
+function FileMsg({msg}){
+  const isMe=msg.from==='me'
+  const pct=msg.pct??1
+  const done=msg.type==='file_done'||msg.type==='file_out'
+  const statusTxt=msg.type==='file_out'?'Sent':msg.type==='file_done'?'Received':msg.type==='file_in'?`Receiving… ${Math.round(pct*100)}%`:'Sending…'
+  const statusCol=msg.type==='file_done'||msg.type==='file_out'?T.green:T.amber
+  const dl=()=>{
+    if(msg.blob){const a=document.createElement('a');a.href=URL.createObjectURL(msg.blob);a.download=msg.meta.name;document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(a.href)}
+  }
+  return(
+    <div style={{padding:'10px 14px',background:isMe?T.blue+'14':T.surface,border:`1px solid ${isMe?T.blue+'40':T.border}`,borderRadius:10,maxWidth:'68%'}}>
+      <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:6}}>
+        <span style={{fontSize:22}}>📦</span>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:13,color:T.text,fontWeight:600,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{msg.meta?.name}</div>
+          <div style={{fontSize:11,color:T.textDim}}>{fmtSz(msg.meta?.size||0)}</div>
+        </div>
+        <span className="stag" style={{color:statusCol,background:statusCol+'18',border:`1px solid ${statusCol}40`}}>{statusTxt}</span>
+      </div>
+      {!done&&(
+        <div className="prog-track" style={{marginBottom:6}}>
+          <div className={`prog-fill ${isMe?'prog-fill-blue':''}`} style={{width:`${pct*100}%`}}/>
+        </div>
+      )}
+      {(msg.type==='file_done'&&msg.blob)||(msg.type==='file_out')?(
+        msg.type==='file_done'&&msg.blob?<button onClick={dl} className="btn btn-green btn-sm" style={{width:'100%'}}>⬇ Download File</button>:null
+      ):null}
+      <div style={{fontSize:10,color:T.textDim,marginTop:4,textAlign:'right'}}>{msg.time}</div>
+    </div>
+  )
+}
+
+// ── FOLDER MSG COMPONENT ──────────────────────────────────────────────────────
+function FolderMsg({msg,onOpen}){
+  const entries=Object.keys(msg.folder?.children||{})
+  return(
+    <div onClick={onOpen} style={{padding:'11px 14px',background:T.amber+'10',border:`1px solid ${T.amber}35`,borderRadius:10,maxWidth:'68%',cursor:'pointer',transition:'background .15s'}} onMouseEnter={e=>e.currentTarget.style.background=T.amber+'18'} onMouseLeave={e=>e.currentTarget.style.background=T.amber+'10'}>
+      <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:6}}>
+        <span style={{fontSize:22}}>📂</span>
+        <div style={{flex:1}}>
+          <div style={{fontSize:13,color:T.amber,fontWeight:700}}>Shared Folder</div>
+          <div style={{fontSize:12,color:T.text}}>{msg.folder?.name}</div>
+        </div>
+        <div style={{fontSize:11,color:T.textDim,background:T.green+'18',border:`1px solid ${T.green}30`,padding:'2px 8px',borderRadius:4,color:T.green}}>🔒 Sandboxed</div>
+      </div>
+      <div style={{fontSize:11,color:T.textDim,marginBottom:6}}>{entries.length} item{entries.length!==1?'s':''}: {entries.slice(0,3).join(', ')}{entries.length>3?'…':''}</div>
+      <div style={{fontSize:11,color:T.textMid,background:T.panel,borderRadius:5,padding:'5px 8px'}}>Click to browse · Read-only · Isolated sandbox</div>
+      <div style={{fontSize:10,color:T.null_,marginTop:4,textAlign:'right'}}>{msg.time}</div>
+    </div>
+  )
+}
+
+// ── ATTACH MENU ───────────────────────────────────────────────────────────────
+function AttachMenu({onFile,onFolder,onCode,onClose}){
+  const items=[
+    {icon:'📄',label:'Send File',sub:'Any type, any size, unlimited',col:'#4db8ff',bg:'#4db8ff20',action:onFile},
+    {icon:'📂',label:'Share Folder',sub:'Receiver browses in sandbox',col:T.amber,bg:T.amber+'20',action:onFolder},
+    {icon:'</>',label:'Send Code',sub:'Syntax highlighted, not executable',col:T.green,bg:T.green+'20',action:onCode},
+  ]
+  return(
+    <div className="card fadein" style={{position:'absolute',bottom:'100%',left:0,marginBottom:6,width:290,overflow:'hidden',boxShadow:'0 8px 32px rgba(0,0,0,.6)',zIndex:50}}>
+      {items.map((it,i)=>(
+        <button key={i} className="attach-item" onClick={()=>{it.action();onClose()}}
+          style={{borderBottom:i<items.length-1?`1px solid ${T.border}`:'none'}}>
+          <div className="attach-icon" style={{background:it.bg,color:it.col,fontSize:it.icon==='</>'?14:18}}>{it.icon}</div>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:T.text}}>{it.label}</div>
+            <div style={{fontSize:11,color:T.textDim}}>{it.sub}</div>
+          </div>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN APP
+// ─────────────────────────────────────────────────────────────────────────────
+export default function App(){
+  const [screen,setScreen]   = useState('setup')
+  const [account,setAccount] = useState(null)
+  const [form,setForm]       = useState({name:'',passphrase:'',password:''})
+  const [formErr,setFormErr] = useState({})
+  const [lockForm,setLockForm]=useState({passphrase:'',password:''})
+  const [lockErr,setLockErr] = useState('')
+  const [lockTries,setLockTries]=useState(0)
+  const [settings,setSettings]=useState({lockTimeout:15,maxAttempts:5,chunkSize:16384,spamLimit:200,mdRender:true,linkWarn:true,archiveWarn:true})
+  const [tab,setTab]         = useState('network')
+  const [selPeer,setSelPeer] = useState(null)
+  const [peers,setPeers]     = useState([])
+  const [msgs,setMsgs]       = useState({})        // peerId → [msg]
+  const [input,setInput]     = useState('')
+  const [showAttach,setShowAttach]=useState(false)
+  const [folderView,setFolderView]=useState(null)
+  const [showCode,setShowCode]=useState(false)
+  const [showReadme,setShowReadme]=useState(false)
+  const [confirm,setConfirm] = useState(null)
+  const [offerBox,setOfferBox]=useState('')
+  const [ansBox,setAnsBox]   = useState('')
+  const [pendId,setPendId]   = useState(null)
+  const [genMode,setGenMode] = useState('idle')
+  const [genCode,setGenCode] = useState('')
+  const [initiatorCode,setInitiatorCode] = useState('')   // offer string shown to initiator
+  const [responderCode,setResponderCode] = useState('')   // answer string shown to responder
+  const [transfers,setTransfers]=useState({})
+  const [notif,setNotif]     = useState(null)
+  const [sideSmall,setSideSmall]=useState(false)
+  const [localIP,setLocalIP] = useState('detecting…')
+  const [uptime,setUptime]   = useState(0)
+  const [lockTimer,setLockTimer]=useState(900)
+
+  const p2pRef    = useRef(null)
+  const keyRef    = useRef(null)
+  const chatEnd   = useRef(null)
+  const fileInp   = useRef(null)
+  const folderInp = useRef(null)
+  const lastAct   = useRef(Date.now())
+  const myId      = useRef('#0000')
+
+  const notify=useCallback((msg,t='info')=>{setNotif({msg,t});setTimeout(()=>setNotif(null),3500)},[])
+  const pushMsg=useCallback((pid,m)=>setMsgs(prev=>({...prev,[pid]:[...(prev[pid]||[]),m]})),[])
+  const updMsg=useCallback((pid,id,patch)=>setMsgs(prev=>({...prev,[pid]:(prev[pid]||[]).map(m=>m.id===id?{...m,...patch}:m)})),[])
+
+  // refresh protection
+  useEffect(()=>{
+    const h=e=>{if(screen==='main'||screen==='locked'){e.preventDefault();e.returnValue='FTPS: All data will be permanently lost.';return e.returnValue}}
+    window.addEventListener('beforeunload',h)
+    return()=>window.removeEventListener('beforeunload',h)
+  },[screen])
+
+  useEffect(()=>{detectIP().then(setLocalIP)},[])
+
+  useEffect(()=>{
+    const r=()=>{lastAct.current=Date.now()}
+    ;['mousemove','keydown','click','touchstart'].forEach(ev=>window.addEventListener(ev,r))
+    return()=>['mousemove','keydown','click','touchstart'].forEach(ev=>window.removeEventListener(ev,r))
+  },[])
+
+  useEffect(()=>{
+    const t=setInterval(()=>{
+      if(screen==='main'){
+        setUptime(u=>u+1)
+        const rem=Math.max(0,settings.lockTimeout*60-(Date.now()-lastAct.current)/1000)
+        setLockTimer(Math.round(rem))
+        if(rem<=0) setScreen('locked')
+      }
+    },1000)
+    return()=>clearInterval(t)
+  },[screen,settings.lockTimeout])
+
+  // init P2P
+  useEffect(()=>{
+    p2pRef.current=new P2PNode({
+      onOpen(pid){
+        setPeers(ps=>{
+          const ex=ps.find(p=>p.id===pid)
+          if(ex)return ps.map(p=>p.id===pid?{...p,online:true,state:'connected'}:p)
+          return[...ps,{id:pid,name:'',online:true,since:now8(),state:'connected'}]
+        })
+        pushMsg(pid,{id:Date.now(),from:'sys',text:'🔒 P2P channel open. AES-GCM-256 E2E active.',time:now8(),type:'sys'})
+        notify('Peer connected — E2E encrypted','ok')
+      },
+      onClose(pid){
+        setPeers(ps=>ps.map(p=>p.id===pid?{...p,online:false,state:'disconnected'}:p))
+        pushMsg(pid,{id:Date.now(),from:'sys',text:'Peer disconnected.',time:now8(),type:'sys'})
+      },
+      onState(pid,state){setPeers(ps=>ps.map(p=>p.id===pid?{...p,state}:p))},
+      onMsg(pid,msg){
+        if(msg.type==='folder_share') pushMsg(pid,{id:Date.now(),from:'them',type:'folder',folder:msg.folder,time:now8()})
+        else pushMsg(pid,{id:Date.now(),from:'them',text:msg.text,time:now8(),type:'text'})
+      },
+      onFileStart(pid,meta){
+        const id=Date.now()
+        setTransfers(t=>({...t,[meta.fid]:{name:meta.name,pct:0,pid,size:meta.size,msgId:id}}))
+        pushMsg(pid,{id,from:'them',type:'file_in',meta,pct:0,time:now8()})
+      },
+      onFileProg(pid,fid,pct){
+        setTransfers(t=>({...t,[fid]:{...t[fid],pct}}))
+        setMsgs(prev=>{
+          const arr=prev[pid]||[]
+          const idx=arr.findIndex(m=>m.type==='file_in'&&m.meta?.fid===fid)
+          if(idx<0)return prev
+          const upd=[...arr];upd[idx]={...upd[idx],pct}
+          return{...prev,[pid]:upd}
+        })
+      },
+      onFileDone(pid,meta,blob){
+        setTransfers(t=>{const n={...t};delete n[meta.fid];return n})
+        setMsgs(prev=>{
+          const arr=prev[pid]||[]
+          const idx=arr.findIndex(m=>m.type==='file_in'&&m.meta?.fid===meta.fid)
+          if(idx<0)return prev
+          const upd=[...arr];upd[idx]={...upd[idx],type:'file_done',pct:1,blob}
+          return{...prev,[pid]:upd}
+        })
+      },
+    })
+  },[pushMsg,notify])
+
+  useEffect(()=>{chatEnd.current?.scrollIntoView({behavior:'smooth'})},[msgs,selPeer])
+
+  // ── ACTIONS ───────────────────────────────────────────────────────────
+  const doSetup=async()=>{
+    const e={}
+    if(!form.name.trim())e.name='Required'
+    if(!form.passphrase.trim())e.passphrase='Required'
+    if(form.password.length<6)e.password='Min 6 chars'
+    if(Object.keys(e).length){setFormErr(e);return}
+    const kp=await generateKeyPair()
+    keyRef.current={keyPair:kp,pub:await exportPublicKey(kp.publicKey)}
+    myId.current=makeNodeId(form.name)
+    setAccount(form);lastAct.current=Date.now();setLockTimer(settings.lockTimeout*60);setScreen('main')
+    notify('Session initialized','ok')
+  }
+
+  const doLock=()=>{setScreen('locked');setLockForm({passphrase:'',password:''});setLockErr('')}
+
+  const doUnlock=()=>{
+    if(lockForm.passphrase===account.passphrase&&lockForm.password===account.password){
+      setLockTries(0);lastAct.current=Date.now();setLockTimer(settings.lockTimeout*60)
+      setScreen('main');setLockForm({passphrase:'',password:''});setLockErr('')
+    } else {
+      const t=lockTries+1;setLockTries(t)
+      if(t>=settings.maxAttempts){
+        p2pRef.current?.closeAll();setAccount(null);setScreen('setup');setLockTries(0)
+        setMsgs({});setPeers([]);setForm({name:'',passphrase:'',password:''})
+        notify(`${settings.maxAttempts} attempts — wiped`,'err')
+      } else setLockErr(`Wrong. ${settings.maxAttempts-t} left before wipe.`)
+    }
+  }
+
+  const doWipe=()=>setConfirm({msg:'⚠ Wipe all session data and close all connections?',onYes:()=>{
+    p2pRef.current?.closeAll();setAccount(null);setScreen('setup');setMsgs({});setPeers([]);setForm({name:'',passphrase:'',password:''});setConfirm(null)
+  }})
+
+  const doOffer=async()=>{
+    setGenMode('loading')
+    try{
+      const{tempId,offerB64}=await p2pRef.current.createOffer(keyRef.current.keyPair,myId.current)
+      setPendId(tempId);setGenCode(offerB64);setInitiatorCode(offerB64);setGenMode('offering')
+      notify('Offer ready — share with peer','info')
+    }catch(e){notify('Offer failed: '+e.message,'err');setGenMode('idle')}
+  }
+
+  const doAnswer=async()=>{
+    if(!offerBox.trim()){notify('Paste the offer first','err');return}
+    setGenMode('loading')
+    try{
+      const{peerId,answerB64}=await p2pRef.current.createAnswer(offerBox.trim(),keyRef.current.keyPair,myId.current)
+      setGenCode(answerB64);setResponderCode(answerB64)
+      setPeers(ps=>[...ps.filter(p=>p.id!==peerId),{id:peerId,name:'',online:false,since:now8(),state:'answering'}])
+      setGenMode('answering')
+      notify('Answer ready — send back to peer','info')
+    }catch(e){notify('Answer failed: '+e.message,'err');setGenMode('idle')}
+  }
+
+  const doFinalize=async()=>{
+    if(!ansBox.trim()||!pendId){notify('Paste the answer first','err');return}
+    try{
+      const peerId=await p2pRef.current.finalizeOffer(pendId,ansBox.trim())
+      setPeers(ps=>ps.map(p=>p.id===pendId?{...p,id:peerId}:p))
+      notify('Connection finalized!','ok');setGenMode('done')
+    }catch(e){notify('Finalize failed: '+e.message,'err')}
+  }
+
+  // Reset entire connect flow — clears pending connections, codes, inputs
+  const doResetConnect=()=>{
+    if(pendId) p2pRef.current?.close(pendId)
+    setGenMode('idle');setGenCode('');setInitiatorCode('');setResponderCode('')
+    setOfferBox('');setAnsBox('');setPendId(null)
+    notify('Connection flow reset','info')
+  }
+
+  // Delete a peer from the list and close their connection
+  const doDeletePeer=(pid)=>{
+    setConfirm({
+      msg:`Remove peer [${pid}] and close their connection? Their messages will still be in history.`,
+      onYes:()=>{
+        p2pRef.current?.close(pid)
+        setPeers(ps=>ps.filter(p=>p.id!==pid))
+        if(selPeer?.id===pid) setSelPeer(null)
+        setConfirm(null)
+        notify('Peer removed','info')
+      }
+    })
+  }
+
+  const doSend=async()=>{
+    if(!input.trim()||!selPeer)return
+    const text=input.trim();setInput('')
+    if(!await p2pRef.current.sendMsg(selPeer.id,text)){notify('Peer not connected','err');return}
+    pushMsg(selPeer.id,{id:Date.now(),from:'me',text,time:now8(),type:'text'})
+  }
+
+  const doSendFile=async(file)=>{
+    if(!selPeer)return
+    setShowAttach(false)
+    if(settings.archiveWarn&&/\.(zip|gz|tar|rar|7z)$/i.test(file.name)) notify(`⚠ Archive file — peer will see sandbox warning`,'info')
+    const msgId=Date.now()
+    pushMsg(selPeer.id,{id:msgId,from:'me',type:'file_out',meta:{fid:'pending',name:file.name,size:file.size},pct:0,time:now8()})
+    const ok=await p2pRef.current.sendFile(selPeer.id,file,pct=>{
+      setMsgs(prev=>{const arr=prev[selPeer.id]||[];const idx=arr.findIndex(m=>m.id===msgId);if(idx<0)return prev;const u=[...arr];u[idx]={...u[idx],pct};return{...prev,[selPeer.id]:u}})
+    })
+    setMsgs(prev=>{const arr=prev[selPeer.id]||[];const idx=arr.findIndex(m=>m.id===msgId);if(idx<0)return prev;const u=[...arr];u[idx]={...u[idx],pct:1};return{...prev,[selPeer.id]:u}})
+    ok?notify(`Sent: ${file.name} (${fmtSz(file.size)})`,'ok'):notify('Send failed','err')
+  }
+
+  const doSendFolder=async(files)=>{
+    if(!selPeer||!files.length)return
+    setShowAttach(false)
+    // Build folder tree from FileList
+    const tree={}
+    for(const file of files){
+      const parts=file.webkitRelativePath.split('/')
+      let node=tree
+      for(let i=0;i<parts.length-1;i++){
+        const seg=parts[i]
+        if(!node[seg])node[seg]={type:'folder',children:{}}
+        node=node[seg].children
+      }
+      const name=parts[parts.length-1]
+      const ext=name.split('.').pop().toLowerCase()
+      node[name]={type:'file',ext,size:fmtSz(file.size),blob:file}
+    }
+    const rootName=files[0].webkitRelativePath.split('/')[0]
+    const meta={name:rootName,type:'folder',children:tree[rootName]?.children||tree}
+    await p2pRef.current.sendFolder(selPeer.id,meta)
+    pushMsg(selPeer.id,{id:Date.now(),from:'me',type:'folder',folder:meta,time:now8()})
+    notify(`Folder "${rootName}" shared`,'ok')
+  }
+
+  const doSendCode=(codeBlock)=>{
+    if(!selPeer)return
+    p2pRef.current.sendMsg(selPeer.id,codeBlock)
+    pushMsg(selPeer.id,{id:Date.now(),from:'me',text:codeBlock,time:now8(),type:'text'})
+  }
+
+  const setPeerName=(id,name)=>setPeers(ps=>ps.map(p=>p.id===id?{...p,name}:p))
+  const setSett=(k,v)=>setSettings(s=>({...s,[k]:v}))
+
+  const onlinePeers=peers.filter(p=>p.online)
+  const peerMsgs=selPeer?(msgs[selPeer.id]||[]):[]
+  const lockPct=(lockTimer/(settings.lockTimeout*60))*100
+
+  // ── SETUP ─────────────────────────────────────────────────────────────
+  if(screen==='setup')return(
+    <div style={{minHeight:'100vh',background:T.bg,display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+      <style>{CSS}</style>
+      <Notif n={notif}/>
+      {showReadme&&<ReadmeModal onClose={()=>setShowReadme(false)}/>}
+      <div style={{width:'100%',maxWidth:440}} className="fadeup">
+        <div style={{textAlign:'center',marginBottom:32}}>
+          <div style={{fontSize:10,color:T.null_,letterSpacing:5,marginBottom:10}}>──────────────────────</div>
+          <div style={{fontSize:32,color:T.accent,fontWeight:700,letterSpacing:5,lineHeight:1}}>FTPS</div>
+          <div style={{fontSize:12,color:T.textDim,letterSpacing:3,marginTop:6}}>FILE TRANSFER PROTOCOL SERVICE</div>
+          <div style={{fontSize:11,color:T.null_,marginTop:5,letterSpacing:2}}>P2P · E2E-AES256 · NO DOMAIN · NO SERVER</div>
+          <div style={{fontSize:10,color:T.null_,letterSpacing:5,marginTop:10}}>──────────────────────</div>
+        </div>
+        <div className="card" style={{padding:28}}>
+          <div style={{fontSize:11,color:T.textDim,letterSpacing:2,marginBottom:20}}>▶ INITIALIZE SESSION — ALL FIELDS REQUIRED</div>
+          {[{k:'name',label:'NAME',ph:'Your display name',type:'text'},{k:'passphrase',label:'PASS-PHRASE',ph:'Memorable unlock phrase',type:'password'},{k:'password',label:'PASSWORD',ph:'Min 6 characters',type:'password'}].map(f=>(
+            <div key={f.k} style={{marginBottom:16}}>
+              <div style={{fontSize:11,marginBottom:6,letterSpacing:1,display:'flex',justifyContent:'space-between',color:formErr[f.k]?T.red:T.textDim}}>
+                <span>{f.label} <span style={{color:T.red}}>*</span></span>
+                {formErr[f.k]&&<span>{formErr[f.k]}</span>}
+              </div>
+              <input value={form[f.k]} type={f.type} placeholder={f.ph} className={`inp${formErr[f.k]?' err':''}`}
+                onChange={e=>{setForm(p=>({...p,[f.k]:e.target.value}));setFormErr(p=>({...p,[f.k]:''}))}}
+                onKeyDown={e=>e.key==='Enter'&&doSetup()}/>
+            </div>
+          ))}
+          <div style={{background:T.panel,border:`1px solid ${T.amber}22`,borderRadius:6,padding:12,marginBottom:20,fontSize:12,color:T.amber,lineHeight:1.9}}>
+            ⚠ Auto-locks after {settings.lockTimeout} min inactivity<br/>
+            ⚠ {settings.maxAttempts} wrong attempts = full wipe<br/>
+            ⚠ Refresh / close tab = all data permanently gone
+          </div>
+          <button onClick={doSetup} className="btn btn-accent" style={{width:'100%',padding:13,fontSize:13,letterSpacing:1,marginBottom:10}}>INITIALIZE SESSION →</button>
+          <button onClick={()=>setShowReadme(true)} className="btn btn-ghost" style={{width:'100%',padding:10,fontSize:12}}>README / DOCUMENTATION</button>
+        </div>
+      </div>
+    </div>
+  )
+
+  // ── LOCK ──────────────────────────────────────────────────────────────
+  if(screen==='locked')return(
+    <div style={{minHeight:'100vh',background:T.bg,display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+      <style>{CSS}</style>
+      <Notif n={notif}/>
+      <div style={{width:'100%',maxWidth:360}} className="fadeup">
+        <div style={{textAlign:'center',marginBottom:24}}>
+          <div style={{fontSize:48,marginBottom:10}} className="pulseAnim">🔒</div>
+          <div style={{fontSize:16,color:T.amber,letterSpacing:2}}>SESSION LOCKED</div>
+          <div style={{fontSize:12,color:T.textDim,marginTop:5}}>Locked due to inactivity</div>
+          {lockTries>0&&<div style={{fontSize:12,color:lockTries>=3?T.red:T.amber,marginTop:7}}>{lockTries} attempt{lockTries>1?'s':''} · {settings.maxAttempts-lockTries} left before wipe</div>}
+        </div>
+        <div className="card" style={{padding:26}}>
+          {['passphrase','password'].map(k=>(
+            <div key={k} style={{marginBottom:16}}>
+              <div style={{fontSize:11,color:T.textDim,marginBottom:6,letterSpacing:1.5}}>{k.toUpperCase()}</div>
+              <input type="password" value={lockForm[k]} placeholder={`Enter ${k}`} className="inp"
+                onChange={e=>setLockForm(p=>({...p,[k]:e.target.value}))} onKeyDown={e=>e.key==='Enter'&&doUnlock()}/>
+            </div>
+          ))}
+          {lockErr&&<div style={{fontSize:12,color:T.red,marginBottom:14}}>{lockErr}</div>}
+          <button onClick={doUnlock} className="btn btn-amber" style={{width:'100%',padding:12,fontSize:13,letterSpacing:1}}>UNLOCK SESSION</button>
+        </div>
+      </div>
+    </div>
+  )
+
+  // ── MAIN ──────────────────────────────────────────────────────────────
+  return(
+    <div style={{height:'100vh',background:T.bg,display:'flex',flexDirection:'column',overflow:'hidden'}}>
+      <style>{CSS}</style>
+      <Notif n={notif}/>
+      {folderView&&<SandboxFolder folder={folderView} onClose={()=>setFolderView(null)}/>}
+      {showReadme&&<ReadmeModal onClose={()=>setShowReadme(false)}/>}
+      {showCode&&selPeer&&<CodeEditor onSend={doSendCode} onClose={()=>setShowCode(false)}/>}
+      {confirm&&<ConfirmModal msg={confirm.msg} onYes={confirm.onYes} onNo={()=>setConfirm(null)}/>}
+
+      {/* TOP BAR */}
+      <div style={{height:52,background:T.surface,borderBottom:`1px solid ${T.border}`,display:'flex',alignItems:'center',padding:'0 14px',gap:12,flexShrink:0,zIndex:30}}>
+        <button onClick={()=>setSideSmall(s=>!s)} style={{background:'none',border:'none',color:T.textDim,fontSize:18,padding:'4px 6px',borderRadius:4,lineHeight:1}}>☰</button>
+        <div style={{fontSize:15,fontWeight:700,color:T.accent,letterSpacing:4}}>FTPS</div>
+        <div style={{width:1,height:18,background:T.border}}/>
+        <div style={{fontSize:12,color:T.textDim}}><span style={{color:T.accent}}>{myId.current}</span> · <span style={{color:T.text}}>{account?.name}</span></div>
+        <div style={{flex:1}}/>
+        {/* Lock countdown */}
+        <div style={{display:'flex',alignItems:'center',gap:8}} title="Inactivity lock countdown — resets on activity">
+          <span style={{fontSize:12,color:lockTimer<120?T.red:T.textDim,animation:lockTimer<60?'blink 1s infinite':'none',fontVariantNumeric:'tabular-nums'}}>{fmtMin(lockTimer)}</span>
+          <div style={{width:56,height:3,background:T.border,borderRadius:2}}><div style={{height:'100%',width:`${lockPct}%`,background:lockTimer<120?T.red:T.accentDim,borderRadius:2,transition:'width 1s linear'}}/></div>
+        </div>
+        <div className="hide-md" style={{fontSize:12,color:onlinePeers.length?T.green:T.null_}}>
+          {onlinePeers.length?`● ${onlinePeers.length} peer${onlinePeers.length>1?'s':''}`:' ○ no peers'}
+        </div>
+        <button onClick={doLock} className="btn btn-amber btn-sm" style={{gap:6}}>🔒 Lock</button>
+        <button onClick={()=>setShowReadme(true)} className="btn btn-ghost btn-sm">DOCS</button>
+        <div className="hide-md" style={{fontSize:11,color:T.red,background:T.red+'0c',border:`1px solid ${T.red}20`,borderRadius:4,padding:'4px 8px'}}>⚠ Refresh = lost</div>
+      </div>
+
+      <div style={{flex:1,display:'flex',overflow:'hidden'}}>
+
+        {/* SIDEBAR */}
+        <div style={{width:sideSmall?52:190,background:T.surface,borderRight:`1px solid ${T.border}`,display:'flex',flexDirection:'column',flexShrink:0,transition:'width .18s ease',overflow:'hidden'}}>
+          {!sideSmall&&(
+            <div style={{padding:'12px 16px 10px',borderBottom:`1px solid ${T.border}`}}>
+              <div style={{fontSize:10,color:T.textDim,letterSpacing:2,marginBottom:3}}>NODE</div>
+              <div style={{fontSize:14,color:T.accent,fontWeight:700,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{account?.name}</div>
+              <div style={{fontSize:10,color:T.null_}}>{myId.current}</div>
+            </div>
+          )}
+          {[{id:'network',icon:'⬡',l:'P2P Network'},{id:'connect',icon:'⊕',l:'Connect Peer'},{id:'history',icon:'◷',l:'History'},{id:'details',icon:'◉',l:'My Details'},{id:'uptime',icon:'▲',l:'Up-Time'},{id:'dev',icon:'⚙',l:'System/Dev'},{id:'settings',icon:'✦',l:'Settings'}].map(item=>(
+            <button key={item.id} className={`sbtn ${tab===item.id?'act':''}`}
+              style={sideSmall?{justifyContent:'center',padding:'13px 0',gap:0}:{}}
+              onClick={()=>{setTab(item.id);setSelPeer(null)}} title={item.l}>
+              <span style={{fontSize:16,flexShrink:0}}>{item.icon}</span>
+              {!sideSmall&&<span>{item.l}</span>}
+            </button>
+          ))}
+          <div style={{flex:1}}/>
+          {!sideSmall&&<div style={{padding:'8px 14px',borderTop:`1px solid ${T.border}`,fontSize:10,color:T.null_,lineHeight:1.8}}>◈ WebRTC Direct P2P<br/>◈ ECDH P-256 + AES-GCM-256</div>}
+        </div>
+
+        {/* CENTER */}
+        <div className="cpanel" style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
+
+          {/* NETWORK */}
+          {tab==='network'&&(
+            <div style={{flex:1,padding:20,overflowY:'auto'}} className="fadein">
+              <div style={{fontSize:12,color:T.accentDim,letterSpacing:3,marginBottom:18,fontWeight:700}}>⬡ SYSTEM & NETWORK</div>
+
+              {/* Identity */}
+              <div style={{fontSize:10,color:T.textDim,letterSpacing:2,marginBottom:8,fontWeight:700}}>NODE IDENTITY</div>
+              <div className="card" style={{marginBottom:16,overflow:'hidden'}}>
+                {[
+                  {l:'Node ID',        v:myId.current, c:T.accent},
+                  {l:'Display Name',   v:account?.name, c:T.text},
+                  {l:'Session Crypto', v:'ECDH P-256 key exchange · AES-GCM-256 encryption', c:T.green},
+                ].map(r=>(
+                  <div key={r.l} style={{display:'grid',gridTemplateColumns:'140px 1fr',gap:16,padding:'11px 16px',borderBottom:`1px solid ${T.border}`}}>
+                    <span style={{fontSize:12,color:T.textDim}}>{r.l}</span>
+                    <span style={{fontSize:12,color:r.c,fontWeight:r.c===T.accent?700:400}}>{r.v}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Network */}
+              <div style={{fontSize:10,color:T.textDim,letterSpacing:2,marginBottom:8,fontWeight:700}}>NETWORK</div>
+              <div className="card" style={{marginBottom:16,overflow:'hidden'}}>
+                {[
+                  {l:'Local IP',       v:localIP==='detecting…'?'Detecting via WebRTC…':localIP, c:localIP==='N/A'?T.null_:T.accent},
+                  {l:'Public IP',      v:'Resolved via STUN during peer handshake', c:T.textMid},
+                  {l:'MAC Address',    v:'Not accessible — blocked by all browsers (privacy protection)', c:T.null_},
+                  {l:'Transport',      v:'WebRTC DataChannel (ordered SCTP, reliable)', c:T.blue},
+                  {l:'Server relay',   v:'None — traffic is direct peer-to-peer', c:T.accent},
+                  {l:'STUN servers',   v:'Google, Cloudflare, STUNProtocol (NAT discovery only)', c:T.textMid},
+                ].map(r=>(
+                  <div key={r.l} style={{display:'grid',gridTemplateColumns:'140px 1fr',gap:16,padding:'11px 16px',borderBottom:`1px solid ${T.border}`}}>
+                    <span style={{fontSize:12,color:T.textDim}}>{r.l}</span>
+                    <span style={{fontSize:12,color:r.c}}>{r.v}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Peers */}
+              <div style={{fontSize:10,color:T.textDim,letterSpacing:2,marginBottom:8,fontWeight:700}}>PEERS</div>
+              <div className="card" style={{marginBottom:16,overflow:'hidden'}}>
+                {[
+                  {l:'Online',         v:`${onlinePeers.length} peer${onlinePeers.length!==1?'s':''}`, c:onlinePeers.length?T.green:T.null_},
+                  {l:'Total known',    v:`${peers.length} peer${peers.length!==1?'s':''}`, c:T.textMid},
+                  {l:'Session uptime', v:fmt(uptime), c:T.textMid},
+                ].map(r=>(
+                  <div key={r.l} style={{display:'grid',gridTemplateColumns:'140px 1fr',gap:16,padding:'11px 16px',borderBottom:`1px solid ${T.border}`}}>
+                    <span style={{fontSize:12,color:T.textDim}}>{r.l}</span>
+                    <span style={{fontSize:12,color:r.c,fontWeight:r.c===T.green?700:400}}>{r.v}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{background:T.panel,border:`1px solid ${T.border}`,borderRadius:6,padding:'11px 14px',fontSize:12,color:T.textDim,lineHeight:1.8}}>
+                <strong style={{color:T.amber}}>About local IP:</strong> Detected using a silent WebRTC ICE probe — no external request is made. Shows your LAN address (e.g. 192.168.x.x). If shown as N/A, your browser's privacy settings block this.
+              </div>
+            </div>
+          )}
+
+          {/* CONNECT */}
+          {tab==='connect'&&(
+            <div style={{flex:1,padding:20,overflowY:'auto'}} className="fadein">
+              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}}>
+                <div style={{fontSize:12,color:T.accentDim,letterSpacing:3,fontWeight:700}}>⊕ P2P CONNECTION — NO SERVER</div>
+                <button onClick={doResetConnect} className="btn btn-danger btn-sm" title="Reset all pending connections and start over">↺ Reset</button>
+              </div>
+
+              {/* Status banner */}
+              {genMode!=='idle'&&(
+                <div style={{marginBottom:14,padding:'10px 14px',borderRadius:6,fontSize:12,lineHeight:1.6,
+                  background: genMode==='done'?T.green+'14':T.amber+'0a',
+                  border:`1px solid ${genMode==='done'?T.green+'50':T.amber+'30'}`,
+                  color: genMode==='done'?T.green:T.amber}}>
+                  {genMode==='loading'   && '⟳ Generating — gathering ICE candidates (STUN + TURN, up to 12 sec)…'}
+                  {genMode==='offering'  && '① Offer ready. Share it with peer, then paste their answer below.'}
+                  {genMode==='answering' && '② Answer ready. Send it back to the initiator.'}
+                  {genMode==='done'      && '✓ Handshake complete — connection is live.'}
+                </div>
+              )}
+
+              {/* BOTH panels always visible */}
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,marginBottom:14}}>
+
+                {/* ── INITIATOR ── */}
+                <div className="card" style={{padding:18,opacity: genMode==='answering'?.45:1, transition:'opacity .2s'}}>
+                  <div style={{fontSize:11,color:T.blue,letterSpacing:2,marginBottom:14,fontWeight:700,display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                    <span>① AS INITIATOR</span>
+                    {(genMode==='offering'||genMode==='done')&&(
+                      <button onClick={doResetConnect} className="btn btn-xs btn-ghost" title="Clear and start over">✕ Clear</button>
+                    )}
+                  </div>
+
+                  {(genMode==='idle'||genMode==='loading'||genMode==='answering')&&(
+                    <button onClick={doOffer} className="btn btn-blue" style={{width:'100%',padding:11}}
+                      disabled={genMode==='loading'||genMode==='answering'}>
+                      {genMode==='loading'?<span>⟳ Generating…</span>:'Generate Offer →'}
+                    </button>
+                  )}
+
+                  {(genMode==='offering'||genMode==='done')&&genCode&&initiatorCode&&(
+                    <div>
+                      <div style={{fontSize:10,color:T.textDim,marginBottom:5,letterSpacing:1}}>YOUR OFFER — copy & share this</div>
+                      <textarea readOnly value={initiatorCode} rows={4}
+                        style={{width:'100%',background:T.bg,border:`1px solid ${T.border}`,borderRadius:5,padding:'8px 10px',color:T.accentDim,fontSize:10,resize:'vertical',fontFamily:'inherit',marginBottom:4}}
+                        onClick={e=>e.target.select()}/>
+                      <button onClick={()=>{navigator.clipboard?.writeText(initiatorCode);notify('Offer copied to clipboard','ok')}} className="btn btn-ghost btn-xs" style={{marginBottom:10,width:'100%'}}>⎘ Copy to Clipboard</button>
+                      <div style={{marginBottom:12}}><QR value={initiatorCode.slice(0,180)} sz={8}/></div>
+                      <div style={{fontSize:10,color:T.textDim,marginBottom:5,letterSpacing:1}}>PASTE PEER'S ANSWER</div>
+                      <textarea value={ansBox} onChange={e=>setAnsBox(e.target.value)} rows={4}
+                        placeholder="Paste peer's answer string here…"
+                        style={{width:'100%',background:T.bg,border:`1px solid ${T.border}`,borderRadius:5,padding:'8px 10px',color:T.text,fontSize:10,resize:'vertical',fontFamily:'inherit',marginBottom:10}}/>
+                      <button onClick={doFinalize} className="btn btn-green" style={{width:'100%',padding:10}}
+                        disabled={!ansBox.trim()}>
+                        ✓ Finalize Connection
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* ── RESPONDER ── */}
+                <div className="card" style={{padding:18,opacity: (genMode==='offering'||genMode==='done')?.45:1, transition:'opacity .2s'}}>
+                  <div style={{fontSize:11,color:T.purple,letterSpacing:2,marginBottom:14,fontWeight:700,display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                    <span>② AS RESPONDER</span>
+                    {genMode==='answering'&&(
+                      <button onClick={doResetConnect} className="btn btn-xs btn-ghost" title="Clear and start over">✕ Clear</button>
+                    )}
+                  </div>
+
+                  <div style={{fontSize:10,color:T.textDim,marginBottom:5,letterSpacing:1}}>PASTE INITIATOR'S OFFER</div>
+                  <textarea value={offerBox} onChange={e=>setOfferBox(e.target.value)} rows={4}
+                    placeholder="Paste offer string here…"
+                    style={{width:'100%',background:T.bg,border:`1px solid ${T.border}`,borderRadius:5,padding:'8px 10px',color:T.text,fontSize:10,resize:'vertical',fontFamily:'inherit',marginBottom:10}}/>
+                  <button onClick={doAnswer} className="btn btn-purple" style={{width:'100%',padding:10}}
+                    disabled={genMode==='loading'||!offerBox.trim()||(genMode==='offering'||genMode==='done')}>
+                    {genMode==='loading'?'Generating…':'Generate Answer →'}
+                  </button>
+
+                  {genMode==='answering'&&genCode&&responderCode&&(
+                    <div style={{marginTop:12}}>
+                      <div style={{fontSize:10,color:T.textDim,marginBottom:5,letterSpacing:1}}>YOUR ANSWER — copy & send back</div>
+                      <textarea readOnly value={responderCode} rows={4}
+                        style={{width:'100%',background:T.bg,border:`1px solid ${T.border}`,borderRadius:5,padding:'8px 10px',color:T.purple,fontSize:10,resize:'vertical',fontFamily:'inherit',marginBottom:4}}
+                        onClick={e=>e.target.select()}/>
+                      <button onClick={()=>{navigator.clipboard?.writeText(responderCode);notify('Answer copied to clipboard','ok')}} className="btn btn-ghost btn-xs" style={{width:'100%'}}>⎘ Copy to Clipboard</button>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* How it works + TURN explanation */}
+              <div style={{background:T.panel,border:`1px solid ${T.border}`,borderRadius:6,padding:'12px 16px',fontSize:12,color:T.textDim,lineHeight:1.9}}>
+                <div style={{color:T.textMid,marginBottom:6,fontWeight:600}}>Why this works across different networks</div>
+                <div>The connection uses <span style={{color:T.blue}}>WebRTC</span> with <span style={{color:T.accent}}>STUN + TURN</span> servers.
+                STUN discovers your public IP. If direct P2P fails (strict NAT, mobile data, different ISPs),
+                <span style={{color:T.accent}}> TURN relays traffic</span> — still end-to-end encrypted, just routed through a relay.
+                The SDP offer/answer exchange via copy-paste replaces a signaling server entirely.</div>
+              </div>
+            </div>
+          )}
+
+          {/* HISTORY */}
+          {tab==='history'&&(
+            <div style={{flex:1,padding:20,overflowY:'auto'}} className="fadein">
+              <div style={{fontSize:12,color:T.accentDim,letterSpacing:3,marginBottom:14,fontWeight:700}}>◷ SESSION HISTORY</div>
+              <div style={{fontSize:12,color:T.amber,background:T.amber+'0a',border:`1px solid ${T.amber}22`,borderRadius:6,padding:11,marginBottom:16}}>⚠ Memory only — data is permanently lost on refresh or tab close</div>
+              {(()=>{
+                // Only show meaningful events: peer connect/disconnect, messages sent by me, files sent/received — no internal sys noise
+                const events = Object.entries(msgs)
+                  .flatMap(([pid,ms])=>ms
+                    .filter(m=>{
+                      if(m.type==='sys') return m.text.includes('channel open')||m.text.includes('closed') // only connection events
+                      if(m.type==='text') return true
+                      if(['file_out','file_done'].includes(m.type)) return true
+                      if(m.type==='folder') return true
+                      return false
+                    })
+                    .map(m=>({...m,pid}))
+                  )
+                  .sort((a,b)=>a.id-b.id)
+                if(!events.length) return <div style={{color:T.null_,fontSize:13,textAlign:'center',marginTop:48}}>No history yet.</div>
+                return events.map((ev,i)=>{
+                  const dot = ev.type==='sys'?T.accent:ev.from==='me'?T.blue:T.green
+                  let label
+                  if(ev.type==='sys') label = ev.text.includes('open') ? `Connected to peer [${ev.pid}]` : `Disconnected from peer [${ev.pid}]`
+                  else if(ev.type==='text') label = ev.from==='me' ? `You → [${ev.pid}]:  ${ev.text.slice(0,80)}${ev.text.length>80?'…':''}` : `[${ev.pid}] → You:  ${ev.text.slice(0,80)}${ev.text.length>80?'…':''}`
+                  else if(ev.type==='file_out') label = `You sent file to [${ev.pid}]: ${ev.meta?.name} (${fmtSz(ev.meta?.size||0)})`
+                  else if(ev.type==='file_done') label = `Received file from [${ev.pid}]: ${ev.meta?.name} (${fmtSz(ev.meta?.size||0)})`
+                  else if(ev.type==='folder') label = ev.from==='me' ? `You shared folder to [${ev.pid}]: ${ev.folder?.name}` : `[${ev.pid}] shared folder: ${ev.folder?.name}`
+                  return(
+                    <div key={i} className="card" style={{display:'flex',gap:12,padding:'10px 16px',marginBottom:5}}>
+                      <span style={{fontSize:11,color:T.textDim,flexShrink:0,width:68,fontVariantNumeric:'tabular-nums'}}>{ev.time}</span>
+                      <div style={{width:6,height:6,borderRadius:'50%',background:dot,marginTop:5,flexShrink:0}}/>
+                      <span style={{fontSize:12,color:T.textMid,flex:1,wordBreak:'break-word'}}>{label}</span>
+                    </div>
+                  )
+                })
+              })()}
+            </div>
+          )}
+
+          {/* DETAILS */}
+          {tab==='details'&&(
+            <div style={{flex:1,padding:20,overflowY:'auto'}} className="fadein">
+              <div style={{fontSize:12,color:T.accentDim,letterSpacing:3,marginBottom:16,fontWeight:700}}>◉ MY DETAILS</div>
+              <div className="card" style={{overflow:'hidden'}}>
+                {[
+                  {l:'Display Name',     v:account?.name},
+                  {l:'Node ID',          v:myId.current, c:T.accent},
+                  {l:'Local IP',         v:localIP==='detecting…'?'Detecting…':localIP, c:T.accent},
+                  {l:'MAC Address',      v:'N/A  (browsers block MAC access for privacy)', c:T.null_},
+                  {l:'ECDH Public Key',  v:(keyRef.current?.pub||'').slice(0,52)+'…', c:T.textDim},
+                  {l:'Session Crypto',   v:'ECDH P-256 + AES-GCM-256', c:T.green},
+                  {l:'Passphrase',       v:'✓ set (hidden)', c:T.green},
+                  {l:'Password',         v:'✓ set (hidden)', c:T.green},
+                  {l:'Session started',  v:new Date(Date.now()-uptime*1000).toLocaleTimeString()},
+                ].map(d=>(
+                  <div key={d.l} style={{display:'grid',gridTemplateColumns:'170px 1fr',gap:16,padding:'11px 16px',borderBottom:`1px solid ${T.border}`}}>
+                    <span style={{fontSize:12,color:T.textDim}}>{d.l}</span>
+                    <span style={{fontSize:12,color:d.c||T.text,wordBreak:'break-all'}}>{d.v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* UPTIME */}
+          {tab==='uptime'&&(
+            <div style={{flex:1,padding:20,overflowY:'auto'}} className="fadein">
+              <div style={{fontSize:12,color:T.accentDim,letterSpacing:3,marginBottom:16,fontWeight:700}}>▲ UP-TIME MONITOR</div>
+              <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(170px,1fr))',gap:10}}>
+                {[{l:'SESSION UPTIME',v:fmt(uptime),c:T.accent,big:true},{l:'LOCK TIMER',v:fmtMin(lockTimer),c:lockTimer<120?T.red:T.amber},{l:'PEERS ONLINE',v:String(onlinePeers.length),c:T.green},{l:'MSGS SENT',v:String(Object.values(msgs).flat().filter(m=>m.from==='me'&&m.type==='text').length)},{l:'FILES SENT',v:String(Object.values(msgs).flat().filter(m=>m.from==='me'&&m.type==='file_out').length)},{l:'ACTIVE TRANSFERS',v:String(Object.keys(transfers).length),c:Object.keys(transfers).length?T.amber:T.textMid}].map(s=>(
+                  <div key={s.l} className="card" style={{padding:'14px 16px'}}>
+                    <div style={{fontSize:10,color:T.textDim,letterSpacing:2,marginBottom:6}}>{s.l}</div>
+                    <div style={{fontSize:s.big?26:16,color:s.c||T.text,fontWeight:700,fontVariantNumeric:'tabular-nums'}}>{s.v}</div>
+                  </div>
+                ))}
+              </div>
+              {Object.keys(transfers).length>0&&(
+                <div style={{marginTop:16}}>
+                  <div style={{fontSize:11,color:T.accentDim,letterSpacing:2,marginBottom:10,fontWeight:700}}>ACTIVE TRANSFERS</div>
+                  {Object.entries(transfers).map(([id,t])=>(
+                    <div key={id} className="card" style={{padding:'12px 16px',marginBottom:8}}>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:6}}>
+                        <span style={{fontSize:13,color:T.text}}>{t.name}</span>
+                        <span style={{fontSize:12,color:T.accent}}>{Math.round(t.pct*100)}%</span>
+                      </div>
+                      <div className="prog-track"><div className="prog-fill" style={{width:`${t.pct*100}%`}}/></div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* DEV */}
+          {tab==='dev'&&(
+            <div style={{flex:1,padding:20,overflowY:'auto'}} className="fadein">
+              <div style={{fontSize:12,color:T.accentDim,letterSpacing:3,marginBottom:16,fontWeight:700}}>⚙ SYSTEM / DEV INFO</div>
+              <div className="card" style={{padding:18}}>
+                {[{l:'Browser',v:navigator.userAgent.slice(0,60)+'…'},{l:'WebRTC',v:typeof RTCPeerConnection!=='undefined'?'✓ Supported':'✗ Unsupported',c:typeof RTCPeerConnection!=='undefined'?T.green:T.red},{l:'WebCrypto',v:typeof crypto.subtle!=='undefined'?'✓ Supported':'✗ Unsupported',c:typeof crypto.subtle!=='undefined'?T.green:T.red},{l:'DataChannel',v:'Ordered SCTP (reliable)'},{l:'STUN Servers',v:'Google, Cloudflare, STUNProtocol'},{l:'Chunk Size',v:fmtSz(settings.chunkSize)},{l:'Spam Limit',v:`${settings.spamLimit} msgs/min/peer`},{l:'Code Execution',v:'Disabled — display only'},{l:'Persistence',v:'None — memory only'},{l:'Archive Sandbox',v:settings.archiveWarn?'Enabled':'Disabled'}].map(d=>(
+                  <div key={d.l} style={{display:'flex',gap:14,padding:'9px 0',borderBottom:`1px solid ${T.border}`}}>
+                    <div style={{fontSize:11,color:T.textDim,width:150,flexShrink:0}}>{d.l}</div>
+                    <div style={{fontSize:12,color:d.c||T.text}}>{d.v}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* SETTINGS */}
+          {tab==='settings'&&(
+            <div style={{flex:1,padding:20,overflowY:'auto'}} className="fadein">
+              <div style={{fontSize:12,color:T.accentDim,letterSpacing:3,marginBottom:16,fontWeight:700}}>✦ SETTINGS</div>
+              <div className="card" style={{padding:18,marginBottom:12}}>
+                <div style={{fontSize:11,color:T.textDim,letterSpacing:2,marginBottom:12,fontWeight:700}}>SECURITY</div>
+                {[{k:'lockTimeout',l:'Auto-lock timeout (minutes)',min:1,max:60,step:1},{k:'maxAttempts',l:'Max unlock attempts before wipe',min:1,max:10,step:1}].map(s=>(
+                  <div key={s.k} style={{display:'flex',alignItems:'center',gap:12,padding:'11px 0',borderBottom:`1px solid ${T.border}`}}>
+                    <div style={{flex:1,fontSize:13,color:T.text}}>{s.l}</div>
+                    <div style={{display:'flex',alignItems:'center',gap:8}}>
+                      <button onClick={()=>setSett(s.k,Math.max(s.min,settings[s.k]-s.step))} className="btn btn-ghost" style={{padding:'4px 10px',fontSize:15}}>−</button>
+                      <span style={{fontSize:14,color:T.accent,width:34,textAlign:'center',fontVariantNumeric:'tabular-nums'}}>{settings[s.k]}</span>
+                      <button onClick={()=>setSett(s.k,Math.min(s.max,settings[s.k]+s.step))} className="btn btn-ghost" style={{padding:'4px 10px',fontSize:15}}>+</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="card" style={{padding:18,marginBottom:12}}>
+                <div style={{fontSize:11,color:T.textDim,letterSpacing:2,marginBottom:12,fontWeight:700}}>TRANSFER</div>
+                {[{k:'chunkSize',l:'Chunk size',opts:[8192,16384,32768,65536],fmt:v=>fmtSz(v)},{k:'spamLimit',l:'Spam limit (msgs/min/peer)',opts:[50,100,200,500],fmt:v=>String(v)}].map(s=>(
+                  <div key={s.k} style={{display:'flex',alignItems:'center',gap:12,padding:'11px 0',borderBottom:`1px solid ${T.border}`}}>
+                    <div style={{flex:1,fontSize:13,color:T.text}}>{s.l}</div>
+                    <div style={{display:'flex',gap:5,flexWrap:'wrap',justifyContent:'flex-end'}}>
+                      {s.opts.map(o=>(
+                        <button key={o} onClick={()=>setSett(s.k,o)} className="btn btn-xs"
+                          style={{background:settings[s.k]===o?T.accent+'22':'transparent',border:`1px solid ${settings[s.k]===o?T.accent:T.border}`,color:settings[s.k]===o?T.accent:T.textDim}}>
+                          {s.fmt(o)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="card" style={{padding:18,marginBottom:20}}>
+                <div style={{fontSize:11,color:T.textDim,letterSpacing:2,marginBottom:12,fontWeight:700}}>FEATURES</div>
+                {[{k:'mdRender',l:'Markdown rendering in chat'},{k:'linkWarn',l:'External link warnings'},{k:'archiveWarn',l:'Archive sandbox warnings'}].map(s=>(
+                  <div key={s.k} style={{display:'flex',alignItems:'center',gap:12,padding:'11px 0',borderBottom:`1px solid ${T.border}`}}>
+                    <div style={{flex:1,fontSize:13,color:T.text}}>{s.l}</div>
+                    <button onClick={()=>setSett(s.k,!settings[s.k])} className="btn btn-xs"
+                      style={{background:settings[s.k]?T.accent+'18':'transparent',border:`1px solid ${settings[s.k]?T.accent:T.border}`,color:settings[s.k]?T.accent:T.textDim,minWidth:44}}>
+                      {settings[s.k]?'ON':'OFF'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button onClick={doWipe} className="btn btn-danger">✕ End Session & Wipe All</button>
+            </div>
+          )}
+        </div>
+
+        {/* RIGHT PANEL — WHATSAPP STYLE */}
+        <div className="rpanel" style={{width:selPeer?420:300,borderLeft:`1px solid ${T.border}`,display:'flex',flexDirection:'column',background:T.surface,transition:'width .2s ease'}}>
+
+          {/* PEERS LIST */}
+          {!selPeer?(
+            <>
+              <div style={{padding:'14px 16px',borderBottom:`1px solid ${T.border}`,display:'flex',alignItems:'center',justifyContent:'space-between',flexShrink:0}}>
+                <div style={{fontSize:13,color:T.accentDim,fontWeight:700,letterSpacing:1}}>PEERS</div>
+                <div style={{fontSize:11,color:T.textDim}}>{onlinePeers.length} online · {peers.length} total</div>
+              </div>
+              <div style={{flex:1,overflowY:'auto'}}>
+                {!peers.length&&(
+                  <div style={{textAlign:'center',padding:40,color:T.null_,fontSize:13,lineHeight:2.2}}>
+                    No peers connected.<br/>
+                    <span style={{fontSize:12}}>Use "Connect Peer" tab<br/>to establish P2P.</span>
+                  </div>
+                )}
+                {peers.map(peer=>(
+                  <div key={peer.id} className={`prow ${selPeer?.id===peer.id?'sel':''}`} style={{position:'relative'}}>
+                    <div style={{flex:1,display:'flex',alignItems:'center',gap:12}} onClick={()=>setSelPeer(peer)}>
+                      <Avatar name={peer.name} id={peer.id} size={44} online={peer.online}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:14,color:peer.name?T.text:T.null_,fontWeight:peer.name?600:400,fontStyle:peer.name?'normal':'italic',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                          {peer.name||'Anonymous'}
+                        </div>
+                        <div style={{fontSize:11,color:T.textDim,marginTop:1}}>{peer.id} · {peer.state}</div>
+                      </div>
+                      <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:4}}>
+                        <div className={`dot ${peer.online?'dot-on':'dot-off'}`}/>
+                        <div style={{fontSize:10,color:peer.online?T.green:T.null_}}>{peer.online?'LIVE':'OFF'}</div>
+                      </div>
+                    </div>
+                    <button onClick={e=>{e.stopPropagation();doDeletePeer(peer.id)}}
+                      title="Remove peer"
+                      style={{marginLeft:8,background:'transparent',border:`1px solid ${T.border}`,color:T.red,borderRadius:4,padding:'3px 7px',fontSize:11,flexShrink:0,cursor:'pointer',opacity:.7}}
+                      onMouseEnter={e=>e.currentTarget.style.opacity='1'}
+                      onMouseLeave={e=>e.currentTarget.style.opacity='.7'}>
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </>
+          ):(
+            /* CHAT PANEL — FULL WhatsApp STYLE */
+            <>
+              {/* Chat header */}
+              <div style={{padding:'11px 16px',borderBottom:`1px solid ${T.border}`,display:'flex',alignItems:'center',gap:12,flexShrink:0,background:T.panel}}>
+                <button onClick={()=>setSelPeer(null)} style={{background:'none',border:'none',color:T.textDim,fontSize:20,padding:'2px 4px',lineHeight:1}}>←</button>
+                <Avatar name={selPeer.name} id={selPeer.id} size={42} online={selPeer.online}/>
+                <div style={{flex:1,minWidth:0}}>
+                  <input value={selPeer.name} onChange={e=>setPeerName(selPeer.id,e.target.value)}
+                    placeholder="Click to name this peer…"
+                    style={{background:'none',border:'none',color:selPeer.name?T.text:T.null_,fontFamily:'inherit',fontSize:14,fontStyle:selPeer.name?'normal':'italic',width:'100%',outline:'none',fontWeight:600,padding:0}}/>
+                  <div style={{fontSize:11,color:T.textDim,marginTop:1,display:'flex',alignItems:'center',gap:6}}>
+                    <span>{selPeer.id}</span>
+                    <span style={{color:T.null_}}>·</span>
+                    <span style={{color:selPeer.online?T.green:T.red}}>{selPeer.online?'🔒 E2E · Direct P2P':'⚠ Disconnected'}</span>
+                  </div>
+                </div>
+                <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                  {selPeer.online&&<div style={{fontSize:10,color:T.green,background:T.green+'12',border:`1px solid ${T.green}30`,borderRadius:4,padding:'3px 8px'}}>● LIVE</div>}
+                  <button onClick={()=>doDeletePeer(selPeer.id)}
+                    title="Remove this peer"
+                    className="btn btn-danger btn-sm"
+                    style={{padding:'4px 9px',fontSize:11}}>
+                    ✕ Remove
+                  </button>
+                </div>
+              </div>
+
+              {/* Messages */}
+              <div style={{flex:1,overflowY:'auto',padding:'14px 14px 8px',display:'flex',flexDirection:'column',gap:8,background:T.bg}}>
+                {peerMsgs.map(msg=>(
+                  <div key={msg.id} style={{display:'flex',flexDirection:'column',alignItems:msg.from==='me'?'flex-end':msg.from==='sys'?'center':'flex-start'}} className="fadein">
+                    {msg.type==='sys'&&<div className="bub bub-sys">{msg.text}</div>}
+                    {msg.type==='text'&&(
+                      <div className={`bub ${msg.from==='me'?'bub-me':'bub-them'}`}>
+                        <div style={{color:T.text}} dangerouslySetInnerHTML={{__html:settings.mdRender?renderMD(msg.text):escH(msg.text).replace(/\n/g,'<br>')}}/>
+                        <div style={{fontSize:10,color:T.textDim,marginTop:5,textAlign:'right',display:'flex',justifyContent:'flex-end',alignItems:'center',gap:5}}>
+                          {msg.time}
+                          {msg.from==='me'&&<span style={{color:T.accentDim}}>✓</span>}
+                        </div>
+                      </div>
+                    )}
+                    {['file_out','file_in','file_done'].includes(msg.type)&&<FileMsg msg={msg}/>}
+                    {msg.type==='folder'&&<FolderMsg msg={msg} onOpen={()=>setFolderView(msg.folder)}/>}
+                  </div>
+                ))}
+                <div ref={chatEnd}/>
+              </div>
+
+              {/* Active in-progress transfers for this peer */}
+              {Object.values(transfers).filter(t=>t.pid===selPeer?.id).map(t=>(
+                <div key={t.name} style={{padding:'6px 14px',background:T.surface,borderTop:`1px solid ${T.border}`}}>
+                  <div style={{display:'flex',justifyContent:'space-between',marginBottom:3}}>
+                    <span style={{fontSize:11,color:T.textDim,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:'75%'}}>{t.name}</span>
+                    <span style={{fontSize:11,color:T.accent,fontVariantNumeric:'tabular-nums'}}>{Math.round(t.pct*100)}%</span>
+                  </div>
+                  <div className="prog-track"><div className="prog-fill" style={{width:`${t.pct*100}%`}}/></div>
+                </div>
+              ))}
+
+              {/* Input area */}
+              <div style={{padding:'10px 12px',borderTop:`1px solid ${T.border}`,background:T.surface,flexShrink:0}}>
+                <div style={{display:'flex',gap:8,alignItems:'flex-end',position:'relative'}}>
+                  {/* ATTACH BUTTON */}
+                  <div style={{position:'relative',flexShrink:0}}>
+                    <button onClick={()=>setShowAttach(a=>!a)}
+                      style={{width:40,height:40,borderRadius:10,background:showAttach?T.accent+'22':T.panel,border:`1px solid ${showAttach?T.accent:T.border}`,color:showAttach?T.accent:T.textDim,fontSize:22,display:'flex',alignItems:'center',justifyContent:'center',transition:'all .15s'}}>
+                      ⊕
+                    </button>
+                    {showAttach&&(
+                      <AttachMenu
+                        onFile={()=>{setShowAttach(false);fileInp.current?.click()}}
+                        onFolder={()=>{setShowAttach(false);folderInp.current?.click()}}
+                        onCode={()=>{setShowAttach(false);setShowCode(true)}}
+                        onClose={()=>setShowAttach(false)}/>
+                    )}
+                  </div>
+
+                  {/* MESSAGE INPUT */}
+                  <textarea value={input} onChange={e=>setInput(e.target.value)}
+                    onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doSend()}}}
+                    placeholder="Message… Markdown supported · Shift+Enter for newline" rows={2}
+                    style={{flex:1,background:T.bg,border:`1px solid ${T.border}`,borderRadius:10,padding:'10px 14px',color:T.text,fontFamily:'inherit',fontSize:13,resize:'none',lineHeight:1.5,transition:'border-color .15s'}}
+                    onFocus={e=>e.target.style.borderColor=T.accentDim} onBlur={e=>e.target.style.borderColor=T.border}/>
+
+                  {/* SEND BUTTON */}
+                  <button onClick={doSend}
+                    style={{width:40,height:40,borderRadius:10,background:input.trim()?T.accent:T.panel,border:`1px solid ${input.trim()?T.accent:T.border}`,color:input.trim()?T.bg:T.textDim,fontSize:18,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,transition:'all .15s',fontWeight:700}}>
+                    ↑
+                  </button>
+                </div>
+                <div style={{fontSize:10,color:T.null_,marginTop:6,textAlign:'center'}}>
+                  🔒 AES-GCM-256 E2E · No unsend · No code execution · No file size limit
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* HIDDEN INPUTS */}
+      <input ref={fileInp} type="file" multiple style={{display:'none'}} onChange={e=>{[...e.target.files].forEach(f=>doSendFile(f));e.target.value=''}}/>
+      <input ref={folderInp} type="file" webkitdirectory="" multiple style={{display:'none'}} onChange={e=>{if(e.target.files.length)doSendFolder([...e.target.files]);e.target.value=''}}/>
+    </div>
+  )
+}
