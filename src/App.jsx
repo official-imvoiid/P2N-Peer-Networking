@@ -605,11 +605,11 @@ function HelpModal({onClose, inline=false}){
         <R icon="🔒" l="Encryption"      v="AES-256-GCM — every message, every chunk" c={T.green}/>
         <R icon="🎲" l="Nonce"           v="12-byte random per frame — replay-proof" c={T.green}/>
         <R icon="✓"  l="Auth Tag"        v="16-byte GCM — tamper detection per frame" c={T.green}/>
-        <R icon="🔌" l="Transport"       v="TCP.FTPS (Files/Text Peer Stream)" c={T.blue}/>
+        <R icon="🔌" l="Transport"       v="Direct TCP (no relay, no server)" c={T.blue}/>
         <R icon="⊘"  l="Servers"         v="None — fully serverless P2P" c={T.accent}/>
         <R icon="📡" l="STUN/mDNS"      v="IP discovery + local discovery only — nothing relayed"/>
         <R icon="📝" l="Log"             v="In-memory only · Click log line to copy"/>
-        <R icon="🔄" l="Refresh UI"      v="TCP.FTPS survives · session auto-restores" c={T.green}/>
+        <R icon="🔄" l="Refresh UI"      v="TCP connections survive · session auto-restores" c={T.green}/>
         <div style={{marginTop:14,padding:'10px 14px',background:T.accent+'08',border:`1px solid ${T.accent}18`,borderRadius:6}}>
           <div style={{fontSize:11,color:T.accent,fontWeight:700,marginBottom:5}}>🔑 TOFU — Trust-On-First-Use</div>
           <div style={{fontSize:11,color:T.textMid,lineHeight:1.7}}>Like SSH known_hosts. P2N stores each peer's <em>persistent identity key</em> (not the ephemeral ECDH key — so reconnections never trigger false MITM warnings). If a key change is detected, P2N shows a <span style={{color:T.red,fontWeight:600}}>MITM warning</span>.</div>
@@ -698,6 +698,7 @@ export default function App(){
   const[showTofuWarn,setShowTofuWarn]=useState(null)  // {peerId, peerName, tofuDetail}
   const[showLinkConfirm,setShowLinkConfirm]=useState(null)
   const[showArchConfirm,setShowArchConfirm]=useState(null)
+  const[showAttach,setShowAttach]   =useState(false)  // attachment menu open
   const[peerFingerprints,setPeerFingerprints]=useState({})
   const[peerIdentityKeys,setPeerIdentityKeys]=useState({})  // peerId → identityKey for tofuAccept
   const[verifiedPeers,setVerifiedPeers]=useState(new Set())
@@ -923,6 +924,11 @@ export default function App(){
     if(!r){notify('Electron API unavailable','err');setUpnpSt(null);return}
     if(r.ok){setListenActive(true);setListenInfo({port:r.port,localIPs:r.localIPs});addLog('OK',`TCP server port ${r.port}`);notify(`Listening on :${r.port}`,'ok')}
     else{notify('Listen failed: '+r.error,'err');setUpnpSt(null)}
+  }
+
+  const doStopListen=async()=>{
+    const r=await window.ftps?.stopListen()
+    if(r?.ok){setListenActive(false);setListenInfo(null);setPairingCode('');setPairingInfo(null);setUpnpSt(null);notify('Stopped listening','ok');addLog('OK','TCP server stopped')}
   }
 
   const doGetPairingCode=async()=>{
@@ -1430,7 +1436,7 @@ export default function App(){
                   <div className="card" style={{padding:14}}>
                     <div className="sh">Protocol Info</div>
                     {[
-                      {l:'Term', v:'TCP.FTPS (Files/Text)'},
+                      {l:'Transport', v:'Direct TCP (no relay)'},
                       {l:'Encryption', v:'AES-256-GCM'},
                       {l:'Key Exchange', v:'ECDH P-256'},
                       {l:'Identity', v:'TOFU Hash Verified', c:T.green}
@@ -1624,7 +1630,7 @@ export default function App(){
                 <div style={{padding:'10px 14px',background:T.panel,borderRadius:8,fontSize:12,color:T.textDim,lineHeight:1.7}}>
                   <div>🔒 Session data is memory-only — never written to disk</div>
                   <div style={{marginTop:3}}>🛡 Archives extracted to isolated OS temp directory</div>
-                  <div style={{marginTop:3}}>🔑 Persistence.TCP.FTPS handshake every session</div>
+                  <div style={{marginTop:3}}>🔑 ECDH P-256 derives a fresh AES-256-GCM key every session</div>
                 </div>
               </div>
             )}

@@ -127,66 +127,120 @@ function secEntry(level, msg, detail = '') {
 // ── mDNS LOCAL PEER DISCOVERY ─────────────────────────────────────────────────
 // Fully decentralized, serverless, same-network auto-discovery.
 // Uses UDP multicast — no internet, no server, no dependencies.
+// Passive mode: socket is opened on session start so peers on the same network
+// are seen even before the user clicks "Start Listening".
 const MDNS_ADDR = '224.0.0.251'
 const MDNS_PORT = 7476
-let discoverySocket   = null
-let discoveryInterval = null
-const discoveredPeers = new Map()  // address → { name, nodeId, port, address, lastSeen }
+let discoverySocket     = null
+let discoveryInterval   = null
+let _announcePort       = null   // null = passive (receive only), number = active
+const discoveredPeers   = new Map()  // key → { name, nodeId, port, address, lastSeen }
 
-function startDiscovery(listenPort) {
-  if (discoverySocket) stopDiscovery()
-  const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
-  discoverySocket = sock
-
-  sock.on('error', () => { discoverySocket = null })
-  sock.on('message', (data, rinfo) => {
-    try {
-      const msg = JSON.parse(data.toString())
-      if (msg.type !== 'P2N_ANNOUNCE' || msg.nodeId === myNodeId) return
-      const key = rinfo.address + ':' + msg.nodeId
-      discoveredPeers.set(key, {
-        name: msg.name || 'Unknown',
-        nodeId: msg.nodeId,
-        port: msg.port,
-        address: rinfo.address,
-        lastSeen: Date.now(),
-      })
-      // Prune stale peers (>30s)
-      const now = Date.now()
-      for (const [k, v] of discoveredPeers) {
-        if (now - v.lastSeen > 30000) discoveredPeers.delete(k)
+// Join multicast group on every non-loopback IPv4 interface so discovery
+// works regardless of which NIC is connected to the local network.
+function _joinMulticastAll(sock) {
+  try { sock.addMembership(MDNS_ADDR) } catch {}   // default interface
+  const ifaces = os.networkInterfaces()
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of (ifaces[name] || [])) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        try { sock.addMembership(MDNS_ADDR, iface.address) } catch {}
       }
-      emit('ftps:peers-discovered', Array.from(discoveredPeers.values()))
-    } catch {}
-  })
-
-  const announce = () => {
-    if (!discoverySocket) return
-    try {
-      const msg = Buffer.from(JSON.stringify({
-        type: 'P2N_ANNOUNCE',
-        name: myName,
-        nodeId: myNodeId,
-        port: listenPort,
-        v: 1,
-      }))
-      sock.send(msg, MDNS_PORT, MDNS_ADDR, () => {})
-    } catch {}
+    }
   }
+}
 
-  sock.bind(MDNS_PORT, () => {
-    try { sock.addMembership(MDNS_ADDR) } catch {}
-    sock.setMulticastTTL(4)
-    announce()
-    discoveryInterval = setInterval(announce, 5000)
-    secEntry('OK', `mDNS discovery started on port ${listenPort}`)
+// Handle one received mDNS announcement packet.
+function _onDiscoveryMsg(data, rinfo) {
+  try {
+    const msg = JSON.parse(data.toString())
+    if (msg.type !== 'P2N_ANNOUNCE' || msg.nodeId === myNodeId) return
+    if (!msg.port || msg.port === 0) return  // peer is not listening, skip
+    const key = rinfo.address + ':' + msg.nodeId
+    discoveredPeers.set(key, {
+      name:     msg.name || 'Unknown',
+      nodeId:   msg.nodeId,
+      port:     msg.port,
+      address:  rinfo.address,
+      lastSeen: Date.now(),
+    })
+    const now = Date.now()
+    for (const [k, v] of discoveredPeers) {
+      if (now - v.lastSeen > 30000) discoveredPeers.delete(k)
+    }
+    emit('ftps:peers-discovered', Array.from(discoveredPeers.values()))
+  } catch {}
+}
+
+// Create the UDP multicast socket once and bind it. Returns a Promise.
+// Subsequent calls are no-ops if the socket already exists.
+function _ensureDiscoverySocket() {
+  if (discoverySocket) return Promise.resolve()
+  return new Promise(resolve => {
+    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+    discoverySocket = sock
+    sock.on('error', e => {
+      secEntry('WARN', 'mDNS socket error', e.message)
+      discoverySocket = null
+      resolve()  // resolve anyway so callers don't hang
+    })
+    sock.on('message', _onDiscoveryMsg)
+    // Explicitly bind to '0.0.0.0' for reliable multicast reception on all platforms.
+    sock.bind(MDNS_PORT, '0.0.0.0', () => {
+      _joinMulticastAll(sock)
+      try { sock.setMulticastTTL(4) } catch {}
+      try { sock.setMulticastLoopback(true) } catch {}  // allow same-machine testing
+      secEntry('OK', 'mDNS discovery socket ready (passive)')
+      resolve()
+    })
   })
 }
 
+// Start passive discovery (receive only — no announcements).
+// Called when a session is started so the user can see nearby peers
+// in My Network even before clicking "Start Listening".
+function startPassiveDiscovery() {
+  _ensureDiscoverySocket().catch(() => {})
+}
+
+// Start active discovery: receive AND announce on listenPort.
+function startDiscovery(listenPort) {
+  _announcePort = listenPort
+  _ensureDiscoverySocket().then(() => {
+    if (!discoverySocket) return
+    clearInterval(discoveryInterval)
+    const announce = () => {
+      if (!discoverySocket || !_announcePort) return
+      try {
+        const msg = Buffer.from(JSON.stringify({
+          type:   'P2N_ANNOUNCE',
+          name:   myName,
+          nodeId: myNodeId,
+          port:   _announcePort,
+          v:      1,
+        }))
+        discoverySocket.send(msg, MDNS_PORT, MDNS_ADDR, () => {})
+      } catch {}
+    }
+    announce()
+    discoveryInterval = setInterval(announce, 5000)
+    secEntry('OK', `mDNS discovery active on port ${listenPort}`)
+  }).catch(() => {})
+}
+
+// Stop announcing but keep the socket open for passive discovery.
 function stopDiscovery() {
-  clearInterval(discoveryInterval); discoveryInterval = null
-  if (discoverySocket) { try { discoverySocket.close() } catch {}; discoverySocket = null }
+  clearInterval(discoveryInterval)
+  discoveryInterval = null
+  _announcePort     = null
+  // Socket stays open — still receives peer announcements.
   discoveredPeers.clear()
+}
+
+// Full teardown — called only on app quit.
+function _shutdownDiscovery() {
+  stopDiscovery()
+  if (discoverySocket) { try { discoverySocket.close() } catch {}; discoverySocket = null }
 }
 
 // ── WINDOW ────────────────────────────────────────────────────────────────────
@@ -254,7 +308,7 @@ app.whenReady().then(() => {
   app.on('activate', () => { if (!mainWindow) createWindow() })
 })
 app.on('window-all-closed', () => {
-  stopServer(); stopDiscovery()
+  stopServer(); _shutdownDiscovery()
   peers.forEach((_, id) => disconnectPeer(id))
   upnpRemoveMapping().catch(() => {}); cleanupAllSandboxes()
   if (process.platform !== 'darwin') app.quit()
@@ -695,18 +749,23 @@ function connectToPeer(host, port) {
     const local = isLocalIP(host)
     const TIMEOUT = local ? 5000 : 12000  // local = shorter timeout, fail faster
 
+    // Guard against double-reject (timeout fires then 'error' event also fires).
+    let settled = false
+    const rejectOnce = err => { if (!settled) { settled = true; reject(err) } }
+    const resolveOnce = ()  => { if (!settled) { settled = true; resolve() } }
+
     const sock = net.createConnection({ host, port: parseInt(port) }, () => {
       sock.setTimeout(0) // clear connect timeout on success
       new PeerConn(sock, { host, port: parseInt(port) })
-      resolve()
+      resolveOnce()
     })
     sock.on('error', err => {
       secEntry('WARN', `Connect failed (${host}:${port})`, err.message)
-      reject(err)
+      rejectOnce(err)
     })
     sock.setTimeout(TIMEOUT, () => {
       sock.destroy()
-      reject(new Error(local
+      rejectOnce(new Error(local
         ? `No response from ${host}:${port} — check peer is listening on correct port`
         : `Timed out connecting to ${host}:${port} — check pairing code or firewall`
       ))
@@ -747,6 +806,9 @@ ipcMain.handle('ftps:set-identity', (_,{name,nodeId})=>{
   myName=name; 
   activeSession={ name, nodeId: myNodeId, startedAt: new Date().toISOString() }
   secEntry('OK',`Identity: ${name} ${myNodeId}`)
+  // Start passive mDNS discovery so "My Network" shows peers immediately,
+  // even before the user clicks "Start Listening".
+  startPassiveDiscovery()
   return {ok:true, nodeId: myNodeId, identityKey: myIdentityKey}
 })
 ipcMain.handle('ftps:clear-session', ()=>{ activeSession=null; return {ok:true} })
@@ -776,7 +838,7 @@ ipcMain.handle('ftps:connect',          async(_,{host,port})=>{ return connectTo
 ipcMain.handle('ftps:send',             (_,{peerId,payload})=>{const c=peers.get(peerId);if(c&&c._reconnecting){c.send(payload);return{ok:true,queued:true}};if(!c?.ready)return{ok:false,error:'Not connected'};c.send(payload);return{ok:true}})
 ipcMain.handle('ftps:send-file',        async(_,{peerId,fid,name,size,mime,dataB64})=>{const c=peers.get(peerId);if(!c?.ready)return{ok:false,error:'Not connected'};try{await c.sendFile(fid,name,size,mime,dataB64);return{ok:true}}catch(e){return{ok:false,error:e.message}}})
 ipcMain.handle('ftps:disconnect',       (_,{peerId})=>{disconnectPeer(peerId);return{ok:true}})
-ipcMain.handle('ftps:close-all',        ()=>{stopServer();stopDiscovery();peers.forEach((_,id)=>disconnectPeer(id));return{ok:true}})
+ipcMain.handle('ftps:close-all',        ()=>{stopServer();_shutdownDiscovery();peers.forEach((_,id)=>disconnectPeer(id));return{ok:true}})
 ipcMain.handle('ftps:is-connected',     (_,{peerId})=>({connected:peers.has(peerId)&&peers.get(peerId).ready}))
 
 // TOFU IPC
