@@ -1,33 +1,33 @@
 {
   "name": "ftps",
   "version": "2.0.0",
-  "description": "FTPS — Encrypted P2P File Transfer & Chat. No servers. No WebRTC.",
+  "description": "FTPS \u2014 Encrypted P2P File Transfer & Chat. No servers. No WebRTC.",
   "private": true,
   "main": "electron/main.js",
   "scripts": {
-    "dev":     "concurrently \"vite\" \"wait-on http://localhost:5173 && VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
-    "build":   "vite build",
-    "dist":    "vite build && electron-builder",
+    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
+    "build": "vite build",
+    "dist": "vite build && electron-builder",
     "dist:win": "vite build && electron-builder --win",
     "dist:mac": "vite build && electron-builder --mac",
     "dist:linux": "vite build && electron-builder --linux"
   },
   "dependencies": {
-    "react":     "^18.2.0",
+    "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.1",
-    "concurrently":          "^8.2.2",
-    "electron":              "^28.0.0",
-    "electron-builder":      "^24.9.1",
-    "vite":                  "^5.0.10",
-    "wait-on":               "^7.2.0"
+    "concurrently": "^8.2.2",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1",
+    "vite": "^5.0.10",
+    "wait-on": "^7.2.0"
   },
   "build": {
-    "appId":       "com.ftps.app",
+    "appId": "com.ftps.app",
     "productName": "FTPS",
-    "copyright":   "Copyright © 2025 FTPS",
+    "copyright": "Copyright \u00a9 2025 FTPS",
     "files": [
       "dist/**/*",
       "electron/**/*",
@@ -37,19 +37,53 @@
       "output": "release"
     },
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }]
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
     },
     "mac": {
-      "target":   [{ "target": "dmg", "arch": ["x64", "arm64"] }],
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
       "category": "public.app-category.productivity"
     },
     "linux": {
-      "target": [{ "target": "AppImage", "arch": ["x64"] }]
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
     },
     "nsis": {
-      "oneClick":              false,
+      "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true
-    }
+    },
+    "extraResources": [
+      {
+        "from": "tor",
+        "to": "tor",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asarUnpack": [
+      "tor/**/*"
+    ]
   }
 }

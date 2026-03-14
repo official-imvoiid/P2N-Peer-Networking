@@ -36,6 +36,22 @@ export class TCPBridge {
     unsub?.()
     return res.ok ? fid : false
   }
+  async sendFolder(peerId, files, onEvent) {
+    // Send all files in the folder sequentially
+    const total = files.length
+    for (let i = 0; i < total; i++) {
+      const file = files[i]
+      try {
+        await this.sendFile(peerId, file, (pct) => {
+          onEvent?.({ type: 'progress', index: i, total, pct })
+        })
+        onEvent?.({ type: 'file_done', index: i, total })
+      } catch (e) {
+        onEvent?.({ type: 'error', index: i, total, error: e.message })
+      }
+    }
+    onEvent?.({ type: 'done', total })
+  }
   disconnect(peerId) { window.ftps.disconnect(peerId) }
   closeAll()         { window.ftps.closeAll() }
   destroy()          { this._unsubs.forEach(f => f?.()); this._unsubs = [] }

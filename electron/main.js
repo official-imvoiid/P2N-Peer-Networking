@@ -281,9 +281,14 @@ function createWindow() {
           })
         }
       })
-      // Re-emit Tor state
+      // Re-emit Tor state so renderer always knows current status
       if (torProcess && onionAddress) {
-        emit('ftps:tor-status', { status: 'running', onionAddress })
+        const port = tcpServer?.address()?.port || 7000
+        emit('ftps:tor-status', { status: 'running', onionAddress, port })
+      } else if (torProcess && !onionAddress) {
+        emit('ftps:tor-status', { status: 'starting' })
+      } else {
+        emit('ftps:tor-status', { status: 'off' })
       }
     }, 300)
   })
@@ -301,6 +306,8 @@ app.whenReady().then(() => {
   loadTOFU()
   createWindow()
   app.on('activate', () => { if (!mainWindow) createWindow() })
+  // Tor auto-start is handled inside ftps:listen — starts when user begins listening.
+  // This avoids racing before the user has set their identity/session.
 })
 app.on('window-all-closed', () => {
   stopServer(); _shutdownDiscovery(); stopTorDaemon()
@@ -343,12 +350,15 @@ async function startTorHiddenService(localPort) {
     torDataDir = tmpBase
     const hsDir = path.join(tmpBase, 'hidden_service')
     fs.mkdirSync(hsDir, { recursive: true })
-    torSocksPort = 9050 + Math.floor(Math.random() * 1000)
+    torSocksPort = 19050 + Math.floor(Math.random() * 1000)  // FIX: start above 19050 to never clash with a user-run tor on 9050
     const torrc = [
       `SocksPort ${torSocksPort}`,
       `DataDirectory ${tmpBase.replace(/\\/g, '/')}`,
       `HiddenServiceDir ${hsDir.replace(/\\/g, '/')}`,
       `HiddenServicePort ${localPort} 127.0.0.1:${localPort}`,
+      // FIX: suppress GeoIP path warnings by setting them to empty string
+      'GeoIPFile ""',
+      'GeoIPv6File ""',
       'Log notice stderr',
     ].join('\n')
     const torrcPath = path.join(tmpBase, 'torrc')
@@ -357,52 +367,188 @@ async function startTorHiddenService(localPort) {
     emit('ftps:tor-status', { status: 'starting' })
 
     return new Promise((resolve) => {
-      // On Windows, check for local tor.exe in project folder first
-      const torBin = process.platform === 'win32'
-        ? (fs.existsSync(path.join(__dirname, '..', 'tor', 'tor.exe')) ? path.join(__dirname, '..', 'tor', 'tor.exe') : 'tor')
-        : 'tor'
-      const proc = require('child_process').spawn(torBin, ['-f', torrcPath], { windowsHide: true })
+      // ── Tor binary search ────────────────────────────────────────────────
+      // When PACKAGED (npm run dist), electron-builder copies tor/ → resources/tor/
+      // via the extraResources entry in package.json.  process.resourcesPath always
+      // points to the resources/ folder next to the exe, so that is the primary path.
+      //
+      // When running in DEV (npm run dev), __dirname is electron/ inside the project
+      // root, so ../tor/ resolves to the project-level tor/ folder directly.
+      //
+      // Both paths are tried first before falling back to system PATH.
+
+      const IS_PACKAGED = app.isPackaged
+
+      // process.resourcesPath = <app>/resources  (packaged)
+      //                       = <project root>   (dev, not always reliable)
+      const resourcesDir = process.resourcesPath || ''
+
+      // __dirname = <project>/electron (dev) or <asar>/electron (packaged)
+      // Going one level up from __dirname in the packaged case reaches app.asar itself,
+      // which is not a real directory — use process.resourcesPath instead.
+      const devRoot = path.resolve(__dirname, '..')  // project root in dev mode
+
+      const exe = process.platform === 'win32' ? 'tor.exe' : 'tor'
+
+      const possibleBins = process.platform === 'win32'
+        ? [
+            // ① PACKAGED primary — extraResources copies tor/ here
+            path.join(resourcesDir, 'tor', exe),
+            // ② PACKAGED secondary — asar.unpacked mirror (asarUnpack in package.json)
+            path.join(resourcesDir, 'app.asar.unpacked', 'tor', exe),
+            // ③ DEV primary — project root tor/ folder
+            path.join(devRoot, 'tor', exe),
+            // ④ DEV secondary — cwd (same as devRoot in most cases)
+            path.join(process.cwd(), 'tor', exe),
+            // ⑤ User-level installs
+            path.join(process.env.APPDATA || '', 'tor', exe),
+            path.join(process.env.LOCALAPPDATA || '', 'tor', exe),
+          ]
+        : [
+            path.join(resourcesDir, 'tor', exe),
+            path.join(resourcesDir, 'app.asar.unpacked', 'tor', exe),
+            path.join(devRoot, 'tor', exe),
+            path.join(process.cwd(), 'tor', exe),
+            '/usr/bin/tor',
+            '/usr/local/bin/tor',
+            '/opt/homebrew/bin/tor',
+          ]
+
+      let torBin = null
+      for (const b of possibleBins) {
+        if (b && fs.existsSync(b)) { torBin = b; break }
+      }
+
+      // Log search results for diagnostics
+      const searchLog = possibleBins.filter(Boolean)
+        .map(b => `${b} [${fs.existsSync(b) ? 'FOUND' : 'missing'}]`).join(' | ')
+      secEntry('INFO', `Tor search paths: ${searchLog}`)
+
+      // Also check system PATH (covers user-installed tor or manually-run daemon)
+      if (!torBin) {
+        const { execSync } = require('child_process')
+        try {
+          const whichCmd = process.platform === 'win32' ? 'where tor.exe' : 'which tor'
+          const found = execSync(whichCmd, { timeout: 3000 }).toString().trim().split('\n')[0].trim()
+          if (found && fs.existsSync(found)) {
+            torBin = found
+            secEntry('INFO', `Found tor in system PATH: ${torBin}`)
+          }
+        } catch { }
+      }
+
+      if (!torBin) {
+        const hint = IS_PACKAGED
+          ? `Run GetTorDaemon.py from the project folder then rebuild with "npm run dist:win".`
+          : `Run GetTorDaemon.py to install tor.exe into the tor/ folder, then restart.`
+        const msg = `Tor binary not found.\nSearched:\n${possibleBins.filter(Boolean).join('\n')}\n\n${hint}`
+        secEntry('ERR', msg)
+        emit('p2n:log', { ts: new Date().toTimeString().slice(0, 8), level: 'ERR', msg: msg.split('\n')[0] })
+        emit('ftps:tor-status', { status: 'error', error: msg.split('\n')[0] })
+        resolve({ ok: false, error: msg })
+        return
+      }
+
+      secEntry('INFO', `Spawning Tor: ${torBin}`)
+      let proc
+      try {
+        proc = require('child_process').spawn(torBin, ['-f', torrcPath], {
+          windowsHide: true,
+          env: { ...process.env, LD_LIBRARY_PATH: path.dirname(torBin) },
+        })
+      } catch (spawnErr) {
+        const msg = `Failed to spawn Tor process: ${spawnErr.message}`
+        secEntry('ERR', msg)
+        emit('ftps:tor-status', { status: 'error', error: msg })
+        resolve({ ok: false, error: msg })
+        return
+      }
       torProcess = proc
       let started = false
+      let logBuffer = ''
+
       const timeout = setTimeout(() => {
         if (!started) {
           started = true
           secEntry('ERR', 'Tor startup timed out (60s)')
-          emit('ftps:tor-status', { status: 'error' })
+          emit('p2n:log', { ts: new Date().toTimeString().slice(0, 8), level: 'ERR', msg: 'Tor startup timed out. Check if Tor is blocked by firewall or antivirus.' })
+          emit('ftps:tor-status', { status: 'error', error: 'Tor startup timed out (60s)' })
           stopTorDaemon()
-          resolve({ ok: false, error: 'Tor startup timed out. Is Tor installed?' })
+          resolve({ ok: false, error: 'Tor startup timed out' })
         }
       }, 60000)
 
-      proc.stderr.on('data', d => {
-        const line = d.toString()
-        if (line.includes('Bootstrapped 100%') && !started) {
+      const onTorLog = (d) => {
+        const chunk = d.toString()
+        logBuffer += chunk
+        
+        // Log to UI
+        chunk.split('\n').filter(l => l.trim()).forEach(l => {
+          emit('p2n:log', { ts: new Date().toTimeString().slice(0, 8), level: 'INFO', msg: 'Tor: ' + l.trim() })
+        })
+
+        if (logBuffer.includes('Bootstrapped 100%') && !started) {
           started = true
           clearTimeout(timeout)
-          // Read hostname
-          try {
-            onionAddress = fs.readFileSync(path.join(hsDir, 'hostname'), 'utf8').trim()
-            secEntry('OK', `Tor hidden service: ${onionAddress}`)
-            emit('ftps:tor-status', { status: 'running', onionAddress })
-            resolve({ ok: true, onionAddress, port: localPort })
-          } catch (e) {
-            secEntry('ERR', 'Tor: could not read hostname', e.message)
-            emit('ftps:tor-status', { status: 'error' })
-            resolve({ ok: false, error: 'Could not read onion hostname' })
+          
+          // Poll for hostname file (Tor might take a moment to write it after bootstrap)
+          const hostnamePath = path.join(hsDir, 'hostname')
+          let retries = 0
+          const tryRead = () => {
+            try {
+              if (fs.existsSync(hostnamePath)) {
+                onionAddress = fs.readFileSync(hostnamePath, 'utf8').trim()
+                secEntry('OK', `Tor hidden service: ${onionAddress}`)
+                emit('ftps:tor-status', { status: 'running', onionAddress, port: localPort })
+                resolve({ ok: true, onionAddress, port: localPort })
+              } else if (retries < 10) {
+                retries++
+                setTimeout(tryRead, 500)
+              } else {
+                throw new Error('hostname file not created')
+              }
+            } catch (e) {
+              secEntry('ERR', 'Tor: could not read hostname', e.message)
+              emit('ftps:tor-status', { status: 'error' })
+              resolve({ ok: false, error: 'Could not read onion hostname' })
+            }
           }
+          tryRead()
         }
-      })
+      }
+
+      proc.stdout.on('data', onTorLog)
+      proc.stderr.on('data', onTorLog)
+
       proc.on('error', e => {
         if (!started) {
           started = true; clearTimeout(timeout)
-          const msg = e.code === 'ENOENT' ? 'Tor not found. Install Tor and ensure it is in PATH.' : e.message
+          let msg
+          if (e.code === 'ENOENT') {
+            const hint = app.isPackaged
+              ? `Run GetTorDaemon.py from the project source folder, then rebuild with "npm run dist:win".`
+              : `Run GetTorDaemon.py to place tor.exe in the tor/ folder, then restart.`
+            msg = `Tor binary not found at "${torBin}". ${hint}`
+          } else if (e.code === 'EACCES') {
+            msg = `Permission denied running Tor binary "${torBin}". Check file permissions.`
+          } else {
+            msg = `Tor process error: ${e.message} (code: ${e.code || 'unknown'})`
+          }
           secEntry('ERR', 'Tor spawn error', msg)
-          emit('ftps:tor-status', { status: 'error' })
+          emit('p2n:log', { ts: new Date().toTimeString().slice(0, 8), level: 'ERR', msg })
+          emit('ftps:tor-status', { status: 'error', error: msg })
           torProcess = null
           resolve({ ok: false, error: msg })
         }
       })
-      proc.on('exit', () => { torProcess = null; onionAddress = null; emit('ftps:tor-status', { status: 'off' }) })
+      proc.on('exit', (code, signal) => { 
+        if (code !== 0 && code !== null) {
+          const exitMsg = `Tor exited with code ${code}${signal ? ` (signal: ${signal})` : ''}`
+          secEntry('ERR', exitMsg)
+          emit('p2n:log', { ts: new Date().toTimeString().slice(0, 8), level: 'ERR', msg: exitMsg })
+        }
+        torProcess = null; onionAddress = null; emit('ftps:tor-status', { status: 'off' }) 
+      })
     })
   } catch (e) {
     secEntry('ERR', 'Tor init error', e.message)
@@ -835,11 +981,14 @@ ipcMain.handle('ftps:set-tor-enabled', async (_, { enabled }) => {
 })
 ipcMain.handle('ftps:connect-onion', async (_, { address, port }) => {
   try {
+    if (!torProcess) {
+      return { ok: false, error: 'Tor daemon is not running. Enable Tor in Settings first.' }
+    }
     const sock = await connectViaTor(address, port)
-    // Hand off the SOCKS5-tunneled socket to PeerConn just like a normal TCP connection
-    const conn = new PeerConn(sock)
-    conn.on('ready', () => { emit('ftps:peer-connected', { peerId: conn.id, peerName: conn.name, fingerprint: conn._fingerprint, identityKey: conn._peerIdentityKey }) })
-    conn.on('close', id => { emit('ftps:peer-disconnected', { peerId: id }) })
+    // Hand off the SOCKS5-tunneled socket to PeerConn just like a normal TCP connection.
+    // PeerConn._setup() already handles the HELLO handshake and emits events via the
+    // global emit() function, so no additional event wiring is needed here.
+    new PeerConn(sock, { host: address, port: parseInt(port) })
     secEntry('OK', `Connected via Tor to ${address}:${port}`)
     return { ok: true }
   } catch (e) {

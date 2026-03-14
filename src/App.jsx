@@ -1,6 +1,37 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, Component } from 'react'
 import { generateKeyPair } from './lib/crypto.js'
 import { TCPBridge } from './lib/tcpbridge.js'
+
+// ── ERROR BOUNDARY ────────────────────────────────────────────────────────────
+// Prevents any render crash from producing a completely blank screen.
+class ErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { error: null } }
+  static getDerivedStateFromError(e) { return { error: e } }
+  componentDidCatch(e, info) { console.error('P2N render error:', e, info) }
+  render() {
+    if (this.state.error) {
+      const T2 = { bg: '#0b0e14', text: '#e6edf3', border: '#30363d', surface: '#161b22' }
+      return (
+        <div style={{ height: '100vh', background: T2.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+          <div style={{ maxWidth: 420, textAlign: 'center' }}>
+            <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
+            <div style={{ fontSize: 16, color: T2.text, fontWeight: 700, marginBottom: 8 }}>UI Error — TCP connections are unaffected</div>
+            <div style={{ fontSize: 12, color: '#8b949e', marginBottom: 16, background: T2.surface, border: `1px solid ${T2.border}`, borderRadius: 6, padding: '8px 12px', textAlign: 'left', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+              {this.state.error?.message || String(this.state.error)}
+            </div>
+            <button onClick={() => this.setState({ error: null })} style={{ background: '#58a6ff', color: '#0d1117', border: 'none', borderRadius: 6, padding: '8px 18px', fontWeight: 700, cursor: 'pointer', marginRight: 8 }}>
+              Retry
+            </button>
+            <button onClick={() => window.ftps?.windowControl('reload')} style={{ background: 'transparent', color: '#8b949e', border: `1px solid ${T2.border}`, borderRadius: 6, padding: '8px 18px', cursor: 'pointer' }}>
+              Refresh UI
+            </button>
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
 
 // ── DESIGN TOKENS ────────────────────────────────────────────────────────────
 const T = {
@@ -1251,6 +1282,7 @@ export default function App() {
   const [torStatus, setTorStatus] = useState('off') // off|starting|running|error
   const [onionAddr, setOnionAddr] = useState('')
   const [onionInput, setOnionInput] = useState('')
+  const [torError, setTorError] = useState('')  // specific Tor error message
   // system
   const [netInfo, setNetInfo] = useState([])
   const [uptime, setUptime] = useState(0)
@@ -1327,6 +1359,13 @@ export default function App() {
   // Main process events
   useEffect(() => {
     const us = [
+      window.ftps?.on('ftps:tor-status', d => {
+        setTorStatus(d.status);
+        if (d.onionAddress) setOnionAddr(d.onionAddress + ':' + (d.port || 7000));
+        if (d.error) setTorError(d.error);
+        if (d.status === 'running') setTorError('');
+        if (d.status === 'off') { setOnionAddr(''); setTorError('') }
+      }),
       window.ftps?.on('ftps:upnp-status', d => { }),
       window.ftps?.on('p2n:log', e => setLogs(p => [{ ts: e.ts || '', level: e.level, msg: e.msg, detail: e.detail || '' }, ...p].slice(0, 300))),
       window.ftps?.on('app:request-close', () => setShowCloseConfirm(true)),
@@ -1349,8 +1388,18 @@ export default function App() {
     return () => us.forEach(u => u?.())
   }, [screen])
 
-  // Load logs from main
-  useEffect(() => { window.ftps?.getLogs().then(l => setLogs((l || []).reverse().slice(0, 300))).catch(() => { }) }, [])
+  // Load logs from main + sync Tor status
+  useEffect(() => {
+    window.ftps?.getLogs().then(l => setLogs((l || []).reverse().slice(0, 300))).catch(() => { })
+    // Sync Tor status on mount (covers app reload, session restore)
+    window.ftps?.getTorStatus().then(s => {
+      if (s) {
+        setTorStatus(s.running ? 'running' : 'off')
+        if (s.onionAddress) setOnionAddr(s.onionAddress + ':' + (s.socksPort || 7000))
+        if (s.enabled !== undefined) setSett2(p => ({ ...p, torEnabled: s.enabled }))
+      }
+    }).catch(() => { })
+  }, [])
 
   // FIX: Session restore on mount — if sessionStorage has session data AND main process confirms
   // an active session, skip the setup screen (handles Refresh UI without losing session)
@@ -1387,6 +1436,11 @@ export default function App() {
         if (fingerprint) pushMsg(pid, { id: Date.now() + 1, from: 'sys', type: 'sys', text: `🔑 Session fingerprint: ${fingerprint}`, time: now8() })
         addLog('OK', `Connected: ${pn || pid}`, fingerprint ? `FP: ${fingerprint}` : '')
         notify(`${pn || 'Peer'} connected`, 'ok')
+        // FIX: Auto-select the newly connected peer so the chat panel is never blank,
+        // and reset connState so the connect form is reusable without a manual Reset.
+        setSelPeer({ id: pid, name: pn, online: true, reconnecting: false })
+        setConnState('idle')
+        setConnErr('')
         setTab('peers')
       },
       onClose(pid) {
@@ -1559,16 +1613,30 @@ export default function App() {
 
   // ── Tor functions ─────────────────────────────────────────────────────
   const doStartTor = async () => {
-    if (!listenInfo) { notify('Start listening first', 'err'); return }
-    setTorStatus('starting'); addLog('INFO', 'Starting Tor daemon…')
+    // If not listening yet, auto-start listening on the default port
+    if (!listenInfo) {
+      addLog('INFO', 'Auto-starting listener for Tor…')
+      const lr = await window.ftps?.listen(parseInt(listenPort) || 7000, false)
+      if (!lr) { notify('Electron API unavailable', 'err'); return }
+      if (!lr.ok) { notify('Listen failed: ' + lr.error, 'err'); return }
+      setListenActive(true); setListenInfo({ port: lr.port, localIPs: lr.localIPs })
+      addLog('OK', `TCP server port ${lr.port}`)
+      // Now start Tor on the newly opened port
+      setTorStatus('starting'); setTorError(''); addLog('INFO', 'Starting Tor daemon…')
+      const r = await window.ftps?.startTor(lr.port)
+      if (r?.ok) { setTorStatus('running'); setOnionAddr(r.onionAddress + ':' + r.port); addLog('OK', `Tor hidden service: ${r.onionAddress}`); notify('Onion link ready!', 'ok') }
+      else { setTorStatus('error'); setTorError(r?.error || 'Unknown error'); addLog('ERR', 'Tor failed: ' + (r?.error || 'Unknown')); notify('Tor failed: ' + (r?.error || 'Unknown'), 'err') }
+      return
+    }
+    setTorStatus('starting'); setTorError(''); addLog('INFO', 'Starting Tor daemon…')
     const r = await window.ftps?.startTor(listenInfo.port)
     if (r?.ok) { setTorStatus('running'); setOnionAddr(r.onionAddress + ':' + r.port); addLog('OK', `Tor hidden service: ${r.onionAddress}`); notify('Onion link ready!', 'ok') }
-    else { setTorStatus('error'); addLog('ERR', 'Tor failed: ' + (r?.error || 'Unknown')); notify('Tor failed: ' + (r?.error || 'Unknown'), 'err') }
+    else { setTorStatus('error'); setTorError(r?.error || 'Unknown error'); addLog('ERR', 'Tor failed: ' + (r?.error || 'Unknown')); notify('Tor failed: ' + (r?.error || 'Unknown'), 'err') }
   }
 
   const doStopTor = async () => {
     const r = await window.ftps?.stopTor()
-    if (r?.ok) { setTorStatus('off'); setOnionAddr(''); addLog('OK', 'Tor daemon stopped'); notify('Tor stopped', 'ok') }
+    if (r?.ok) { setTorStatus('off'); setOnionAddr(''); setTorError(''); addLog('OK', 'Tor daemon stopped'); notify('Tor stopped', 'ok') }
   }
 
   const doConnectOnion = async () => {
@@ -1830,12 +1898,12 @@ export default function App() {
                     <div>
                       <div style={{ fontSize: 10, color: T.purple, fontWeight: 700, marginBottom: 6, letterSpacing: 1 }}>GENERATE ONION LINK</div>
                       {torStatus !== 'running'
-                        ? <button onClick={doStartTor} className="btn btn-purple" style={{ width: '100%', padding: 9 }} disabled={torStatus === 'starting' || !listenActive}>
+                        ? <button onClick={doStartTor} className="btn btn-purple" style={{ width: '100%', padding: 9 }} disabled={torStatus === 'starting'}>
                           {torStatus === 'starting' ? '⟳ Starting Tor…' : '🧅 Start Tor & Generate Link'}
                         </button>
                         : <button onClick={doStopTor} className="btn btn-danger" style={{ width: '100%', padding: 9 }}>■ Stop Tor</button>
                       }
-                      {!listenActive && torStatus === 'off' && <div style={{ fontSize: 10, color: T.amber, marginTop: 5 }}>⚠ Start listening first (①)</div>}
+                      {!listenActive && torStatus === 'off' && <div style={{ fontSize: 10, color: T.textDim, marginTop: 5 }}>Listening will start automatically</div>}
                       {onionAddr && <div style={{ marginTop: 8, padding: 8, background: T.purple + '08', border: `1px solid ${T.purple}22`, borderRadius: 5 }}>
                         <div style={{ fontSize: 9, color: T.purple, fontWeight: 700, marginBottom: 4, letterSpacing: 1 }}>YOUR ONION ADDRESS</div>
                         <div style={{ display: 'flex', gap: 5 }}>
@@ -1853,7 +1921,11 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-                  {torStatus === 'error' && <div style={{ padding: '6px 9px', background: T.red + '09', border: `1px solid ${T.red}22`, borderRadius: 5, fontSize: 11, color: T.red, marginTop: 6 }}>✕ Tor daemon failed. Is Tor installed on your system?</div>}
+                  {torStatus === 'error' && <div style={{ padding: '8px 11px', background: T.red + '09', border: `1px solid ${T.red}22`, borderRadius: 5, fontSize: 11, color: T.red, marginTop: 6, lineHeight: 1.6 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 3 }}>✕ Tor Daemon Failed</div>
+                    <div style={{ fontSize: 10, wordBreak: 'break-word' }}>{torError || 'Unknown error. Check Logs for details.'}</div>
+                    <div style={{ fontSize: 10, color: T.muted, marginTop: 4 }}>Run <code style={{ background: T.panel, padding: '1px 4px', borderRadius: 3, fontFamily: 'monospace' }}>python GetTorDaemon.py</code> to install/verify the Tor daemon.</div>
+                  </div>}
                 </div>
 
                 <div className="card" style={{ padding: 12, fontSize: 11, color: T.textDim, lineHeight: 1.8 }}>
@@ -2081,9 +2153,15 @@ export default function App() {
                           <div style={{ fontSize: 10, color: T.textDim, fontFamily: 'monospace' }}>{dp.address}:{dp.port}</div>
                         </div>
                         <button onClick={async () => {
-                          notify(`Connecting to ${dp.name || dp.address}…`, 'ok')
-                          const r = await window.ftps?.connect(dp.address, dp.port)
-                          if (r?.ok) { notify('Connected!', 'ok') } else { notify('Failed: ' + (r?.error || 'unknown'), 'err') }
+                          try {
+                            notify(`Connecting to ${dp.name || dp.address}…`, 'ok')
+                            const r = await window.ftps?.connect(dp.address, String(dp.port))
+                            if (r?.ok) { notify('Connected!', 'ok'); setTab('peers') }
+                            else { notify('Failed: ' + (r?.error || 'unknown'), 'err') }
+                          } catch (err) {
+                            notify('Connection error: ' + (err?.message || 'unknown'), 'err')
+                            addLog('ERR', `Connect to ${dp.address}:${dp.port} failed`, err?.message || '')
+                          }
                         }} className="btn btn-ghost btn-sm" style={{ color: T.green, border: `1px solid ${T.green}30` }}>⚡ Connect</button>
                       </div>
                     ))}
@@ -2267,5 +2345,14 @@ export default function App() {
       <input ref={fileInp} type="file" multiple style={{ display: 'none' }} onChange={e => { [...e.target.files].forEach(f => doSendFile(f)); e.target.value = '' }} />
       <input ref={folderInp} type="file" {...{ 'webkitdirectory': '' }} multiple style={{ display: 'none' }} onChange={e => { if (e.target.files.length) doSendFolder([...e.target.files]); e.target.value = '' }} />
     </div>
+  )
+}
+
+// ── WRAPPED EXPORT ─────────────────────────────────────────────────────────────
+export function AppWithErrorBoundary() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   )
 }

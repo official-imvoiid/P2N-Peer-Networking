@@ -21,7 +21,9 @@ import urllib.request
 import tarfile
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-TOR_VERSION = "13.0.9"
+# NOTE: If this version is outdated, check https://www.torproject.org/download/tor/
+# for the latest Tor Expert Bundle version and update TOR_VERSION below.
+TOR_VERSION = "14.0.9"
 TOR_WIN_URL   = (
     f"https://archive.torproject.org/tor-package-archive/torbrowser/"
     f"{TOR_VERSION}/tor-expert-bundle-windows-x86_64-{TOR_VERSION}.tar.gz"
@@ -35,6 +37,9 @@ INSTALL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tor")
 # DLLs that tor.exe depends on inside the Expert Bundle (Windows)
 # Without these, tor.exe will fail to start with a missing DLL error.
 WINDOWS_REQUIRED_FILES = {"tor.exe", "libssl-3-x64.dll", "libcrypto-3-x64.dll", "zlib1.dll"}
+
+# GeoIP files — optional but prevent startup warnings
+GEOIP_FILES = {"geoip", "geoip6"}
 
 # ── COLORS ──────────────────────────────────────────────────────────────────
 def _supports_color():
@@ -203,75 +208,124 @@ def install_linux() -> bool:
 
 
 # ── WINDOWS ─────────────────────────────────────────────────────────────────
+def _verify_tor_binary(tor_path: str) -> bool:
+    """Run tor --version to check the binary actually works."""
+    try:
+        result = subprocess.run(
+            [tor_path, "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            version_line = result.stdout.strip().split("\n")[0]
+            ok(f"Tor binary works: {version_line}")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def install_windows() -> bool:
     """
-    Download Tor Expert Bundle for Windows and extract tor.exe plus the
-    DLLs it depends on (libssl, libcrypto, zlib1).
-
-    IMPORTANT: Extracting *only* tor.exe is not enough — it will immediately
-    crash at startup with a missing DLL error if the libraries are absent.
+    Download Tor Expert Bundle for Windows and extract tor.exe, DLLs, and GeoIP files.
+    FIX: tries multiple version URLs so it never silently fails on a 404.
     """
     info("Platform: Windows")
 
     local_tor = os.path.join(INSTALL_DIR, "tor.exe")
 
-    # Already present and complete?
+    # Already present? Verify it actually runs.
     if os.path.exists(local_tor):
-        missing = [
-            f for f in WINDOWS_REQUIRED_FILES
-            if not os.path.exists(os.path.join(INSTALL_DIR, f))
-        ]
-        if not missing:
-            ok(f"tor.exe and all required DLLs already present in: {INSTALL_DIR}")
+        if _verify_tor_binary(local_tor):
+            ok(f"tor.exe is ready at: {INSTALL_DIR}")
             return True
-        warn(f"tor.exe found but missing DLLs: {missing}. Re-extracting...")
+        warn("tor.exe exists but failed to run. Re-extracting...")
 
     # In PATH already?
-    if shutil.which("tor"):
-        ok("Tor is already installed and in PATH!")
-        return True
+    tor_in_path = shutil.which("tor")
+    if tor_in_path:
+        if _verify_tor_binary(tor_in_path):
+            ok("Tor is already installed and in PATH!")
+            return True
 
-    info(f"Downloading Tor Expert Bundle from:\n  {TOR_WIN_URL}")
+    # FIX: Try configured version first, then fall back to known-good versions
+    # in case the primary URL returns 404 after a new release.
+    def _make_win_url(v):
+        return (f"https://archive.torproject.org/tor-package-archive/torbrowser/"
+                f"{v}/tor-expert-bundle-windows-x86_64-{v}.tar.gz")
+
+    candidate_urls = [TOR_WIN_URL]
+    for v in ["14.0.8", "14.0.7", "13.5.9", "13.5.8"]:
+        u = _make_win_url(v)
+        if u != TOR_WIN_URL:
+            candidate_urls.append(u)
+
+    tmp = tempfile.mkdtemp(prefix="p2n-tor-")
+    archive_path = None
+    used_url = None
+    for url in candidate_urls:
+        info(f"Trying: {url}")
+        dest = os.path.join(tmp, "tor-bundle.tar.gz")
+        try:
+            _download_with_progress(url, dest)
+            archive_path = dest
+            used_url = url
+            ok("Download complete")
+            break
+        except Exception as e:
+            warn(f"  Failed ({e}), trying next version...")
+
+    if not archive_path:
+        err("All download attempts failed.")
+        warn("Manually download the Tor Expert Bundle from:")
+        warn("  https://www.torproject.org/download/tor/")
+        warn(f"  Extract tor.exe and DLLs to: {INSTALL_DIR}")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False
+
+    info(f"Extracting tor.exe, DLLs, and GeoIP files from: {used_url}")
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+
+    extracted = set()
     try:
-        tmp = tempfile.mkdtemp(prefix="p2n-tor-")
-        archive_path = os.path.join(tmp, "tor-bundle.tar.gz")
-
-        _download_with_progress(TOR_WIN_URL, archive_path)
-        ok("Download complete")
-
-        info("Extracting tor.exe and required DLLs...")
-        os.makedirs(INSTALL_DIR, exist_ok=True)
-
-        extracted = set()
         with tarfile.open(archive_path, "r:gz") as tar:
             for member in tar.getmembers():
                 if member.isdir():
                     continue
                 basename = os.path.basename(member.name)
-                if basename in WINDOWS_REQUIRED_FILES:
+                # Extract tor.exe, known DLLs, any other DLLs, and GeoIP data files
+                if (basename in WINDOWS_REQUIRED_FILES
+                        or basename.endswith(".dll")
+                        or basename in GEOIP_FILES):
                     _safe_extract_file(tar, member, INSTALL_DIR)
                     ok(f"Extracted: {basename}")
                     extracted.add(basename)
-
-        missing = WINDOWS_REQUIRED_FILES - extracted
-        if "tor.exe" not in extracted:
-            err("Could not find 'tor.exe' in the bundle")
-            return False
-        if missing:
-            warn(f"Some expected files were not found in bundle: {missing}")
-            warn("tor.exe may still work if your system has these DLLs installed.")
-
-        shutil.rmtree(tmp, ignore_errors=True)
-        ok("Tor daemon ready!")
-        info(f"Location: {INSTALL_DIR}")
-        return True
-
     except Exception as e:
-        err(f"Download/extract failed: {e}")
-        warn("You can manually download the Tor Expert Bundle from:")
-        warn("  https://www.torproject.org/download/tor/")
-        warn(f"  Extract tor.exe and DLLs to: {INSTALL_DIR}")
+        err(f"Extraction failed: {e}")
+        shutil.rmtree(tmp, ignore_errors=True)
         return False
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    if "tor.exe" not in extracted:
+        err("Could not find 'tor.exe' in the bundle")
+        return False
+
+    # Verify the extracted binary actually works
+    if _verify_tor_binary(local_tor):
+        ok("Tor daemon ready!")
+    else:
+        missing_dlls = WINDOWS_REQUIRED_FILES - extracted
+        if missing_dlls:
+            warn(f"DLLs not found in bundle: {missing_dlls}")
+            warn("tor.exe may still work if these are statically linked (v13+).")
+        else:
+            warn("tor.exe extracted but --version check failed. It may still work at runtime.")
+
+    if "geoip" not in extracted:
+        warn("GeoIP files not found — Tor will log path warnings but will still connect.")
+
+    info(f"Location: {INSTALL_DIR}")
+    return True
 
 
 # ── MACOS ───────────────────────────────────────────────────────────────────
