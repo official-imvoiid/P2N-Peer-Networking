@@ -40,11 +40,19 @@ contextBridge.exposeInMainWorld('ftps', {
   getMaxRetries: () => ipcRenderer.invoke('ftps:get-max-retries'),
   setTorEnabled: (v) => ipcRenderer.invoke('ftps:set-tor-enabled', { enabled: v }),
 
+  // BUG-02 FIX: 6 missing IPC bridges that renderer called but preload never exposed
+  getPlatform: () => ipcRenderer.invoke('ftps:get-platform'),
+  listArchive: (name, b64) => ipcRenderer.invoke('ftps:list-archive', { name, dataB64: b64 }),
+  readArchiveEntry: (name, b64, entryPath) => ipcRenderer.invoke('ftps:read-archive-entry', { name, dataB64: b64, entryPath }),
+  saveFileFromTemp: (tmpPath, name) => ipcRenderer.invoke('ftps:save-file-from-temp', { tmpPath, name }),
+  saveToDir: (files, folderName) => ipcRenderer.invoke('ftps:save-to-dir', { files, folderName }),
+  launchOSSandbox: (opts) => ipcRenderer.invoke('ftps:launch-os-sandbox', opts),
+
   on: (channel, cb) => {
     const allowed = [
       'ftps:peer-connected', 'ftps:peer-disconnected', 'ftps:message',
       'ftps:file-start', 'ftps:file-progress', 'ftps:file-done', 'ftps:send-progress',
-      'ftps:server-error', 'ftps:upnp-status', 'ftps:pairing-status', 'ftps:peer-reconnecting',
+      'ftps:server-error', 'ftps:peer-reconnecting', // FIX: KNOWN-02 — removed dead channels: ftps:upnp-status, ftps:pairing-status
       'ftps:peers-discovered', 'ftps:tor-status', 'p2n:log', 'app:request-close', 'app:session-active',
       'ftps:listen-auto',
     ]

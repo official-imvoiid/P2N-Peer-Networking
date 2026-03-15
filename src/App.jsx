@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo, Component } from 'react'
-import { generateKeyPair } from './lib/crypto.js'
+// NOTE: generateKeyPair from crypto.js is intentionally NOT imported here.
+// All cryptography (ECDH P-256 + AES-256-GCM) is handled in main.js via Node crypto.
+// The renderer WebCrypto key was dead code (keyRef.current was never read). BUG-09 fixed.
 import { TCPBridge } from './lib/tcpbridge.js'
 
 // ── ERROR BOUNDARY ────────────────────────────────────────────────────────────
@@ -38,6 +40,7 @@ const T = {
   bg: '#0b0e14', surface: '#161b22', panel: '#1c2330cc', border: '#30363d',
   accent: '#58a6ff', accentDim: '#1f6feb', accentFaint: '#58a6ff10',
   blue: '#58a6ff', amber: '#d29922', red: '#f85149', green: '#3fb950', purple: '#bc8cff',
+  orange: '#f97316', // FIX: KNOWN-01 — T.orange was undefined, used by ZipViewer/OSSandbox/FolderBrowseMsg
   text: '#e6edf3', textDim: '#8b949e', textMid: '#b1bac4', muted: '#30363d',
   glass: 'backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);',
 }
@@ -303,7 +306,7 @@ function CloseConfirm({ onCancel, onTerminate }) {
 }
 
 // ── TITLE BAR ─────────────────────────────────────────────────────────────────
-function TitleBar({ account, nodeId, onlinePeers, onLock, onTerminate, uptime, onHelp }) {
+function TitleBar({ account, nodeId, onlinePeers, onLock, onTerminate, uptime, onHelp, lockTimer, lockMin }) {
   const [vOpen, setVOpen] = useState(false)
   const vRef = useRef(null)
   const wc = a => window.ftps?.windowControl(a)
@@ -355,6 +358,15 @@ function TitleBar({ account, nodeId, onlinePeers, onLock, onTerminate, uptime, o
     </div>
     <div style={{ display: 'flex', alignItems: 'center', gap: 3, WebkitAppRegion: 'no-drag' }}>
       <span style={{ fontSize: 10, color: T.muted, fontVariantNumeric: 'tabular-nums', marginRight: 6 }}>{fmt(uptime)}</span>
+      {/* BUG-05 fix: lock countdown timer — was computed but never displayed */}
+      <span
+        title={`Auto-locks after ${lockMin} min inactivity`}
+        style={{
+          fontSize: 10, color: lockTimer < 60 ? T.red : lockTimer < 180 ? T.amber : T.muted,
+          fontVariantNumeric: 'tabular-nums', marginRight: 6,
+          fontWeight: lockTimer < 60 ? 700 : 400,
+        }}
+      > {fmtMin(lockTimer)}</span>
       <button onClick={onLock} className="tb-btn" style={{ color: T.amber }}>🔒 Lock</button>
       <button onClick={onTerminate} className="tb-btn" style={{ color: T.red }}>End</button>
     </div>
@@ -398,10 +410,13 @@ function SandboxPanel({ sandbox, onClose }) {
   const [preview, setPreview] = useState(null)
   const [loading, setLoading] = useState(null)
   const idRef = useRef(sandboxId)
+  const previewUrlRef = useRef(null) // FIX: KNOWN-04 — track ObjectURL for revocation
 
   useEffect(() => { idRef.current = sandboxId }, [sandboxId])
   useEffect(() => { setCrumbs([]); setPreview(null) }, [sandboxId])
   useEffect(() => () => { if (idRef.current) window.ftps?.cleanupSandbox(idRef.current) }, [])
+  // FIX: KNOWN-04 — revoke ObjectURL on unmount
+  useEffect(() => () => { if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current) }, [])
 
   const cur = crumbs.reduce((n, s) => n?.children?.[s], { children: tree })
   const entries = Object.entries(cur?.children || tree || {})
@@ -411,14 +426,16 @@ function SandboxPanel({ sandbox, onClose }) {
     setLoading(fname)
     const res = await window.ftps?.readSandboxFile(sandboxDir, node.relPath)
     setLoading(null); if (!res?.ok) return
+    // FIX: KNOWN-04 — revoke previous ObjectURL before creating new one
+    if (previewUrlRef.current) { URL.revokeObjectURL(previewUrlRef.current); previewUrlRef.current = null }
     const buf = Uint8Array.from(atob(res.dataB64), c => c.charCodeAt(0))
-    if (IS_PDF.test(fname)) { const blob = new Blob([buf], { type: 'application/pdf' }); const url = URL.createObjectURL(blob); setPreview({ name: fname, type: 'pdf', url }) }
+    if (IS_PDF.test(fname)) { const blob = new Blob([buf], { type: 'application/pdf' }); const url = URL.createObjectURL(blob); previewUrlRef.current = url; setPreview({ name: fname, type: 'pdf', url }) }
     else if (IS_TEXT.test(fname)) {
       let content = new TextDecoder().decode(buf)
       if (fname.endsWith('.json') || fname.endsWith('.jsonc')) { try { content = JSON.stringify(JSON.parse(content), null, 2) } catch { } }
       setPreview({ name: fname, type: 'text', content })
     }
-    else if (IS_IMG.test(fname)) { const blob = new Blob([buf], { type: 'image/' + fname.split('.').pop() }); setPreview({ name: fname, type: 'img', url: URL.createObjectURL(blob) }) }
+    else if (IS_IMG.test(fname)) { const blob = new Blob([buf], { type: 'image/' + fname.split('.').pop() }); const url = URL.createObjectURL(blob); previewUrlRef.current = url; setPreview({ name: fname, type: 'img', url }) }
     else setPreview({ name: fname, type: 'bin', size: buf.length })
   }
   const saveFile = async (fname, node) => { await window.ftps?.saveSandboxFile(sandboxDir, node.relPath, fname) }
@@ -492,6 +509,9 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
   const [tree, setTree] = useState(null), [loading, setLoading] = useState(true)
   const [preview, setPreview] = useState(null), [previewLoading, setPreviewLoading] = useState(false)
   const [crumbs, setCrumbs] = useState([]), [error, setError] = useState(null)
+  const previewUrlRef = useRef(null) // FIX: KNOWN-04 — track ObjectURL for revocation
+  // FIX: KNOWN-04 — revoke ObjectURL on unmount
+  useEffect(() => () => { if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current) }, [])
   const fname = msg.meta?.name || ''
   const isRar = IS_RAR.test(fname)
 
@@ -514,13 +534,15 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
 
   const openEntry = async (entryPath, entryName) => {
     if (!msg.blob) return; setPreviewLoading(true)
+    // FIX: KNOWN-04 — revoke previous ObjectURL before creating new one
+    if (previewUrlRef.current) { URL.revokeObjectURL(previewUrlRef.current); previewUrlRef.current = null }
     const r = new FileReader(); const b64 = await new Promise((res, rej) => { r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(msg.blob) })
     const result = await window.ftps?.readArchiveEntry(fname, b64, entryPath)
     setPreviewLoading(false)
     if (!result?.ok) { setPreview({ name: entryName, type: 'err', msg: result?.error || 'Cannot read file' }); return }
     const buf = Uint8Array.from(atob(result.dataB64), c => c.charCodeAt(0))
-    if (IS_IMG.test(entryName)) { const blob = new Blob([buf]); const url = URL.createObjectURL(blob); setPreview({ name: entryName, type: 'img', url }) }
-    else if (IS_PDF.test(entryName)) { const blob = new Blob([buf], { type: 'application/pdf' }); const url = URL.createObjectURL(blob); setPreview({ name: entryName, type: 'pdf', url }) }
+    if (IS_IMG.test(entryName)) { const blob = new Blob([buf]); const url = URL.createObjectURL(blob); previewUrlRef.current = url; setPreview({ name: entryName, type: 'img', url }) }
+    else if (IS_PDF.test(entryName)) { const blob = new Blob([buf], { type: 'application/pdf' }); const url = URL.createObjectURL(blob); previewUrlRef.current = url; setPreview({ name: entryName, type: 'pdf', url }) }
     else if (IS_TEXT.test(entryName) || IS_VIEWABLE.test(entryName)) { let text = new TextDecoder().decode(buf); if (entryName.endsWith('.json') || entryName.endsWith('.jsonc')) { try { text = JSON.stringify(JSON.parse(text), null, 2) } catch { } } setPreview({ name: entryName, type: 'text', text: text.slice(0, 200000) }) }
     else setPreview({ name: entryName, type: 'bin', size: buf.length })
   }
@@ -798,7 +820,7 @@ function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
     return root
   }
 
-  const tree = useMemo(() => buildTree(msg.tree), [msg.fid])
+  const tree = useMemo(() => buildTree(msg.tree), [msg.tree]) // FIX: KNOWN-03 — depend on msg.tree, not msg.fid
   const cur = crumbs.reduce((n, s) => n?.[s]?.children ?? n?.[s] ?? null, tree) || tree
   const entries = Object.entries(cur || {})
 
@@ -823,7 +845,7 @@ function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
     </div>
     {/* Receive progress */}
     {status === 'pulling' && <div style={{ padding: '0 11px 9px' }}>
-      <div className="prog"><div className="prog-fill" style={{ width: '100%', background: T.amber }} /></div>
+      <div className="prog"><div className="prog-fill" style={{ width: '100%', background: T.amber, animation: 'pulse 1s infinite' }} /></div>{/* FIX: KNOWN-06 — add pulse animation */}
       <div style={{ fontSize: 10, color: T.textDim, marginTop: 3 }}>↓ Receiving files…</div>
     </div>}
     {/* Expanded tree browser + pull actions */}
@@ -869,7 +891,7 @@ function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
 
 // ── FOLDER RECV MSG (receiver side — shows received folder progress + save) ───
 function FolderRecvMsg({ msg, folderDataRef, notify }) {
-  const pct = msg.totalFiles > 0 ? (msg.receivedCount || 0) / msg.totalFiles : 0, done = msg.complete
+  const done = msg.complete // FIX: KNOWN-05 — removed dead `pct` variable (progress bar uses inline calculation)
   const [expanded, setExpanded] = useState(false)
   const files = (folderDataRef?.current?.[msg.folderFid]?.files || []).filter(Boolean)
 
@@ -898,8 +920,9 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
       {done && <span style={{ fontSize: 10, color: T.textDim, flexShrink: 0 }}>{expanded ? '▾' : '▸'}</span>}
     </div>
     {!done && <div style={{ padding: '0 11px 9px' }}>
-      <div className="prog"><div className="prog-fill" style={{ width: `${pct * 100}%`, background: T.green }} /></div>
-      <div style={{ fontSize: 10, color: T.textDim, marginTop: 3 }}>↓ Receiving…</div>
+      {/* BUG-17 fix: use actual received/total ratio instead of indeterminate 100% */}
+      <div className="prog"><div className="prog-fill" style={{ width: `${msg.totalFiles > 0 ? Math.round((msg.receivedCount || 0) / msg.totalFiles * 100) : 0}%`, background: T.green, transition: 'width .3s' }} /></div>
+      <div style={{ fontSize: 10, color: T.textDim, marginTop: 3 }}>↓ Receiving… {msg.receivedCount || 0}/{msg.totalFiles}</div>
     </div>}
     {done && expanded && <div style={{ borderTop: `1px solid ${T.green}20` }}>
       <div style={{ padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 5, background: T.surface }}>
@@ -927,6 +950,8 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
 }
 function FileInlineViewer({ file }) {
   const [open, setOpen] = useState(false), [content, setContent] = useState(null), [loading, setLoading] = useState(false)
+  // FIX: KNOWN-04 — revoke ObjectURL when content changes or component unmounts
+  useEffect(() => () => { if (content?.url) URL.revokeObjectURL(content.url) }, [content])
   const name = file.name || ''
   const open_ = () => {
     setOpen(true); if (content) return; setLoading(true)
@@ -1075,26 +1100,36 @@ function VerifyModal({ fingerprint, peerName, onClose, onVerified }) {
 function BandwidthGraph({ data, color, label }) {
   const canvasRef = useRef(null)
   useEffect(() => {
-    const c = canvasRef.current, ctx = c.getContext('2d'), w = c.width, h = c.height
+    const c = canvasRef.current
+    if (!c) return
+    // BUG-18 fix: scale canvas buffer to devicePixelRatio for crisp rendering on HiDPI
+    const dpr = window.devicePixelRatio || 1
+    const rect = c.getBoundingClientRect()
+    c.width = Math.round(rect.width * dpr)
+    c.height = Math.round(rect.height * dpr)
+    const ctx = c.getContext('2d')
+    ctx.scale(dpr, dpr)
+    const w = rect.width, h = rect.height
     ctx.clearRect(0, 0, w, h)
     if (!data.length) return
-    ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 2
+    ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 1.5
     ctx.lineJoin = 'round'
-    const step = w / 20
+    const step = w / Math.max(data.length - 1, 1)
     data.slice(-20).forEach((v, i) => {
       const x = i * step, y = h - (Math.min(1, v / 500000) * (h - 4)) - 2
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y)
     })
     ctx.stroke()
     // gradient fill
-    ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.fillStyle = color + '15'; ctx.fill()
+    const lastX = (Math.min(data.length, 20) - 1) * step
+    ctx.lineTo(lastX, h); ctx.lineTo(0, h); ctx.fillStyle = color + '15'; ctx.fill()
   }, [data, color])
   return <div style={{ flex: 1, height: 40, display: 'flex', flexDirection: 'column' }}>
     <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
       <span style={{ fontSize: 9, color: T.textDim, textTransform: 'uppercase' }}>{label}</span>
       <span style={{ fontSize: 9, color, fontWeight: 700 }}>{fmtSz(data[data.length - 1] || 0)}/s</span>
     </div>
-    <canvas ref={canvasRef} width={240} height={40} style={{ width: '100%', height: '100%' }} />
+    <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block' }} />
   </div>
 }
 
@@ -1209,7 +1244,17 @@ function HelpModal({ onClose, inline = false }) {
   </div>
 }
 
-// ── SESSION RESTORE ───────────────────────────────────────────────────────────
+// ── SETTINGS PERSISTENCE (BUG-08 fix) ────────────────────────────────────────
+function loadSettings() {
+  try {
+    const s = localStorage.getItem('p2n_settings')
+    if (s) return { ...{ lockMin: 15, md: true, warnLinks: true, warnArch: true, torEnabled: true, maxTries: 5 }, ...JSON.parse(s) }
+  } catch { }
+  return { lockMin: 15, md: true, warnLinks: true, warnArch: true, torEnabled: true, maxTries: 5 }
+}
+function saveSettings(s) {
+  try { localStorage.setItem('p2n_settings', JSON.stringify(s)) } catch { }
+}
 // sessionStorage survives webContents.reload() (Refresh UI) but NOT app restart.
 // This lets Refresh UI work without terminating the session.
 function readSavedSession() {
@@ -1248,7 +1293,15 @@ export default function App() {
   const [lockForm, setLockForm] = useState({ pp: '', pw: '' })
   const [lockErr, setLockErr] = useState('')
   const [lockTries, setLockTries] = useState(0)
-  const [sett, setSett2] = useState({ lockMin: 15, md: true, warnLinks: true, warnArch: true, torEnabled: true, maxTries: 5 })
+  const [sett, setSett2Raw] = useState(loadSettings)
+  // BUG-08 fix: persist settings to localStorage on every change
+  const setSett2 = useCallback(updater => {
+    setSett2Raw(prev => {
+      const next = typeof updater === 'function' ? updater(prev) : updater
+      saveSettings(next)
+      return next
+    })
+  }, [])
   const [tab, setTab] = useState('connect')
   const [selPeer, setSelPeer] = useState(null)
   const [peers, setPeers] = useState([])
@@ -1266,7 +1319,7 @@ export default function App() {
   const [showLinkConfirm, setShowLinkConfirm] = useState(null)
   const [showArchConfirm, setShowArchConfirm] = useState(null)
   const [showRemoveConfirm, setShowRemoveConfirm] = useState(null) // {peerId,peerName}
-  const [showAttach, setShowAttach] = useState(false)  // attachment menu open
+  // BUG-14 fix: showAttach was dead state (never used in UI) — removed
   const [peerFingerprints, setPeerFingerprints] = useState({})
   const [peerIdentityKeys, setPeerIdentityKeys] = useState({})  // peerId → identityKey for tofuAccept
   const [verifiedPeers, setVerifiedPeers] = useState(new Set())
@@ -1298,7 +1351,7 @@ export default function App() {
   const [bwHistory, setBwHistory] = useState({ in: [], out: [] })
   const lastBw = useRef({ in: 0, out: 0 })
 
-  const bridgeRef = useRef(null), keyRef = useRef(null), chatEnd = useRef(null)
+  const bridgeRef = useRef(null), chatEnd = useRef(null)
   const fileInp = useRef(null), folderInp = useRef(null), lastAct = useRef(Date.now()), myId = useRef(getInitialNodeId())
   // Stores received folder file data keyed by folderFid — kept in ref to avoid re-renders per-chunk
   const folderDataRef = useRef({})  // {[folderFid]: {name, files:[{relPath,name,size,dataB64?,tmpPath?}]}}
@@ -1369,11 +1422,10 @@ export default function App() {
         if (d.status === 'running') setTorError('');
         if (d.status === 'off') { setOnionAddr(''); setTorError('') }
       }),
-      window.ftps?.on('ftps:upnp-status', d => { }),
+      // FIX: KNOWN-02 — removed dead subscriptions: ftps:upnp-status, ftps:pairing-status, ftps:stun-result
+      // None of these channels are emitted by main.js
       window.ftps?.on('p2n:log', e => setLogs(p => [{ ts: e.ts || '', level: e.level, msg: e.msg, detail: e.detail || '' }, ...p].slice(0, 300))),
       window.ftps?.on('app:request-close', () => setShowCloseConfirm(true)),
-      window.ftps?.on('ftps:pairing-status', d => { }),
-      window.ftps?.on('ftps:stun-result', d => { }),
       // FIX: mDNS discovered peers
       window.ftps?.on('ftps:peers-discovered', list => setDiscoveredPeers(list || [])),
       // FIX: Session restore signal from main process (sent after renderer reload)
@@ -1404,23 +1456,28 @@ export default function App() {
     }).catch(() => { })
   }, [])
 
-  // FIX: Session restore on mount — if sessionStorage has session data AND main process confirms
-  // an active session, skip the setup screen (handles Refresh UI without losing session)
+  // FIX BUG-04: Session restore on mount — check main process for active session.
+  // We call clearSavedSession() IMMEDIATELY so if getSession() is slow or fails,
+  // we don't show stale peer/account data from a previous run.
   useEffect(() => {
     if (screen !== 'restoring') return
     const saved = readSavedSession()
     if (!saved) { setScreen('setup'); return }
+    // Pre-emptively clear stale session data so the UI starts clean.
+    // If main process confirms the session is still active, we restore it below.
+    clearSavedSession()
     window.ftps?.getSession().then(sess => {
       if (sess?.active && sess.nodeId === saved.nodeId) {
+        // Session is genuinely alive (Refresh UI scenario) — restore it
+        saveSession(saved.account, saved.nodeId)  // re-save since we cleared above
         setAccount(saved.account); myId.current = saved.nodeId
-        // Re-announce identity to main process (in case it lost it — shouldn't happen but safe)
         window.ftps?.setIdentity(saved.account.name, saved.nodeId)
         setScreen('main'); addLog('OK', 'Session restored after UI refresh')
       } else {
-        // Main process has no active session (full restart, not reload) — go to setup
-        clearSavedSession(); setScreen('setup')
+        // Full restart — no active session in main process, go to setup
+        setScreen('setup')
       }
-    }).catch(() => { clearSavedSession(); setScreen('setup') })
+    }).catch(() => { setScreen('setup') })
   }, [])  // eslint-disable-line
   useEffect(() => {
     bridgeRef.current = new TCPBridge({
@@ -1549,6 +1606,149 @@ export default function App() {
     return () => bridgeRef.current?.destroy?.()
   }, [pushMsg, addLog, notify])
 
+  // ── BUG-01 FIX: 8 missing action functions that were called in JSX but never defined ──
+
+  // doSend — send chat message to selected peer
+  const doSend = useCallback(async () => {
+    if (!selPeer || !input.trim()) return
+    const text = input.trim()
+    setInput('')
+    if (await bridgeRef.current?.sendMsg(selPeer.id, text)) {
+      pushMsg(selPeer.id, { id: Date.now(), from: 'me', type: 'text', text, time: now8() })
+    } else {
+      notify('Send failed — peer may have disconnected', 'err')
+    }
+  }, [selPeer, input, pushMsg, notify])
+
+  // doSendFile — read a File and send it to the selected peer
+  const doSendFile = useCallback(async (file) => {
+    if (!selPeer) return
+    const fid = 'fo_' + Date.now() + '_' + Math.random().toString(36).slice(2)
+    pushMsg(selPeer.id, { id: fid + '_out', from: 'me', type: 'file_out', meta: { name: file.name, size: file.size }, pct: 1, time: now8() })
+    addLog('INFO', `Sending: ${file.name}`, fmtSz(file.size))
+    const ok = await bridgeRef.current?.sendFile(selPeer.id, file, pct => {
+      setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).map(m => m.id === fid + '_out' ? { ...m, pct } : m) }))
+    })
+    if (!ok) {
+      notify(`Send failed: ${file.name}`, 'err')
+      setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).filter(m => m.id !== fid + '_out') }))
+    } else {
+      notify(`Sent: ${file.name}`, 'ok')
+    }
+  }, [selPeer, pushMsg, addLog, notify])
+
+  // doSendFolder — advertise a folder offer to the peer (browse+pull model)
+  const doSendFolder = useCallback(async (files) => {
+    if (!selPeer || !files.length) return
+    const fid = 'fd_' + Date.now() + '_' + Math.random().toString(36).slice(2)
+    const folderName = files[0].webkitRelativePath?.split('/')[0] || 'Folder'
+    // Build tree for remote preview
+    const tree = files.map((f, idx) => ({
+      relPath: f.webkitRelativePath || f.name,
+      name: f.name,
+      size: f.size,
+      index: idx,
+    }))
+    const totalBytes = files.reduce((s, f) => s + f.size, 0)
+    // Store files in ref so we can send on pull-request
+    sharedFoldersRef.current[fid] = { name: folderName, files: Array.from(files) }
+    // Show offer card in our own chat
+    pushMsg(selPeer.id, {
+      id: 'fo_' + fid, from: 'me', type: 'folder_offer',
+      name: folderName, fid, totalFiles: files.length, totalBytes,
+      status: 'offered', time: now8(),
+    })
+    // Notify peer of the folder offer so they can browse structure
+    await bridgeRef.current?.sendMsg(selPeer.id, {
+      type: 'folder_offer', fid, name: folderName,
+      totalFiles: files.length, totalBytes, tree,
+    })
+    addLog('INFO', `Folder offered: ${folderName}`, `${files.length} files, ${fmtSz(totalBytes)}`)
+    notify(`Folder offered: ${folderName}`, 'ok')
+  }, [selPeer, pushMsg, addLog, notify])
+
+  // doPullFolder — receiver side: request files from sender's shared folder
+  const doPullFolder = useCallback(async (peerId, fid, fileIndex) => {
+    setMsgs(p => ({
+      ...p, [peerId]: (p[peerId] || []).map(m =>
+        m.id === 'fb_' + fid ? { ...m, status: 'pulling' } : m
+      )
+    }))
+    await bridgeRef.current?.sendMsg(peerId, {
+      type: 'folder_pull', fid,
+      fileIndex: fileIndex != null ? fileIndex : null,
+    })
+  }, [])
+
+  // doExtract — gate for archive extraction (shows warning if warnArch is on)
+  const doExtract = useCallback((msg) => {
+    if (!msg.blob && !msg.tmpPath) { notify('File not in memory — save first', 'err'); return }
+    if (sett.warnArch) {
+      setShowArchConfirm(msg)
+    } else {
+      doExtractAction(msg)
+    }
+  }, [sett.warnArch])
+
+  // doExtractAction — actually extract archive into sandboxed temp dir
+  const doExtractAction = useCallback(async (msg) => {
+    setShowArchConfirm(null)
+    if (!msg.blob) { notify('File not loaded in memory', 'err'); return }
+    setSandboxLoading(true)
+    try {
+      const r = new FileReader()
+      const b64 = await new Promise((res, rej) => {
+        r.onload = () => res(r.result.split(',')[1])
+        r.onerror = rej
+        r.readAsDataURL(msg.blob)
+      })
+      const result = await window.ftps?.extractArchive(msg.meta?.name || 'archive', b64)
+      setSandboxLoading(false)
+      if (result?.ok) {
+        setSandbox({ name: msg.meta?.name, sandboxDir: result.sandboxDir, sandboxId: result.sandboxId, tree: result.tree })
+        addLog('OK', `Archive extracted: ${msg.meta?.name}`, result.sandboxDir)
+        notify('Archive ready in sandbox', 'ok')
+      } else {
+        notify('Extract failed: ' + (result?.error || 'unknown'), 'err')
+        addLog('ERR', 'Extract failed', result?.error || '')
+      }
+    } catch (e) {
+      setSandboxLoading(false)
+      notify('Extract error: ' + e.message, 'err')
+      addLog('ERR', 'Extract error', e.message)
+    }
+  }, [addLog, notify])
+
+  // doRevoke — revoke a sent file (nulls blob on receiver's side)
+  const doRevoke = useCallback(async (msgOrId) => {
+    if (!selPeer) return
+    const targetId = typeof msgOrId === 'string' ? msgOrId : msgOrId?.id
+    if (!targetId) return
+    // Update own chat immediately
+    setMsgs(p => ({
+      ...p, [selPeer.id]: (p[selPeer.id] || []).map(m =>
+        m.id === targetId ? { ...m, blob: null, tmpPath: null, type: 'revoked', revokedAt: new Date().toLocaleTimeString() } : m
+      )
+    }))
+    // Tell peer to revoke
+    await bridgeRef.current?.sendMsg(selPeer.id, { type: 'revoke', targetId })
+    notify('File access revoked', 'ok')
+    addLog('INFO', 'File revoked', targetId)
+  }, [selPeer, addLog, notify])
+
+  // doDeletePeer — disconnect and remove a peer from the list
+  const doDeletePeer = useCallback((peerId) => {
+    setShowRemoveConfirm(null)
+    bridgeRef.current?.disconnect(peerId)
+    setPeers(ps => ps.filter(p => p.id !== peerId))
+    setMsgs(p => { const n = { ...p }; delete n[peerId]; return n })
+    if (selPeer?.id === peerId) setSelPeer(null)
+    addLog('INFO', 'Peer removed', peerId)
+    notify('Peer removed', 'ok')
+  }, [selPeer, addLog, notify])
+
+  // ── END BUG-01 FIX ──────────────────────────────────────────────────────────
+
   const onlinePeers = peers.filter(p => p.online)
   const peerMsgs = msgs[selPeer?.id] || []
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: 'smooth' }) }, [peerMsgs.length])
@@ -1564,7 +1764,7 @@ export default function App() {
     else if (!/[a-z]/.test(pw)) e.password = 'Needs lowercase'
     else if (!/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(pw)) e.password = 'Needs special char'
     if (Object.keys(e).length) { setFErr(e); return }
-    keyRef.current = await generateKeyPair()
+    // BUG-09 fix: keyRef/generateKeyPair removed — all crypto is in main.js
     myId.current = makeId(form.name)
     const res = await window.ftps?.setIdentity(form.name.trim(), myId.current)
     if (res?.nodeId) myId.current = res.nodeId
@@ -1643,17 +1843,39 @@ export default function App() {
       if (!lr.ok) { notify('Listen failed: ' + lr.error, 'err'); return }
       setListenActive(true); setListenInfo({ port: lr.port, localIPs: lr.localIPs })
       addLog('OK', `TCP server port ${lr.port}`)
-      // Now start Tor on the newly opened port
+      // FIX: listen() in main.js already auto-starts Tor when torEnabled.
+      // Calling startTor again caused "Already running" errors.
+      // Now startTor returns ok:true if Tor is already starting — handle gracefully.
       setTorStatus('starting'); setTorError(''); addLog('INFO', 'Starting Tor daemon…')
       const r = await window.ftps?.startTor(lr.port)
-      if (r?.ok) { setTorStatus('running'); setOnionAddr(r.onionAddress + ':' + r.port); addLog('OK', `Tor hidden service: ${r.onionAddress}`); notify('Onion link ready!', 'ok') }
-      else { setTorStatus('error'); setTorError(r?.error || 'Unknown error'); addLog('ERR', 'Tor failed: ' + (r?.error || 'Unknown')); notify('Tor failed: ' + (r?.error || 'Unknown'), 'err') }
+      if (r?.ok) {
+        if (r.onionAddress) {
+          setTorStatus('running'); setOnionAddr(r.onionAddress + ':' + r.port)
+          addLog('OK', `Tor hidden service: ${r.onionAddress}`); notify('Onion link ready!', 'ok')
+        } else {
+          // Tor is still bootstrapping — ftps:tor-status events will update the UI
+          addLog('INFO', 'Tor is bootstrapping — waiting for onion address…')
+        }
+      } else {
+        setTorStatus('error'); setTorError(r?.error || 'Unknown error')
+        addLog('ERR', 'Tor failed: ' + (r?.error || 'Unknown')); notify('Tor failed: ' + (r?.error || 'Unknown'), 'err')
+      }
       return
     }
     setTorStatus('starting'); setTorError(''); addLog('INFO', 'Starting Tor daemon…')
     const r = await window.ftps?.startTor(listenInfo.port)
-    if (r?.ok) { setTorStatus('running'); setOnionAddr(r.onionAddress + ':' + r.port); addLog('OK', `Tor hidden service: ${r.onionAddress}`); notify('Onion link ready!', 'ok') }
-    else { setTorStatus('error'); setTorError(r?.error || 'Unknown error'); addLog('ERR', 'Tor failed: ' + (r?.error || 'Unknown')); notify('Tor failed: ' + (r?.error || 'Unknown'), 'err') }
+    if (r?.ok) {
+      if (r.onionAddress) {
+        setTorStatus('running'); setOnionAddr(r.onionAddress + ':' + r.port)
+        addLog('OK', `Tor hidden service: ${r.onionAddress}`); notify('Onion link ready!', 'ok')
+      } else {
+        // Tor bootstrapping — ftps:tor-status events will update the UI
+        addLog('INFO', 'Tor is bootstrapping — waiting for onion address…')
+      }
+    } else {
+      setTorStatus('error'); setTorError(r?.error || 'Unknown error')
+      addLog('ERR', 'Tor failed: ' + (r?.error || 'Unknown')); notify('Tor failed: ' + (r?.error || 'Unknown'), 'err')
+    }
   }
 
   const doStopTor = async () => {
@@ -1663,10 +1885,15 @@ export default function App() {
 
   const doConnectOnion = async () => {
     const addr = onionInput.trim(); if (!addr) { notify('Enter .onion address', 'err'); return }
-    const parts = addr.split(':'); if (parts.length < 2) { notify('Format: xxxx.onion:port', 'err'); return }
+    const parts = addr.split(':')
+    // BUG-07 fix: validate .onion format and port
+    if (!parts[0].endsWith('.onion')) { notify('Address must end in .onion', 'err'); return }
+    if (parts[0].length < 16) { notify('Invalid .onion address (too short)', 'err'); return }
+    const port = parseInt(parts[1])
+    if (!parts[1] || isNaN(port) || port < 1 || port > 65535) { notify('Invalid port — format: xxxx.onion:7000', 'err'); return }
     setTorConnState('connecting'); setTorConnErr('')
     addLog('INFO', `Connecting via Tor to ${addr}`)
-    const r = await window.ftps?.connectOnion(parts[0], parseInt(parts[1]))
+    const r = await window.ftps?.connectOnion(parts[0], port)
     if (!r) { notify('Electron API unavailable', 'err'); setTorConnState('idle'); return }
     if (r.ok) { setTorConnState('done'); notify('Connected via Tor — handshaking…', 'ok') }
     else { setTorConnState('error'); setTorConnErr(r.error || 'Failed'); notify('Tor connect failed: ' + (r.error || ''), 'err') }
@@ -1801,7 +2028,7 @@ export default function App() {
         <div style={{ color: T.textDim, fontSize: 13 }}>Extracting archive…</div>
       </div>}
 
-      <TitleBar account={account} nodeId={myId.current} onlinePeers={onlinePeers.length} onLock={doLock} onTerminate={() => setShowCloseConfirm(true)} uptime={uptime} onHelp={() => setTab('docs')} />
+      <TitleBar account={account} nodeId={myId.current} onlinePeers={onlinePeers.length} onLock={doLock} onTerminate={() => setShowCloseConfirm(true)} uptime={uptime} onHelp={() => setTab('docs')} lockTimer={lockTimer} lockMin={sett.lockMin} />
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         {/* ── SIDEBAR ── */}
@@ -2285,6 +2512,7 @@ export default function App() {
                       <button onClick={() => setSett2(p => ({ ...p, lockMin: Math.min(60, p.lockMin + 1) }))} className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: 14 }}>+</button>
                     </div>
                   </div>
+                  <div style={{ fontSize: 10, color: lockTimer < 60 ? T.red : lockTimer < 180 ? T.amber : T.muted, padding: '4px 0 2px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>🔒 Locks in {fmtMin(lockTimer)}</div>
                   <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${T.border}` }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: T.text }}>Max unlock attempts</div>

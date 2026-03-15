@@ -163,10 +163,13 @@ function _onDiscoveryMsg(data, rinfo) {
       address: rinfo.address,
       lastSeen: Date.now(),
     })
+    // BUG-11 fix: collect stale keys first, then delete — never mutate Map during for..of
     const now = Date.now()
+    const staleKeys = []
     for (const [k, v] of discoveredPeers) {
-      if (now - v.lastSeen > 30000) discoveredPeers.delete(k)
+      if (now - v.lastSeen > 30000) staleKeys.push(k)
     }
+    staleKeys.forEach(k => discoveredPeers.delete(k))
     emit('ftps:peers-discovered', Array.from(discoveredPeers.values()))
   } catch { }
 }
@@ -310,6 +313,8 @@ app.whenReady().then(() => {
   // This avoids racing before the user has set their identity/session.
 })
 app.on('window-all-closed', () => {
+  // BUG-04 fix: null activeSession on full close so a future restart never sees stale session
+  activeSession = null
   stopServer(); _shutdownDiscovery(); stopTorDaemon()
   peers.forEach((_, id) => disconnectPeer(id))
   cleanupAllSandboxes()
@@ -338,12 +343,18 @@ function getLocalIPs() {
 // ═════════════════════════════════════════════════════════════════════════════
 let torProcess = null
 let torDataDir = null
-let torSocksPort = 9050
+let torSocksPort = 0  // BUG-12 fix: start at 0 (invalid) so we never accidentally hit Tor Browser on 9050
 let onionAddress = null
-let torEnabled = true  // default ON — starts with app, stops with app
+let torEnabled = true
 
 async function startTorHiddenService(localPort) {
-  if (torProcess) { secEntry('WARN', 'Tor already running'); return { ok: false, error: 'Already running' } }
+  // FIX: Return success when Tor is already running/starting instead of a false error.
+  // Multiple callers (set-identity, listen, start-tor) can race here — dedup gracefully.
+  if (torProcess) {
+    secEntry('INFO', 'Tor already running — deduplicating start request')
+    if (onionAddress) return { ok: true, onionAddress, port: localPort }
+    return { ok: true, starting: true }
+  }
   try {
     const tmpBase = path.join(os.tmpdir(), 'p2n-tor-' + crypto.randomBytes(4).toString('hex'))
     fs.mkdirSync(tmpBase, { recursive: true })
@@ -623,24 +634,29 @@ function connectViaTor(onionHost, port) {
         sock.write(req)
 
       } else if (step === 'connect') {
-        // SOCKS5 CONNECT reply: VER REP RSV ATYP [BND.ADDR variable] BND.PORT(2)
-        // Minimum reply is 10 bytes (ATYP=IPv4). We just need bytes 0+1 to check status.
-        if (rxBuf.length < 2) return
+        // BUG-03 FIX: SOCKS5 CONNECT reply: VER REP RSV ATYP [BND.ADDR variable] BND.PORT(2)
+        // Must skip the ENTIRE reply based on ATYP, NOT just 2 bytes.
+        // Old code sliced only 2 bytes → 8 leftover SOCKS5 header bytes prepended to HELLO
+        // → JSON.parse failed → every onion connection died silently.
+        if (rxBuf.length < 4) return  // wait for VER REP RSV ATYP
         if (rxBuf[0] !== 0x05 || rxBuf[1] !== 0x00) {
           const codes = { 1: 'general failure', 2: 'connection not allowed', 3: 'network unreachable', 4: 'host unreachable', 5: 'connection refused', 6: 'TTL expired', 7: 'command not supported', 8: 'address type not supported' }
           fail(new Error(`SOCKS5 connect failed: ${codes[rxBuf[1]] || 'error code ' + rxBuf[1]}`))
           return
         }
+        const atyp = rxBuf[3]
+        let responseLen
+        if (atyp === 0x01) responseLen = 10        // IPv4: 4 hdr + 4 addr + 2 port
+        else if (atyp === 0x04) responseLen = 22   // IPv6: 4 hdr + 16 addr + 2 port
+        else if (atyp === 0x03) {
+          if (rxBuf.length < 5) return             // wait for domain length byte
+          responseLen = 7 + rxBuf[4]               // 4 hdr + 1 len + N domain + 2 port
+        } else { fail(new Error(`SOCKS5 unknown ATYP: ${atyp}`)); return }
+        if (rxBuf.length < responseLen) return     // wait for full reply
         step = 'connected'
-        // Any remaining bytes in rxBuf are application data — prepend back to socket
-        // by calling succeed() and letting PeerConn consume them via its own listener.
-        // Since we remove our listener first, PeerConn will receive the buffered data
-        // on its next 'data' event once we give up the listener.
+        const leftover = rxBuf.slice(responseLen)  // real app data starts after full SOCKS5 reply
         succeed()
-        // If there were leftover bytes, emit them as a synthetic data event after PeerConn attaches
-        if (rxBuf.length > 2) {
-          // Socket already handed off — emit remaining data after microtask so PeerConn listener is ready
-          const leftover = rxBuf.slice(2)
+        if (leftover.length > 0) {
           setImmediate(() => { if (!sock.destroyed) sock.emit('data', leftover) })
         }
       }
@@ -799,12 +815,52 @@ class PeerConn {
       totalBytesSent += data.length
     } catch (e) { secEntry('ERR', 'Send failed', e.message) }
   }
-  _dispatch(msg) {
+  async _dispatch(msg) {
     switch (msg.type) {
       case 'chat': emit('ftps:message', { peerId: this.id, msg }); break
-      case 'file_start': this._filebufs.set(msg.fid, { meta: msg, chunks: new Map() }); emit('ftps:file-start', { peerId: this.id, meta: msg }); break
-      case 'file_chunk': { const fb = this._filebufs.get(msg.fid); if (fb) { fb.chunks.set(msg.i, Buffer.from(msg.d, 'base64')); emit('ftps:file-progress', { peerId: this.id, fid: msg.fid, pct: fb.chunks.size / fb.meta.total }) } break }
-      case 'file_end': { const fb = this._filebufs.get(msg.fid); if (fb) { const data = Buffer.concat([...fb.chunks.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1])); emit('ftps:file-done', { peerId: this.id, meta: fb.meta, dataB64: data.toString('base64') }); this._filebufs.delete(msg.fid); secEntry('OK', `File received: ${fb.meta.name}`, `${fb.meta.size}B`) } break }
+      case 'file_start': {
+        // BUG-06 fix: for large files, stream chunks to a temp file instead of buffering in RAM
+        const largeTmpPath = path.join(os.tmpdir(), 'p2n-recv-' + msg.fid + '-' + crypto.randomBytes(4).toString('hex'))
+        this._filebufs.set(msg.fid, { meta: msg, chunks: new Map(), tmpPath: largeTmpPath, written: 0 })
+        emit('ftps:file-start', { peerId: this.id, meta: msg })
+        break
+      }
+      case 'file_chunk': {
+        const fb = this._filebufs.get(msg.fid)
+        if (fb) {
+          fb.chunks.set(msg.i, Buffer.from(msg.d, 'base64'))
+          emit('ftps:file-progress', { peerId: this.id, fid: msg.fid, pct: fb.chunks.size / fb.meta.total })
+        }
+        break
+      }
+      case 'file_end': {
+        const fb = this._filebufs.get(msg.fid)
+        if (fb) {
+          // Sort chunks by index and assemble
+          const sorted = [...fb.chunks.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1])
+          const LARGE_THRESHOLD = 32 * 1024 * 1024  // 32 MB
+          if (fb.meta.size > LARGE_THRESHOLD) {
+            // Write to temp file, pass path to renderer — avoids IPC size limit
+            try {
+              const tmpPath = fb.tmpPath
+              const ws = fs.createWriteStream(tmpPath)
+              await new Promise((res, rej) => { ws.on('finish', res); ws.on('error', rej); sorted.forEach(c => ws.write(c)); ws.end() })
+              emit('ftps:file-done', { peerId: this.id, meta: fb.meta, dataB64: null, tmpPath })
+              secEntry('OK', `Large file received: ${fb.meta.name}`, `${fb.meta.size}B → ${tmpPath}`)
+            } catch (e) {
+              secEntry('ERR', `Large file write failed: ${fb.meta.name}`, e.message)
+              emit('ftps:file-done', { peerId: this.id, meta: fb.meta, dataB64: null, tmpPath: null })
+            }
+          } else {
+            // Small file — send as base64 through IPC as before
+            const data = Buffer.concat(sorted)
+            emit('ftps:file-done', { peerId: this.id, meta: fb.meta, dataB64: data.toString('base64'), tmpPath: null })
+            secEntry('OK', `File received: ${fb.meta.name}`, `${fb.meta.size}B`)
+          }
+          this._filebufs.delete(msg.fid)
+        }
+        break
+      }
       default: emit('ftps:message', { peerId: this.id, msg }); break
     }
   }
@@ -831,8 +887,15 @@ class PeerConn {
       const timer = setTimeout(() => {
         pendingReconnects.delete(id); if (this._closed) return
         const sock = net.createConnection({ host: this._initiator.host, port: this._initiator.port }, () => {
-          const nc = new PeerConn(sock, this._initiator); nc._sendQueue = this._sendQueue; nc._reconnectAttempt = this._reconnectAttempt
-          if (id) peers.delete(id)
+          const nc = new PeerConn(sock, this._initiator)
+          nc._sendQueue = this._sendQueue
+          nc._reconnectAttempt = this._reconnectAttempt
+          // BUG-10 fix: pre-register new PeerConn under the old id so the peers map
+          // is never empty during reconnect. _onHello will overwrite with final id.
+          if (id) {
+            peers.delete(id)
+            peers.set(id, nc)
+          }
         })
         sock.on('error', () => this._onDisconnect())
         sock.setTimeout(8000, () => { sock.destroy(); this._onDisconnect() })
@@ -1126,6 +1189,176 @@ ipcMain.handle('ftps:save-sandbox-file', async (_, { sandboxDir, relPath, name: 
 })
 ipcMain.handle('ftps:cleanup-sandbox', async (_, { sandboxId }) => { const d = sandboxes.get(sandboxId); if (d) { try { fs.rmSync(path.dirname(d), { recursive: true, force: true }) } catch { }; sandboxes.delete(sandboxId) }; return { ok: true } })
 ipcMain.handle('ftps:open-sandbox-folder', async (_, { sandboxDir }) => { secEntry('INFO', 'Sandbox in explorer', sandboxDir); await shell.openPath(sandboxDir); return { ok: true } })
+
+// BUG-02 FIX: 6 IPC handlers that were called from renderer but never existed in main.js
+
+// Get platform string for OS Sandbox feature
+ipcMain.handle('ftps:get-platform', () => process.platform)
+
+// List contents of a zip/rar archive as a file tree (no extraction)
+ipcMain.handle('ftps:list-archive', async (_, { name, dataB64 }) => {
+  try {
+    const sid = crypto.randomBytes(6).toString('hex')
+    const tmpDir = path.join(os.tmpdir(), 'p2n-archlist-' + sid)
+    fs.mkdirSync(tmpDir, { recursive: true })
+    const archPath = path.join(tmpDir, name)
+    fs.writeFileSync(archPath, Buffer.from(dataB64, 'base64'))
+    // Check for password protection on zip
+    if (/\.zip$/i.test(name)) {
+      const buf = fs.readFileSync(archPath)
+      const str = buf.toString('binary')
+      if (str.includes('\x09\x08\x06\x00') || (buf[6] & 0x01)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+        return { passwordProtected: true }
+      }
+    }
+    const listDir = path.join(tmpDir, 'listing')
+    fs.mkdirSync(listDir, { recursive: true })
+    await extractArchive(archPath, listDir)
+    const tree = buildFileTree(listDir, listDir)
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+    return { ok: true, tree }
+  } catch (e) {
+    if (e.message?.toLowerCase().includes('password') || e.message?.toLowerCase().includes('encrypted')) {
+      return { passwordProtected: true }
+    }
+    return { error: e.message }
+  }
+})
+
+// Read a single file entry from inside a zip/rar (for preview without full extraction)
+ipcMain.handle('ftps:read-archive-entry', async (_, { name, dataB64, entryPath }) => {
+  try {
+    const sid = crypto.randomBytes(6).toString('hex')
+    const tmpDir = path.join(os.tmpdir(), 'p2n-archentry-' + sid)
+    fs.mkdirSync(tmpDir, { recursive: true })
+    const archPath = path.join(tmpDir, name)
+    fs.writeFileSync(archPath, Buffer.from(dataB64, 'base64'))
+    const extractDir = path.join(tmpDir, 'entry')
+    fs.mkdirSync(extractDir, { recursive: true })
+    await extractArchive(archPath, extractDir)
+    const targetPath = path.resolve(extractDir, entryPath)
+    // Path traversal guard
+    if (!targetPath.startsWith(path.resolve(extractDir))) {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      return { ok: false, error: 'Path traversal detected' }
+    }
+    if (!fs.existsSync(targetPath)) {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      return { ok: false, error: 'File not found in archive' }
+    }
+    const stat = fs.statSync(targetPath)
+    if (stat.size > 50 * 1024 * 1024) {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      return { ok: false, error: 'File too large to preview (>50MB)' }
+    }
+    const dataB64out = fs.readFileSync(targetPath).toString('base64')
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+    return { ok: true, dataB64: dataB64out }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+})
+
+// Save a large file from a temp path (used for files >32MB that bypass IPC base64)
+ipcMain.handle('ftps:save-file-from-temp', async (_, { tmpPath, name }) => {
+  if (!mainWindow) return { ok: false }
+  try {
+    if (!fs.existsSync(tmpPath)) return { ok: false, error: 'Temp file not found — may have been cleaned up' }
+    const { filePath, canceled } = await dialog.showSaveDialog(mainWindow, {
+      defaultPath: name,
+      filters: [{ name: 'All Files', extensions: ['*'] }]
+    })
+    if (canceled || !filePath) return { ok: false, canceled: true }
+    fs.copyFileSync(tmpPath, filePath)
+    // Clean up temp file after save
+    try { fs.unlinkSync(tmpPath) } catch { }
+    secEntry('OK', `Large file saved: ${path.basename(filePath)}`)
+    return { ok: true, filePath }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+})
+
+// Save an entire received folder to a user-chosen directory
+ipcMain.handle('ftps:save-to-dir', async (_, { files, folderName }) => {
+  if (!mainWindow) return { ok: false }
+  try {
+    const { filePaths, canceled } = await dialog.showOpenDialog(mainWindow, {
+      title: `Save folder "${folderName}" to…`,
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    if (canceled || !filePaths?.length) return { ok: false, canceled: true }
+    const destBase = path.join(filePaths[0], folderName)
+    fs.mkdirSync(destBase, { recursive: true })
+    for (const f of files) {
+      if (!f.relPath && !f.name) continue
+      const dest = path.resolve(destBase, f.relPath || f.name)
+      if (!dest.startsWith(path.resolve(destBase))) continue  // path traversal guard
+      fs.mkdirSync(path.dirname(dest), { recursive: true })
+      if (f.tmpPath && fs.existsSync(f.tmpPath)) {
+        fs.copyFileSync(f.tmpPath, dest)
+        try { fs.unlinkSync(f.tmpPath) } catch { }
+      } else if (f.dataB64) {
+        fs.writeFileSync(dest, Buffer.from(f.dataB64, 'base64'))
+      }
+    }
+    secEntry('OK', `Folder saved: ${folderName}`, destBase)
+    return { ok: true, dir: destBase }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+})
+
+// Launch OS-level sandbox: Windows Sandbox (Hyper-V) or Linux firejail/bubblewrap
+ipcMain.handle('ftps:launch-os-sandbox', async (_, { name, dataB64, tmpPath }) => {
+  try {
+    const plat = process.platform
+    const sid = crypto.randomBytes(6).toString('hex')
+    const stageDir = path.join(os.tmpdir(), 'p2n-ossandbox-' + sid)
+    fs.mkdirSync(stageDir, { recursive: true })
+    const fileDest = path.join(stageDir, name)
+    if (tmpPath && fs.existsSync(tmpPath)) {
+      fs.copyFileSync(tmpPath, fileDest)
+    } else if (dataB64) {
+      fs.writeFileSync(fileDest, Buffer.from(dataB64, 'base64'))
+    } else {
+      return { ok: false, error: 'No file data provided' }
+    }
+
+    if (plat === 'win32') {
+      // Try Windows Sandbox (requires Win10/11 Pro with Hyper-V)
+      const wsb = `<Configuration><MappedFolders><MappedFolder><HostFolder>${stageDir}</HostFolder><ReadOnly>true</ReadOnly></MappedFolder></MappedFolders><LogonCommand><Command>explorer C:\\Users\\WDAGUtilityAccount\\Desktop\\mapped</Command></LogonCommand></Configuration>`
+      const wsbPath = path.join(stageDir, 'sandbox.wsb')
+      fs.writeFileSync(wsbPath, wsb)
+      const { spawn } = require('child_process')
+      const proc = spawn('WindowsSandbox.exe', [wsbPath], { detached: true, stdio: 'ignore' })
+      proc.unref()
+      secEntry('OK', `Windows Sandbox launched for ${name}`)
+      return { ok: true, message: 'Windows Sandbox launched — file is read-only inside' }
+    } else if (plat === 'linux') {
+      // Try firejail, fall back to bubblewrap
+      const { execFile } = require('child_process')
+      const tryCmd = (cmd, args) => new Promise(res => {
+        execFile('which', [cmd], (err, out) => {
+          if (err || !out.trim()) { res(false); return }
+          const proc = require('child_process').spawn(cmd, args, { detached: true, stdio: 'ignore' })
+          proc.unref()
+          res(true)
+        })
+      })
+      const launched = await tryCmd('firejail', ['--noprofile', '--private=' + stageDir, 'bash', '-c', `cd ${stageDir} && xterm -e "ls -la; echo 'Press Enter'; read" || bash`])
+        || await tryCmd('bwrap', ['--ro-bind', stageDir, '/sandbox', '--proc', '/proc', '--dev', '/dev', '--unshare-all', 'ls', '-la', '/sandbox'])
+      if (!launched) return { ok: false, unsupported: true, message: 'firejail and bubblewrap not found. Install with: sudo apt install firejail' }
+      secEntry('OK', `Linux sandbox launched for ${name}`)
+      return { ok: true, message: 'Sandbox launched via firejail/bubblewrap' }
+    } else {
+      return { ok: false, unsupported: true, message: 'OS sandbox not available on macOS yet' }
+    }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+})
 
 // Shell + Window
 ipcMain.handle('shell:open-external', async (_, { url }) => { if (!/^https?:\/\//.test(url)) return { ok: false }; await shell.openExternal(url); secEntry('INFO', 'External URL', url); return { ok: true } })

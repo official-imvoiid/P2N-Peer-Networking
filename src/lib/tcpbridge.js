@@ -15,9 +15,15 @@ export class TCPBridge {
       window.ftps.on('ftps:message',      ({ peerId, msg }) => this.h.onMsg?.(peerId, msg)),
       window.ftps.on('ftps:file-start',   ({ peerId, meta }) => this.h.onFileStart?.(peerId, meta)),
       window.ftps.on('ftps:file-progress',({ peerId, fid, pct }) => this.h.onFileProg?.(peerId, fid, pct)),
-      window.ftps.on('ftps:file-done',    ({ peerId, meta, dataB64 }) => {
+      window.ftps.on('ftps:file-done', ({ peerId, meta, dataB64, tmpPath }) => {
+        // BUG-06 fix: large files (>32MB) arrive with tmpPath and no dataB64
+        // Renderer shows a Save button; actual file stays on disk until user saves
+        if (tmpPath && !dataB64) {
+          this.h.onFileDone?.(peerId, meta, null, tmpPath)
+          return
+        }
         const bytes = Uint8Array.from(atob(dataB64), c => c.charCodeAt(0))
-        this.h.onFileDone?.(peerId, meta, new Blob([bytes], { type: meta.mime || 'application/octet-stream' }))
+        this.h.onFileDone?.(peerId, meta, new Blob([bytes], { type: meta.mime || 'application/octet-stream' }), null)
       }),
       window.ftps.on('ftps:send-progress',({ peerId, fid, pct }) => this.h.onSendProg?.(peerId, fid, pct)),
     ]
