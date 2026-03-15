@@ -1,394 +1,306 @@
 #!/usr/bin/env python3
-"""
-GetTorDaemon.py — P2N Pre-requisite: Install Tor Daemon
-========================================================
-Run this BEFORE using P2N to install the Tor daemon.
-  - Linux : installs via system package manager (apt/pacman/dnf)
-  - Windows: downloads Tor Expert Bundle and extracts tor.exe + required DLLs
-             into ./tor/ folder (no full Tor Browser install)
-
-Usage:
-  python GetTorDaemon.py
-"""
-
-import os
-import sys
 import platform
-import subprocess
+import sys
+import os
 import shutil
-import tempfile
 import urllib.request
 import tarfile
+import re
+import stat
+from html.parser import HTMLParser
 
-# ── CONFIG ──────────────────────────────────────────────────────────────────
-# NOTE: If this version is outdated, check https://www.torproject.org/download/tor/
-# for the latest Tor Expert Bundle version and update TOR_VERSION below.
-TOR_VERSION = "14.0.9"
-TOR_WIN_URL   = (
-    f"https://archive.torproject.org/tor-package-archive/torbrowser/"
-    f"{TOR_VERSION}/tor-expert-bundle-windows-x86_64-{TOR_VERSION}.tar.gz"
-)
-TOR_LINUX_URL = (
-    f"https://archive.torproject.org/tor-package-archive/torbrowser/"
-    f"{TOR_VERSION}/tor-expert-bundle-linux-x86_64-{TOR_VERSION}.tar.gz"
-)
-INSTALL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tor")
+# ──────────────────────────────────────────────
+# ANSI COLORS  (work on Windows 10+ and Linux)
+# ──────────────────────────────────────────────
 
-# DLLs that tor.exe depends on inside the Expert Bundle (Windows)
-# Without these, tor.exe will fail to start with a missing DLL error.
-WINDOWS_REQUIRED_FILES = {"tor.exe", "libssl-3-x64.dll", "libcrypto-3-x64.dll", "zlib1.dll"}
+def _enable_ansi_windows():
+    """Enable ANSI escape codes on Windows 10+."""
+    if platform.system() == "Windows":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
 
-# GeoIP files — optional but prevent startup warnings
-GEOIP_FILES = {"geoip", "geoip6"}
+_enable_ansi_windows()
 
-# ── COLORS ──────────────────────────────────────────────────────────────────
-def _supports_color():
-    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+R  = "\033[31m"   # red
+G  = "\033[32m"   # green
+Y  = "\033[33m"   # yellow
+B  = "\033[34m"   # blue
+M  = "\033[35m"   # magenta
+C  = "\033[36m"   # cyan
+W  = "\033[37m"   # white
+DIM= "\033[2m"    # dim
+BLD= "\033[1m"    # bold
+RST= "\033[0m"    # reset
 
-C      = _supports_color()
-GREEN  = "\033[92m" if C else ""
-RED    = "\033[91m" if C else ""
-YELLOW = "\033[93m" if C else ""
-CYAN   = "\033[96m" if C else ""
-BOLD   = "\033[1m"  if C else ""
-RESET  = "\033[0m"  if C else ""
+def banner():
+    print(f"""
+{C}{BLD} 
+  ████████╗ ██████╗ ██████╗
+  ╚══██╔══╝██╔═══██╗██╔══██╗
+     ██║   ██║   ██║██████╔╝
+     ██║   ██║   ██║██╔══██╗
+     ██║   ╚██████╔╝██║  ██║
+     ╚═╝    ╚═════╝ ╚═╝  ╚═╝ 
+  {DIM}daemon installer{RST}
+  {DIM}P2N Peer Networking v1.0{RST}
+""")
 
-def ok(msg):   print(f"{GREEN}[✓]{RESET} {msg}")
-def err(msg):  print(f"{RED}[✗]{RESET} {msg}")
-def info(msg): print(f"{CYAN}[i]{RESET} {msg}")
-def warn(msg): print(f"{YELLOW}[!]{RESET} {msg}")
+def step(icon, msg):
+    print(f"  {icon}  {msg}")
 
+def ok(msg):
+    print(f"  {G}✔{RST}  {msg}")
 
-# ── DOWNLOAD HELPER ─────────────────────────────────────────────────────────
-def _download_with_progress(url: str, dest: str, timeout: int = 60) -> None:
-    """
-    Download *url* to *dest* file path, printing a simple progress indicator.
-    Raises urllib.error.URLError / OSError on failure.
-    Timeout applies to the initial connection + each read chunk.
-    """
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
-        total = resp.headers.get("content-length")
-        total = int(total) if total else None
-        downloaded = 0
-        chunk_size = 65536  # 64 KB
+def info(msg):
+    print(f"  {C}•{RST}  {DIM}{msg}{RST}")
 
-        with open(dest, "wb") as f:
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = downloaded * 100 // total
-                    mb  = downloaded / 1_048_576
-                    print(f"\r  {mb:6.1f} MB  [{pct:3d}%]", end="", flush=True)
-                else:
-                    mb = downloaded / 1_048_576
-                    print(f"\r  {mb:6.1f} MB", end="", flush=True)
-    print()  # newline after progress
+def warn(msg):
+    print(f"  {Y}⚠{RST}  {Y}{msg}{RST}")
 
+def err(msg):
+    print(f"  {R}✘{RST}  {R}{msg}{RST}")
 
-def _safe_extract_file(tar: tarfile.TarFile, member: tarfile.TarInfo, dest_dir: str) -> None:
-    """
-    Extract a single *member* from an open TarFile into *dest_dir*,
-    writing only the file's basename (strips any path components).
+def section(title):
+    width = 44
+    pad   = (width - len(title) - 2) // 2
+    print(f"\n{DIM}  {'─' * pad} {title} {'─' * pad}{RST}")
 
-    Uses extractfile() + manual write to avoid the mutating-member-name
-    hack and to stay compatible with Python 3.14's stricter tar filters.
-    """
-    basename = os.path.basename(member.name)
-    dest_path = os.path.join(dest_dir, basename)
-    fobj = tar.extractfile(member)
-    if fobj is None:
-        raise OSError(f"Could not open member '{member.name}' inside archive")
-    with fobj, open(dest_path, "wb") as out:
-        shutil.copyfileobj(fobj, out)
+def divider():
+    print(f"{DIM}  {'─' * 44}{RST}")
 
+# ──────────────────────────────────────────────
+# PATH CONFIG
+# ──────────────────────────────────────────────
 
-# ── LINUX ───────────────────────────────────────────────────────────────────
-def install_linux_package_manager() -> bool:
-    """Try to install Tor via the system package manager."""
-    managers = [
-        (["apt-get", "--version"], ["sudo", "apt-get", "install", "-y", "tor"]),
-        (["pacman",  "--version"], ["sudo", "pacman",  "-S", "--noconfirm", "tor"]),
-        (["dnf",     "--version"], ["sudo", "dnf",     "install", "-y", "tor"]),
-        (["yum",     "--version"], ["sudo", "yum",     "install", "-y", "tor"]),
-        (["zypper",  "--version"], ["sudo", "zypper",  "install", "-y", "tor"]),
-    ]
-    for check_cmd, install_cmd in managers:
-        try:
-            subprocess.run(check_cmd, capture_output=True, check=True)
-            info(f"Found package manager: {check_cmd[0]}")
-            info(f"Running: {' '.join(install_cmd)}")
-            result = subprocess.run(install_cmd)
-            if result.returncode == 0:
-                ok("Tor installed successfully via package manager!")
-                return True
-            err(f"Package manager install failed (exit code {result.returncode})")
-            return False
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            continue
-    return False
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+TOR_DIR     = os.path.join(SCRIPT_DIR, "tor")
+TOR_EXE_WIN = os.path.join(TOR_DIR, "tor.exe")
+TOR_EXE_LIN = os.path.join(TOR_DIR, "tor")
 
+TOR_DOWNLOAD_PAGE = "https://www.torproject.org/download/tor/"
 
-def install_linux_bundle() -> bool:
-    """
-    Download Tor Expert Bundle for Linux as a fallback.
+# ──────────────────────────────────────────────
+# SCRAPER
+# ──────────────────────────────────────────────
 
-    Extracts the 'tor' binary AND any bundled shared libraries (.so files)
-    found alongside it, because the bundled tor binary links against
-    specific versions of libssl/libcrypto that may differ from the system ones.
-    """
-    info(f"Downloading Tor Expert Bundle from:\n  {TOR_LINUX_URL}")
+class _LinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            for name, val in attrs:
+                if name == "href" and val:
+                    self.links.append(val)
+
+def get_tor_expert_bundle_url(platform_pattern):
+    info("Contacting torproject.org...")
     try:
-        tmp = tempfile.mkdtemp(prefix="p2n-tor-")
-        archive_path = os.path.join(tmp, "tor-bundle.tar.gz")
+        req = urllib.request.Request(
+            TOR_DOWNLOAD_PAGE,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
 
-        _download_with_progress(TOR_LINUX_URL, archive_path)
-        ok("Download complete")
+        parser = _LinkParser()
+        parser.feed(html)
+        pattern = re.compile(platform_pattern, re.IGNORECASE)
 
-        info("Extracting tor binary and libraries...")
-        os.makedirs(INSTALL_DIR, exist_ok=True)
+        for link in parser.links:
+            if link.startswith("/"):
+                link = "https://www.torproject.org" + link
+            if pattern.match(link):
+                return link
 
-        extracted_tor = False
-        with tarfile.open(archive_path, "r:gz") as tar:
-            for member in tar.getmembers():
-                if member.isdir():
-                    continue
-                basename = os.path.basename(member.name)
-                # Extract the tor binary
-                if basename == "tor":
-                    _safe_extract_file(tar, member, INSTALL_DIR)
-                    os.chmod(os.path.join(INSTALL_DIR, "tor"), 0o755)
-                    ok(f"Extracted: {INSTALL_DIR}/tor")
-                    extracted_tor = True
-                # Also extract bundled shared libraries
-                elif basename.endswith(".so") or ".so." in basename:
-                    _safe_extract_file(tar, member, INSTALL_DIR)
-                    info(f"Extracted library: {basename}")
+        match = pattern.search(html)
+        if match:
+            return match.group()
 
-        if not extracted_tor:
-            err("Could not find 'tor' binary in the bundle")
-            return False
-
-        shutil.rmtree(tmp, ignore_errors=True)
-        ok("Tor daemon ready!")
-        info(f"Location: {INSTALL_DIR}/tor")
-        return True
+        err("Could not find download URL on the page.")
+        return None
 
     except Exception as e:
-        err(f"Download/extract failed: {e}")
-        return False
+        err(f"Network error: {e}")
+        return None
 
+# ──────────────────────────────────────────────
+# DOWNLOAD + EXTRACT
+# ──────────────────────────────────────────────
 
-def install_linux() -> bool:
-    info("Platform: Linux")
+def _dl_progress(block, block_size, total):
+    done  = block * block_size
+    pct   = min(int(done * 100 / total), 100) if total > 0 else 0
+    filled = pct // 5
+    bar   = f"{G}{'█' * filled}{DIM}{'░' * (20 - filled)}{RST}"
+    mb_done  = done / 1_048_576
+    mb_total = total / 1_048_576
+    print(f"\r  {bar}  {BLD}{pct:>3}%{RST}  {DIM}{mb_done:.1f} / {mb_total:.1f} MB{RST}  ",
+          end="", flush=True)
 
-    # Already installed system-wide?
-    if shutil.which("tor"):
-        ok("Tor is already installed and in PATH!")
-        result = subprocess.run(["tor", "--version"], capture_output=True, text=True)
-        if result.returncode == 0:
-            info(result.stdout.strip().split("\n")[0])
-        return True
+def download_and_extract(url, exe_search_suffix, final_exe_path):
+    os.makedirs(TOR_DIR, exist_ok=True)
+    archive_path = os.path.join(TOR_DIR, "tor-expert-bundle.tar.gz")
 
-    # Already extracted locally?
-    local_tor = os.path.join(INSTALL_DIR, "tor")
-    if os.path.exists(local_tor):
-        ok(f"tor already present at: {local_tor}")
-        return True
+    # Show short version of URL
+    url_short = re.sub(r'https://[^/]+/', '', url)
+    info(f"Source  : {DIM}{url_short}{RST}")
+    info(f"Target  : {DIM}{TOR_DIR}{RST}")
+    print()
 
-    info("Tor not found. Attempting package manager install...")
-    if install_linux_package_manager():
-        return True
-
-    warn("Package manager failed. Falling back to Expert Bundle download...")
-    return install_linux_bundle()
-
-
-# ── WINDOWS ─────────────────────────────────────────────────────────────────
-def _verify_tor_binary(tor_path: str) -> bool:
-    """Run tor --version to check the binary actually works."""
     try:
-        result = subprocess.run(
-            [tor_path, "--version"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            version_line = result.stdout.strip().split("\n")[0]
-            ok(f"Tor binary works: {version_line}")
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def install_windows() -> bool:
-    """
-    Download Tor Expert Bundle for Windows and extract tor.exe, DLLs, and GeoIP files.
-    FIX: tries multiple version URLs so it never silently fails on a 404.
-    """
-    info("Platform: Windows")
-
-    local_tor = os.path.join(INSTALL_DIR, "tor.exe")
-
-    # Already present? Verify it actually runs.
-    if os.path.exists(local_tor):
-        if _verify_tor_binary(local_tor):
-            ok(f"tor.exe is ready at: {INSTALL_DIR}")
-            return True
-        warn("tor.exe exists but failed to run. Re-extracting...")
-
-    # In PATH already?
-    tor_in_path = shutil.which("tor")
-    if tor_in_path:
-        if _verify_tor_binary(tor_in_path):
-            ok("Tor is already installed and in PATH!")
-            return True
-
-    # FIX: Try configured version first, then fall back to known-good versions
-    # in case the primary URL returns 404 after a new release.
-    def _make_win_url(v):
-        return (f"https://archive.torproject.org/tor-package-archive/torbrowser/"
-                f"{v}/tor-expert-bundle-windows-x86_64-{v}.tar.gz")
-
-    candidate_urls = [TOR_WIN_URL]
-    for v in ["14.0.8", "14.0.7", "13.5.9", "13.5.8"]:
-        u = _make_win_url(v)
-        if u != TOR_WIN_URL:
-            candidate_urls.append(u)
-
-    tmp = tempfile.mkdtemp(prefix="p2n-tor-")
-    archive_path = None
-    used_url = None
-    for url in candidate_urls:
-        info(f"Trying: {url}")
-        dest = os.path.join(tmp, "tor-bundle.tar.gz")
-        try:
-            _download_with_progress(url, dest)
-            archive_path = dest
-            used_url = url
-            ok("Download complete")
-            break
-        except Exception as e:
-            warn(f"  Failed ({e}), trying next version...")
-
-    if not archive_path:
-        err("All download attempts failed.")
-        warn("Manually download the Tor Expert Bundle from:")
-        warn("  https://www.torproject.org/download/tor/")
-        warn(f"  Extract tor.exe and DLLs to: {INSTALL_DIR}")
-        shutil.rmtree(tmp, ignore_errors=True)
+        urllib.request.urlretrieve(url, archive_path, reporthook=_dl_progress)
+        print()   # newline after progress bar
+    except Exception as e:
+        print()
+        err(f"Download failed: {e}")
         return False
 
-    info(f"Extracting tor.exe, DLLs, and GeoIP files from: {used_url}")
-    os.makedirs(INSTALL_DIR, exist_ok=True)
+    ok("Download complete")
+    step(f"{C}⠿{RST}", "Extracting tor binary from archive...")
 
-    extracted = set()
     try:
         with tarfile.open(archive_path, "r:gz") as tar:
-            for member in tar.getmembers():
-                if member.isdir():
-                    continue
-                basename = os.path.basename(member.name)
-                # Extract tor.exe, known DLLs, any other DLLs, and GeoIP data files
-                if (basename in WINDOWS_REQUIRED_FILES
-                        or basename.endswith(".dll")
-                        or basename in GEOIP_FILES):
-                    _safe_extract_file(tar, member, INSTALL_DIR)
-                    ok(f"Extracted: {basename}")
-                    extracted.add(basename)
+            tor_member = next(
+                (m for m in tar.getmembers()
+                 if m.name.lower().endswith(exe_search_suffix)),
+                None
+            )
+            if tor_member is None:
+                err("tor binary not found in archive.")
+                return False
+
+            tor_member.name = os.path.basename(final_exe_path)
+            tar.extract(tor_member, TOR_DIR)
     except Exception as e:
         err(f"Extraction failed: {e}")
-        shutil.rmtree(tmp, ignore_errors=True)
         return False
+    finally:
+        if os.path.isfile(archive_path):
+            os.remove(archive_path)
 
-    shutil.rmtree(tmp, ignore_errors=True)
+    if platform.system() != "Windows":
+        os.chmod(final_exe_path, os.stat(final_exe_path).st_mode | stat.S_IEXEC)
 
-    if "tor.exe" not in extracted:
-        err("Could not find 'tor.exe' in the bundle")
-        return False
+    return os.path.isfile(final_exe_path)
 
-    # Verify the extracted binary actually works
-    if _verify_tor_binary(local_tor):
-        ok("Tor daemon ready!")
-    else:
-        missing_dlls = WINDOWS_REQUIRED_FILES - extracted
-        if missing_dlls:
-            warn(f"DLLs not found in bundle: {missing_dlls}")
-            warn("tor.exe may still work if these are statically linked (v13+).")
-        else:
-            warn("tor.exe extracted but --version check failed. It may still work at runtime.")
+# ──────────────────────────────────────────────
+# TOR HELPERS
+# ──────────────────────────────────────────────
 
-    if "geoip" not in extracted:
-        warn("GeoIP files not found — Tor will log path warnings but will still connect.")
+def tor_exe():
+    return TOR_EXE_WIN if platform.system() == "Windows" else TOR_EXE_LIN
 
-    info(f"Location: {INSTALL_DIR}")
-    return True
+def is_tor_installed():
+    return os.path.isfile(tor_exe())
 
-
-# ── MACOS ───────────────────────────────────────────────────────────────────
-def install_macos() -> bool:
-    info("Platform: macOS")
-
-    # Already installed?
-    if shutil.which("tor"):
-        ok("Tor is already installed and in PATH!")
-        result = subprocess.run(["tor", "--version"], capture_output=True, text=True)
-        if result.returncode == 0:
-            info(result.stdout.strip().split("\n")[0])
-        return True
-
-    # Try Homebrew automatically
-    if shutil.which("brew"):
-        info("Homebrew found. Running: brew install tor")
-        result = subprocess.run(["brew", "install", "tor"])
-        if result.returncode == 0:
-            ok("Tor installed via Homebrew!")
-            return True
-        err("brew install tor failed.")
-    else:
-        warn("Homebrew not found. Install it from https://brew.sh then run:")
-        print(f"\n  {BOLD}brew install tor{RESET}\n")
-
-    warn("Then re-run this script, or add 'tor' to your PATH manually.")
-    return False
-
-
-# ── MAIN ────────────────────────────────────────────────────────────────────
-def main() -> int:
-    print()
-    print(f"{BOLD}{CYAN}╔══════════════════════════════════════════╗{RESET}")
-    print(f"{BOLD}{CYAN}║   P2N — Tor Daemon Installer             ║{RESET}")
-    print(f"{BOLD}{CYAN}║   Pre-requisite for cross-network P2P    ║{RESET}")
-    print(f"{BOLD}{CYAN}╚══════════════════════════════════════════╝{RESET}")
-    print()
-
-    system = platform.system().lower()
-
-    if system == "linux":
-        success = install_linux()
-    elif system == "windows":
-        success = install_windows()
-    elif system == "darwin":
-        success = install_macos()
-    else:
-        err(f"Unsupported platform: {system}")
-        success = False
-
-    print()
-    if success:
-        ok(f"{BOLD}Tor daemon is ready! You can now use P2N.{RESET}")
-    else:
-        err(
-            f"{BOLD}Tor installation incomplete. "
-            f"P2N will work for local connections but Tor features won't be available.{RESET}"
+def download_tor():
+    if platform.system() == "Windows":
+        url = get_tor_expert_bundle_url(
+            r'https://[^\s"\']+tor-expert-bundle-windows-x86_64-[^\s"\']+\.tar\.gz'
         )
+        suffix, final = "tor/tor.exe", TOR_EXE_WIN
+    else:
+        url = get_tor_expert_bundle_url(
+            r'https://[^\s"\']+tor-expert-bundle-linux-x86_64-[^\s"\']+\.tar\.gz'
+        )
+        suffix, final = "tor/tor", TOR_EXE_LIN
+
+    if not url:
+        return False
+    return download_and_extract(url, suffix, final)
+
+def uninstall_tor():
+    if os.path.isdir(TOR_DIR):
+        shutil.rmtree(TOR_DIR)
+        ok(f"Removed: {DIM}{TOR_DIR}{RST}")
+    else:
+        warn("Tor folder not found — nothing to remove.")
+
+def upgrade_tor():
+    step(f"{Y}↑{RST}", "Fetching latest version...")
+    if os.path.isfile(tor_exe()):
+        os.remove(tor_exe())
+    return download_tor()
+
+# ──────────────────────────────────────────────
+# SECOND-RUN MENU
+# ──────────────────────────────────────────────
+
+def second_run_menu():
+    exe = tor_exe()
+    size_kb = os.path.getsize(exe) // 1024 if os.path.isfile(exe) else 0
+
+    section("Already Installed")
+    ok(f"tor binary found  {DIM}({size_kb} KB){RST}")
+    info(f"Path: {DIM}{exe}{RST}")
+    print()
+    print(f"  {BLD}What would you like to do?{RST}\n")
+    print(f"    {C}1{RST}  {W}Upgrade Tor{RST}   {DIM}(re-download latest){RST}")
+    print(f"    {R}2{RST}  {W}Uninstall Tor{RST} {DIM}(removes tor folder){RST}")
+    print(f"    {DIM}0  Exit{RST}")
     print()
 
-    return 0 if success else 1
+    choice = input(f"  {BLD}>{RST} ").strip()
 
+    if choice == "1":
+        section("Upgrade")
+        if upgrade_tor():
+            ok(f"Tor upgraded successfully")
+            info(f"Path: {DIM}{tor_exe()}{RST}")
+        else:
+            err("Upgrade failed.")
+
+    elif choice == "2":
+        print()
+        confirm = input(f"  {R}Remove tor folder? (y/n){RST} ").strip().lower()
+        if confirm == "y":
+            section("Uninstall")
+            uninstall_tor()
+            ok("Tor uninstalled.")
+        else:
+            info("Cancelled.")
+
+    elif choice == "0":
+        info("Bye!")
+        sys.exit(0)
+    else:
+        warn("Invalid choice.")
+
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
+
+def execute_os_commands():
+    banner()
+
+    current_os = platform.system()
+    os_label   = {"Windows": "Windows", "Linux": "Linux", "Darwin": "macOS"}.get(current_os)
+
+    if not os_label:
+        err(f"Unsupported OS: {current_os}")
+        sys.exit(1)
+
+    info(f"OS detected: {BLD}{os_label}{RST}")
+    divider()
+
+    if is_tor_installed():
+        second_run_menu()
+    else:
+        section("Install")
+        step(f"{C}↓{RST}", "Fetching latest Tor Expert Bundle...")
+        print()
+        if not download_tor():
+            err("Installation failed.")
+            sys.exit(1)
+        print()
+        divider()
+        ok(f"{BLD}{G}Tor is ready!{RST}")
+        info(f"Binary : {DIM}{tor_exe()}{RST}")
+
+    print()
 
 if __name__ == "__main__":
-    sys.exit(main())
+    execute_os_commands()

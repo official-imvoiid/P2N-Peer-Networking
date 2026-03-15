@@ -46,6 +46,7 @@ contextBridge.exposeInMainWorld('ftps', {
       'ftps:file-start', 'ftps:file-progress', 'ftps:file-done', 'ftps:send-progress',
       'ftps:server-error', 'ftps:upnp-status', 'ftps:pairing-status', 'ftps:peer-reconnecting',
       'ftps:peers-discovered', 'ftps:tor-status', 'p2n:log', 'app:request-close', 'app:session-active',
+      'ftps:listen-auto',
     ]
     if (!allowed.includes(channel)) return () => { }
     const h = (_, d) => cb(d)

@@ -1283,6 +1283,9 @@ export default function App() {
   const [onionAddr, setOnionAddr] = useState('')
   const [onionInput, setOnionInput] = useState('')
   const [torError, setTorError] = useState('')  // specific Tor error message
+  // FIX: Separate connection state for Tor vs local — they must not block each other
+  const [torConnState, setTorConnState] = useState('idle') // idle|connecting|done|error
+  const [torConnErr, setTorConnErr] = useState('')
   // system
   const [netInfo, setNetInfo] = useState([])
   const [uptime, setUptime] = useState(0)
@@ -1439,8 +1442,8 @@ export default function App() {
         // FIX: Auto-select the newly connected peer so the chat panel is never blank,
         // and reset connState so the connect form is reusable without a manual Reset.
         setSelPeer({ id: pid, name: pn, online: true, reconnecting: false })
-        setConnState('idle')
-        setConnErr('')
+        setConnState('idle'); setConnErr('')
+        setTorConnState('idle'); setTorConnErr('')
         setTab('peers')
       },
       onClose(pid) {
@@ -1570,6 +1573,16 @@ export default function App() {
     saveSession(form, myId.current)
     addLog('OK', `Session started: ${form.name}`)
     setScreen('main'); notify('Session ready', 'ok')
+    // FIX: main process auto-starts TCP server + Tor on identity set.
+    // Listen for the one-time auto-listen event and update UI state.
+    const unsubAutoListen = window.ftps?.on('ftps:listen-auto', d => {
+      if (d?.ok) {
+        setListenActive(true)
+        setListenInfo({ port: d.port, localIPs: d.localIPs })
+        addLog('OK', `TCP server auto-started on port ${d.port}`)
+      }
+      unsubAutoListen?.()
+    })
   }
 
   const doUnlock = () => {
@@ -1587,7 +1600,16 @@ export default function App() {
   }
 
   const doLock = () => { setScreen('locked'); setLockForm({ pp: '', pw: '' }); addLog('INFO', 'Session locked') }
-  const doTerminate = () => { clearSavedSession(); window.ftps?.clearSession(); addLog('INFO', 'Session ended'); bridgeRef.current?.closeAll(); setAccount(null); setScreen('setup'); setMsgs({}); setPeers([]); setForm({ name: '', passphrase: '', password: '' }) }
+  const doTerminate = () => {
+    clearSavedSession(); window.ftps?.clearSession(); addLog('INFO', 'Session ended')
+    bridgeRef.current?.closeAll()
+    setAccount(null); setScreen('setup'); setMsgs({}); setPeers([])
+    setForm({ name: '', passphrase: '', password: '' })
+    setConnState('idle'); setConnErr(''); setConnectAddr('')
+    setTorConnState('idle'); setTorConnErr(''); setOnionInput('')
+    setTorStatus('off'); setOnionAddr(''); setTorError('')
+    setListenActive(false); setListenInfo(null)
+  }
 
   const doListen = async () => {
     const r = await window.ftps?.listen(parseInt(listenPort) || 0, false)
@@ -1642,12 +1664,12 @@ export default function App() {
   const doConnectOnion = async () => {
     const addr = onionInput.trim(); if (!addr) { notify('Enter .onion address', 'err'); return }
     const parts = addr.split(':'); if (parts.length < 2) { notify('Format: xxxx.onion:port', 'err'); return }
-    setConnState('connecting'); setConnErr('')
+    setTorConnState('connecting'); setTorConnErr('')
     addLog('INFO', `Connecting via Tor to ${addr}`)
     const r = await window.ftps?.connectOnion(parts[0], parseInt(parts[1]))
-    if (!r) { notify('Electron API unavailable', 'err'); setConnState('idle'); return }
-    if (r.ok) { setConnState('done'); notify('Connected via Tor — handshaking…', 'ok') }
-    else { setConnState('error'); setConnErr(r.error || 'Failed'); notify('Tor connect failed: ' + (r.error || ''), 'err') }
+    if (!r) { notify('Electron API unavailable', 'err'); setTorConnState('idle'); return }
+    if (r.ok) { setTorConnState('done'); notify('Connected via Tor — handshaking…', 'ok') }
+    else { setTorConnState('error'); setTorConnErr(r.error || 'Failed'); notify('Tor connect failed: ' + (r.error || ''), 'err') }
   }
 
   // ── RESTORING (Refresh UI in progress) ────────────────────────────────────
@@ -1916,9 +1938,12 @@ export default function App() {
                     <div>
                       <div style={{ fontSize: 10, color: T.purple, fontWeight: 700, marginBottom: 6, letterSpacing: 1 }}>CONNECT VIA ONION</div>
                       <input value={onionInput} onChange={e => setOnionInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && doConnectOnion()} className="inp" placeholder="xxxx.onion:7000" style={{ marginBottom: 6, fontSize: 11, fontFamily: 'monospace' }} />
-                      <button onClick={doConnectOnion} className="btn btn-purple" style={{ width: '100%', padding: 8 }} disabled={connState === 'connecting' || !onionInput.trim()}>
-                        {connState === 'connecting' ? '⟳ Connecting via Tor…' : '🧅 Connect via Onion'}
+                      <button onClick={doConnectOnion} className="btn btn-purple" style={{ width: '100%', padding: 8 }} disabled={torConnState === 'connecting' || !onionInput.trim()}>
+                        {torConnState === 'connecting' ? '⟳ Connecting via Tor…' : '🧅 Connect via Onion'}
                       </button>
+                      {torConnState === 'done' && <div style={{ marginTop: 6, padding: '6px 9px', background: T.green + '09', border: `1px solid ${T.green}22`, borderRadius: 5, fontSize: 11, color: T.green }}>✓ Connected via Tor — handshaking</div>}
+                      {torConnState === 'error' && <div style={{ marginTop: 6, padding: '6px 9px', background: T.red + '09', border: `1px solid ${T.red}22`, borderRadius: 5, fontSize: 11, color: T.red }}>✕ {torConnErr || 'Failed'}</div>}
+                      {torConnState !== 'idle' && <button onClick={() => { setTorConnState('idle'); setTorConnErr(''); setOnionInput('') }} className="btn btn-ghost btn-xs" style={{ marginTop: 5, width: '100%' }}>Reset</button>}
                     </div>
                   </div>
                   {torStatus === 'error' && <div style={{ padding: '8px 11px', background: T.red + '09', border: `1px solid ${T.red}22`, borderRadius: 5, fontSize: 11, color: T.red, marginTop: 6, lineHeight: 1.6 }}>
@@ -2283,12 +2308,22 @@ export default function App() {
                       <div style={{ fontSize: 12, color: T.text }}>Tor Daemon</div>
                       <div style={{ fontSize: 10, color: T.muted }}>{torStatus === 'running' ? '● Running' : torStatus === 'starting' ? '○ Starting…' : '○ Off'}</div>
                     </div>
-                    <button onClick={() => {
+                    <button onClick={async () => {
                       const next = !sett.torEnabled
                       setSett2(p => ({ ...p, torEnabled: next }))
-                      window.ftps?.setTorEnabled(next)
-                      if (next && listenActive && torStatus !== 'running') doStartTor()
-                      if (!next && torStatus === 'running') doStopTor()
+                      // FIX: setTorEnabled in main handles start/stop internally.
+                      // Calling doStartTor/doStopTor here too caused a race condition.
+                      await window.ftps?.setTorEnabled(next)
+                      if (next) {
+                        // Sync status after enable so button reflects reality
+                        const s = await window.ftps?.getTorStatus()
+                        if (s) {
+                          setTorStatus(s.running ? 'running' : 'off')
+                          if (s.onionAddress) setOnionAddr(s.onionAddress + ':' + (s.socksPort || 7000))
+                        }
+                      } else {
+                        setTorStatus('off'); setOnionAddr(''); setTorError('')
+                      }
                     }} className="btn btn-xs" style={{ background: sett.torEnabled ? T.purple + '16' : T.panel, border: `1px solid ${sett.torEnabled ? T.purple : T.border}`, color: sett.torEnabled ? T.purple : T.textDim, minWidth: 36 }}>
                       {sett.torEnabled ? 'ON' : 'OFF'}
                     </button>

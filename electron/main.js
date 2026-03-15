@@ -570,43 +570,81 @@ function stopTorDaemon() {
   secEntry('OK', 'Tor daemon stopped')
 }
 
-// Connect to a .onion address via SOCKS5 proxy
 function connectViaTor(onionHost, port) {
   return new Promise((resolve, reject) => {
     const sock = new net.Socket()
+    // Buffer all incoming bytes so we can handle partial SOCKS5 responses safely
+    let rxBuf = Buffer.alloc(0)
+    let step = 'greeting'
+    let settled = false
+
+    const fail = (err) => { if (!settled) { settled = true; try { sock.destroy() } catch { }; reject(err) } }
+    const succeed = () => {
+      if (!settled) {
+        settled = true
+        // FIX: Clear the 30s timeout and remove our SOCKS5 data listener BEFORE
+        // handing the socket to PeerConn. If left in place, the timeout destroys
+        // a healthy onion connection after 30s and the stale listener competes with
+        // PeerConn for incoming bytes.
+        sock.setTimeout(0)
+        sock.removeAllListeners('data')
+        sock.removeAllListeners('error')
+        sock.removeAllListeners('timeout')
+        resolve(sock)
+      }
+    }
+
+    sock.setTimeout(60000, () => fail(new Error('SOCKS5 timeout — onion connections can be slow, try again')))
+    sock.on('error', fail)
+
     sock.connect(torSocksPort, '127.0.0.1', () => {
       // SOCKS5 greeting: version 5, 1 auth method, no auth
       sock.write(Buffer.from([0x05, 0x01, 0x00]))
     })
-    let step = 'greeting'
-    sock.on('data', data => {
+
+    sock.on('data', chunk => {
+      rxBuf = Buffer.concat([rxBuf, chunk])
+
       if (step === 'greeting') {
-        if (data[0] !== 0x05 || data[1] !== 0x00) {
-          sock.destroy(); reject(new Error('SOCKS5 auth rejected')); return
-        }
-        // SOCKS5 CONNECT request with domain name (onion address)
+        if (rxBuf.length < 2) return  // wait for full 2-byte greeting response
+        if (rxBuf[0] !== 0x05 || rxBuf[1] !== 0x00) { fail(new Error(`SOCKS5 auth rejected (server method: ${rxBuf[1]})`)); return }
+        rxBuf = rxBuf.slice(2)  // consume greeting bytes
         step = 'connect'
+        // SOCKS5 CONNECT request with domain name (onion address)
         const hostBuf = Buffer.from(onionHost, 'utf8')
         const req = Buffer.alloc(7 + hostBuf.length)
-        req[0] = 0x05 // version
-        req[1] = 0x01 // CONNECT
-        req[2] = 0x00 // reserved
-        req[3] = 0x03 // domain name
+        req[0] = 0x05  // version
+        req[1] = 0x01  // CONNECT
+        req[2] = 0x00  // reserved
+        req[3] = 0x03  // domain name
         req[4] = hostBuf.length
         hostBuf.copy(req, 5)
         req.writeUInt16BE(port, 5 + hostBuf.length)
         sock.write(req)
+
       } else if (step === 'connect') {
-        if (data[0] !== 0x05 || data[1] !== 0x00) {
-          sock.destroy(); reject(new Error(`SOCKS5 connect failed: code ${data[1]}`)); return
+        // SOCKS5 CONNECT reply: VER REP RSV ATYP [BND.ADDR variable] BND.PORT(2)
+        // Minimum reply is 10 bytes (ATYP=IPv4). We just need bytes 0+1 to check status.
+        if (rxBuf.length < 2) return
+        if (rxBuf[0] !== 0x05 || rxBuf[1] !== 0x00) {
+          const codes = { 1: 'general failure', 2: 'connection not allowed', 3: 'network unreachable', 4: 'host unreachable', 5: 'connection refused', 6: 'TTL expired', 7: 'command not supported', 8: 'address type not supported' }
+          fail(new Error(`SOCKS5 connect failed: ${codes[rxBuf[1]] || 'error code ' + rxBuf[1]}`))
+          return
         }
         step = 'connected'
-        // Socket is now tunneled through Tor to the onion address
-        resolve(sock)
+        // Any remaining bytes in rxBuf are application data — prepend back to socket
+        // by calling succeed() and letting PeerConn consume them via its own listener.
+        // Since we remove our listener first, PeerConn will receive the buffered data
+        // on its next 'data' event once we give up the listener.
+        succeed()
+        // If there were leftover bytes, emit them as a synthetic data event after PeerConn attaches
+        if (rxBuf.length > 2) {
+          // Socket already handed off — emit remaining data after microtask so PeerConn listener is ready
+          const leftover = rxBuf.slice(2)
+          setImmediate(() => { if (!sock.destroyed) sock.emit('data', leftover) })
+        }
       }
     })
-    sock.on('error', e => reject(e))
-    sock.setTimeout(30000, () => { sock.destroy(); reject(new Error('SOCKS5 timeout')) })
   })
 }
 
@@ -884,15 +922,35 @@ async function connectToPeerWithFallback(host, port) {
 function disconnectPeer(id) { const c = peers.get(id); if (c) c.disconnect() }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
-ipcMain.handle('ftps:set-identity', (_, { name, nodeId }) => {
+ipcMain.handle('ftps:set-identity', async (_, { name, nodeId }) => {
   const suffix = myIdentityKey.slice(0, 6)
   myNodeId = nodeId + '-' + suffix
-  myName = name;
+  myName = name
   activeSession = { name, nodeId: myNodeId, startedAt: new Date().toISOString() }
   secEntry('OK', `Identity: ${name} ${myNodeId}`)
-  // Start passive mDNS discovery so "My Network" shows peers immediately,
-  // even before the user clicks "Start Listening".
+  // Start passive mDNS discovery immediately
   startPassiveDiscovery()
+
+  // FIX: Auto-start TCP server + Tor when a session begins.
+  // This makes Tor start with the program — no manual "Start Listening" needed.
+  if (!tcpServer) {
+    try {
+      const r = await startServer(7000)
+      startDiscovery(r.port)
+      emit('ftps:listen-auto', { ok: true, port: r.port, localIPs: r.localIPs })
+      secEntry('OK', `TCP server auto-started on port ${r.port}`)
+      if (torEnabled) {
+        startTorHiddenService(r.port).catch(e => secEntry('WARN', 'Tor auto-start failed', e.message || ''))
+      }
+    } catch (e) {
+      secEntry('WARN', 'TCP server auto-start failed', e.message)
+    }
+  } else if (torEnabled && !torProcess) {
+    // Server already up (session restore) — just ensure Tor is running
+    const port = tcpServer.address()?.port
+    if (port) startTorHiddenService(port).catch(e => secEntry('WARN', 'Tor auto-start failed', e.message || ''))
+  }
+
   return { ok: true, nodeId: myNodeId, identityKey: myIdentityKey }
 })
 ipcMain.handle('ftps:clear-session', () => { activeSession = null; return { ok: true } })
@@ -919,7 +977,10 @@ ipcMain.handle('ftps:listen', async (_, { port }) => {
   } catch (e) { return { ok: false, error: e.message } }
 })
 ipcMain.handle('ftps:stop-listen', async () => {
-  stopServer(); stopDiscovery(); stopTorDaemon(); return { ok: true }
+  // FIX: Stop TCP server and mDNS discovery but do NOT stop Tor daemon.
+  // Tor runs independently — the hidden service keeps the onion address alive
+  // even while the local TCP server is not accepting new connections.
+  stopServer(); stopDiscovery(); return { ok: true }
 })
 ipcMain.handle('ftps:connect', async (_, { host, port }) => { return connectToPeerWithFallback(host, port) })
 ipcMain.handle('ftps:send', (_, { peerId, payload }) => { const c = peers.get(peerId); if (c && c._reconnecting) { c.send(payload); return { ok: true, queued: true } }; if (!c?.ready) return { ok: false, error: 'Not connected' }; c.send(payload); return { ok: true } })
