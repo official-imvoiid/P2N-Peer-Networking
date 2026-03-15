@@ -9,7 +9,6 @@
     "build": "vite build",
     "dist": "vite build && electron-builder",
     "dist:win": "vite build && electron-builder --win",
-    "dist:mac": "vite build && electron-builder --mac",
     "dist:linux": "vite build && electron-builder --linux"
   },
   "dependencies": {
@@ -45,18 +44,6 @@
           ]
         }
       ]
-    },
-    "mac": {
-      "target": [
-        {
-          "target": "dmg",
-          "arch": [
-            "x64",
-            "arm64"
-          ]
-        }
-      ],
-      "category": "public.app-category.productivity"
     },
     "linux": {
       "target": [

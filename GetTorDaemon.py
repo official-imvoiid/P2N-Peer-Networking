@@ -277,7 +277,7 @@ def execute_os_commands():
     banner()
 
     current_os = platform.system()
-    os_label   = {"Windows": "Windows", "Linux": "Linux", "Darwin": "macOS"}.get(current_os)
+    os_label   = {"Windows": "Windows", "Linux": "Linux"}.get(current_os)
 
     if not os_label:
         err(f"Unsupported OS: {current_os}")
