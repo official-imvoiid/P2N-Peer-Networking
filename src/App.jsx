@@ -24,9 +24,7 @@ class ErrorBoundary extends Component {
             <button onClick={() => this.setState({ error: null })} style={{ background: '#58a6ff', color: '#0d1117', border: 'none', borderRadius: 6, padding: '8px 18px', fontWeight: 700, cursor: 'pointer', marginRight: 8 }}>
               Retry
             </button>
-            <button onClick={() => window.ftps?.windowControl('reload')} style={{ background: 'transparent', color: '#8b949e', border: `1px solid ${T2.border}`, borderRadius: 6, padding: '8px 18px', cursor: 'pointer' }}>
-              Refresh UI
-            </button>
+
           </div>
         </div>
       )
@@ -290,14 +288,14 @@ async function detectThreats(blob, filename) {
     const ext = filename.toLowerCase().replace(/.*\./, '')
     const magic4 = Array.from(bytes.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('')
     const MAGIC = {
-      png:  ['89504e47'],
-      jpg:  ['ffd8ffe0', 'ffd8ffe1', 'ffd8ffdb', 'ffd8ffee'],
-      gif:  ['47494638'],
-      pdf:  ['25504446'],
-      zip:  ['504b0304', '504b0506'],
-      rar:  ['52617221'],
+      png: ['89504e47'],
+      jpg: ['ffd8ffe0', 'ffd8ffe1', 'ffd8ffdb', 'ffd8ffee'],
+      gif: ['47494638'],
+      pdf: ['25504446'],
+      zip: ['504b0304', '504b0506'],
+      rar: ['52617221'],
       '7z': ['377abcaf'],
-      exe:  ['4d5a9000', '4d5a5000'],
+      exe: ['4d5a9000', '4d5a5000'],
     }
     const expectedMagic = MAGIC[ext]
     if (expectedMagic && !expectedMagic.some(m => magic4.startsWith(m.slice(0, magic4.length)))) {
@@ -314,45 +312,45 @@ async function detectThreats(blob, filename) {
 
     // ── PDF attacks ───────────────────────────────────────────────────────────
     if (IS_PDF.test(filename)) {
-      if (/\/JavaScript\b/.test(text))    threats.push('JavaScript in PDF')
-      if (/\/JS\s/.test(text))            threats.push('JS action in PDF')
-      if (/\/OpenAction/.test(text))      threats.push('Auto-open action')
-      if (/\/Launch\b/.test(text))        threats.push('Launch action (can run executables)')
-      if (/\/EmbeddedFile/.test(text))    threats.push('Embedded file attachment')
-      if (/\/RichMedia/.test(text))       threats.push('Rich media embed')
-      if (/\/AcroForm/.test(text))        threats.push('PDF form (can auto-submit data)')
-      if (/\/URI\s/.test(text))           threats.push('Embedded URI action')
-      if (/\/SubmitForm/.test(text))      threats.push('Form submission action')
-      if (/\/GoToR\b/.test(text))         threats.push('Remote file reference')
-      if (/\/ImportData/.test(text))      threats.push('Data import action')
-      if (/\/Sound\b/.test(text))         threats.push('Embedded sound')
-      if (/\/Movie\b/.test(text))         threats.push('Embedded movie')
+      if (/\/JavaScript\b/.test(text)) threats.push('JavaScript in PDF')
+      if (/\/JS\s/.test(text)) threats.push('JS action in PDF')
+      if (/\/OpenAction/.test(text)) threats.push('Auto-open action')
+      if (/\/Launch\b/.test(text)) threats.push('Launch action (can run executables)')
+      if (/\/EmbeddedFile/.test(text)) threats.push('Embedded file attachment')
+      if (/\/RichMedia/.test(text)) threats.push('Rich media embed')
+      if (/\/AcroForm/.test(text)) threats.push('PDF form (can auto-submit data)')
+      if (/\/URI\s/.test(text)) threats.push('Embedded URI action')
+      if (/\/SubmitForm/.test(text)) threats.push('Form submission action')
+      if (/\/GoToR\b/.test(text)) threats.push('Remote file reference')
+      if (/\/ImportData/.test(text)) threats.push('Data import action')
+      if (/\/Sound\b/.test(text)) threats.push('Embedded sound')
+      if (/\/Movie\b/.test(text)) threats.push('Embedded movie')
       if ((text.match(/obj\b/g) || []).length > 5000) threats.push('Abnormally high PDF object count')
     }
 
     // ── Image attacks ─────────────────────────────────────────────────────────
     if (IS_IMG.test(filename)) {
-      if (/<\?php/i.test(text))              threats.push('PHP code in image')
-      if (/<script[\s>]/i.test(text))        threats.push('Script tag in image')
-      if (/eval\s*\(/.test(text))            threats.push('eval() in EXIF data')
-      if (/document\.cookie/i.test(text))    threats.push('Cookie access code in image')
+      if (/<\?php/i.test(text)) threats.push('PHP code in image')
+      if (/<script[\s>]/i.test(text)) threats.push('Script tag in image')
+      if (/eval\s*\(/.test(text)) threats.push('eval() in EXIF data')
+      if (/document\.cookie/i.test(text)) threats.push('Cookie access code in image')
       if (/fetch\s*\(|XMLHttpRequest/i.test(text)) threats.push('Network request code in image')
       // SVG-specific: SVG can contain full HTML/JS
       if (/\.svg$/i.test(filename)) {
-        if (/<script/i.test(text))           threats.push('JavaScript in SVG')
-        if (/on\w+\s*=/i.test(text))         threats.push('Event handler in SVG (XSS vector)')
-        if (/<foreignObject/i.test(text))    threats.push('foreignObject in SVG (HTML injection)')
-        if (/xlink:href/i.test(text))        threats.push('XLink in SVG (SSRF/data exfil vector)')
+        if (/<script/i.test(text)) threats.push('JavaScript in SVG')
+        if (/on\w+\s*=/i.test(text)) threats.push('Event handler in SVG (XSS vector)')
+        if (/<foreignObject/i.test(text)) threats.push('foreignObject in SVG (HTML injection)')
+        if (/xlink:href/i.test(text)) threats.push('XLink in SVG (SSRF/data exfil vector)')
       }
     }
 
     // ── Polyglot detection (file valid as 2+ formats) ─────────────────────────
-    const hasPngSig  = magic4 === '89504e47'
-    const hasGifSig  = text.startsWith('GIF8')
+    const hasPngSig = magic4 === '89504e47'
+    const hasGifSig = text.startsWith('GIF8')
     const hasJpegSig = bytes[0] === 0xff && bytes[1] === 0xd8
-    const hasScript  = /<script/i.test(text)
-    const hasEval    = /eval\(/.test(text)
-    const hasPkZip   = magic4.startsWith('504b')
+    const hasScript = /<script/i.test(text)
+    const hasEval = /eval\(/.test(text)
+    const hasPkZip = magic4.startsWith('504b')
     if ((hasPngSig || hasGifSig || hasJpegSig) && (hasScript || hasEval))
       threats.push('Polyglot file — valid image AND executable script')
     if (hasPkZip && /\.jpg|\.png|\.gif|\.pdf/i.test(filename))
@@ -360,9 +358,9 @@ async function detectThreats(blob, filename) {
 
     // ── HTML/text files with suspicious content ───────────────────────────────
     if (/\.(html|htm|svg|xml)$/i.test(filename)) {
-      if (/javascript:/i.test(text))      threats.push('javascript: URI scheme')
-      if (/data:text\/html/i.test(text))  threats.push('data: URI HTML embedding')
-      if (/vbscript:/i.test(text))        threats.push('VBScript URI (IE attack)')
+      if (/javascript:/i.test(text)) threats.push('javascript: URI scheme')
+      if (/data:text\/html/i.test(text)) threats.push('data: URI HTML embedding')
+      if (/vbscript:/i.test(text)) threats.push('VBScript URI (IE attack)')
     }
 
     return threats
@@ -406,14 +404,14 @@ async function stripMetadata(blob, filename) {
 
     // ── PNG: Remove all non-critical chunks (tEXt, iTXt, zTXt, eXIf, etc.) ──
     if (/\.png$/i.test(filename)) {
-      const KEEP = new Set(['IHDR','PLTE','IDAT','IEND','tRNS','gAMA','cHRM','sRGB','bKGD','pHYs','sBIT','hIST','sPLT','tIME'])
+      const KEEP = new Set(['IHDR', 'PLTE', 'IDAT', 'IEND', 'tRNS', 'gAMA', 'cHRM', 'sRGB', 'bKGD', 'pHYs', 'sBIT', 'hIST', 'sPLT', 'tIME'])
       const out = []
       // PNG signature
       for (let j = 0; j < 8; j++) out.push(bytes[j])
       let i = 8
       while (i < bytes.length) {
-        const len = (bytes[i]<<24|bytes[i+1]<<16|bytes[i+2]<<8|bytes[i+3]) >>> 0
-        const name = String.fromCharCode(bytes[i+4],bytes[i+5],bytes[i+6],bytes[i+7])
+        const len = (bytes[i] << 24 | bytes[i + 1] << 16 | bytes[i + 2] << 8 | bytes[i + 3]) >>> 0
+        const name = String.fromCharCode(bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7])
         const totalChunk = 4 + 4 + len + 4
         if (KEEP.has(name)) {
           for (let j = i; j < i + totalChunk; j++) out.push(bytes[j])
@@ -566,8 +564,6 @@ function TitleBar({ account, nodeId, onlinePeers, listenActive, onLock, onTermin
   }, [])
 
   const VIEW = [
-    { l: 'Refresh UI', k: 'reload', s: 'Ctrl+R', note: 'Refreshes the interface only — all connections and data persist' },
-    { sep: true },
     { l: 'Minimize', k: 'minimize', s: 'Ctrl+M' },
     { l: 'Maximize', k: 'maximize', s: 'Ctrl+Shift+M' },
     { l: 'Toggle Fullscreen', k: 'fullscreen', s: 'F11' },
@@ -575,8 +571,6 @@ function TitleBar({ account, nodeId, onlinePeers, listenActive, onLock, onTermin
     { l: 'Zoom In', k: 'zoomin', s: 'Ctrl++' },
     { l: 'Actual Size', k: 'zoomreset', s: 'Ctrl+0' },
     { l: 'Zoom Out', k: 'zoomout', s: 'Ctrl+-' },
-    { sep: true },
-    { l: 'Toggle Dev Tools', k: 'devtools', s: 'Ctrl+Shift+I' },
   ]
 
   return <div className="tb">
@@ -1023,15 +1017,15 @@ function FileMsg({ msg, onExtract, onPreview, onRevoke, onZipView, onOSSandbox, 
     {msg.type === 'file_done' && (msg.blob || msg.tmpPath) && <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
       <button onClick={save} className="btn btn-green btn-xs" style={{ flex: 1 }}>⬇ Save</button>
       {isZipRar && <button onClick={() => onZipView?.(msg)} className="btn btn-blue btn-xs" style={{ flex: 1 }} disabled={!msg.blob}>📂 Browse</button>}
-      {isArch && <button onClick={() => onOSSandbox?.(msg)} className="btn btn-amber btn-xs" style={{ flex: 1 }} disabled={!msg.blob && !msg.tmpPath}>🛡 Sandbox</button>}
-      {!isArch && canView && <button onClick={() => onPreview?.(msg)} className="btn btn-blue btn-xs" style={{ flex: 1 }}>👁 View</button>}
+      {(isArch || isDanger) && <button onClick={() => onOSSandbox?.(msg)} className="btn btn-amber btn-xs" style={{ flex: 1 }} disabled={!msg.blob && !msg.tmpPath}>🛡 Sandbox</button>}
+      {!isArch && !isDanger && canView && <button onClick={() => onPreview?.(msg)} className="btn btn-blue btn-xs" style={{ flex: 1 }}>👁 View</button>}
       {msg.blob && !isArch && (IS_IMG.test(fname) || IS_PDF.test(fname)) && (
         <button onClick={async () => {
           try {
             const stripped = await stripMetadata(msg.blob, fname)
             const r = new FileReader(); r.onload = async () => await window.ftps?.saveFile(fname, r.result.split(',')[1]); r.readAsDataURL(stripped)
             notify('Metadata stripped — choose save location', 'ok')
-          } catch(e) { notify('Strip failed: ' + e.message, 'err') }
+          } catch (e) { notify('Strip failed: ' + e.message, 'err') }
         }} className="btn btn-purple btn-xs" style={{ flex: 1 }} title="Remove EXIF/XMP/metadata then save">🧹 Strip Meta</button>
       )}
     </div>}
@@ -1223,7 +1217,7 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
               const a = document.createElement('a'); a.href = URL.createObjectURL(zipBlob); a.download = msg.name + '.zip'; a.click()
             }
             notify('ZIP ready — choose save location', 'ok')
-          } catch(e) { notify('ZIP failed: ' + e.message, 'err') }
+          } catch (e) { notify('ZIP failed: ' + e.message, 'err') }
         }} className="btn btn-blue btn-xs">📦 Save as ZIP</button>
         <button onClick={saveAll} className="btn btn-green btn-xs">⬇ Save All</button>
       </div>
@@ -1478,9 +1472,9 @@ function HelpModal({ onClose, inline = false }) {
       {tab === 'connect' && <>
         <div style={{ background: `linear-gradient(135deg, ${T.accent}08, ${T.green}06)`, border: `1px solid ${T.accent}18`, borderRadius: 8, padding: '12px 16px', marginBottom: 18 }}>
           <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>⚡ Quick Start</div>
-          <div style={{ fontSize: 12, color: T.textMid, lineHeight: 1.8 }}>One peer listens. The other dials. No servers, no codes required for same WiFi — peers are <strong style={{ color: T.green }}>auto-discovered</strong> via mDNS. For internet connections, use pairing codes.</div>
+          <div style={{ fontSize: 12, color: T.textMid, lineHeight: 1.8 }}>One peer listens. The other dials. No servers required. Same network peers are <strong style={{ color: T.green }}>auto-discovered</strong> via mDNS. For internet connections, start Tor and share your onion address.</div>
         </div>
-        <S n="1" col={T.blue} title="Start Listening" body="Connect tab → Start Listening (default port 7900). UPnP auto-maps port on your router. mDNS discovery starts automatically for same-network peers." />
+        <S n="1" col={T.blue} title="Start Listening" body="Connect tab → Start Listening (default port 7900). mDNS discovery starts automatically — nearby peers on the same network appear in the My Network tab." />
         <S n="2" col={T.green} title="Same Network" body="Open My Network tab — nearby peers appear automatically with a one-click Connect button. No IP typing needed. This uses mDNS multicast (like AirDrop/Bonjour), fully local." />
         <S n="3" col={T.purple} title="Different Network (Tor)" body="Connect tab → Different Network → Start Tor → copy your onion address → share via Discord/Signal/any platform → peer pastes it into Connect via Onion → encrypted session begins." />
         <S n="4" col={T.accent} title="Fully E2E Encrypted" body="ECDH P-256 + Ed25519 handshake. Fresh AES-256-GCM keys every session via HKDF. Every message and file chunk encrypted before leaving your machine. No server, no relay — direct peer-to-peer." />
@@ -1509,9 +1503,9 @@ function HelpModal({ onClose, inline = false }) {
         <R icon="✓" l="Auth Tag" v="16-byte GCM — tamper detection per frame" c={T.green} />
         <R icon="🔌" l="Transport" v="Direct TCP (no relay, no server)" c={T.blue} />
         <R icon="⊘" l="Servers" v="None — fully serverless P2P" c={T.accent} />
-        <R icon="📡" l="STUN/mDNS" v="IP discovery + local discovery only — nothing relayed" />
+        <R icon="📡" l="mDNS" v="Local network auto-discovery — nothing relayed" />
         <R icon="📝" l="Log" v="In-memory only · Click log line to copy" />
-        <R icon="🔄" l="Refresh UI" v="TCP connections survive renderer reload" c={T.green} />
+        <R icon="✎" l="Rename limit" v="3 renames per session — anti-impersonation" c={T.amber} />
         <div style={{ marginTop: 14, padding: '10px 14px', background: T.accent + '08', border: `1px solid ${T.accent}18`, borderRadius: 6 }}>
           <div style={{ fontSize: 11, color: T.accent, fontWeight: 700, marginBottom: 5 }}>🔑 TOFU — Trust-On-First-Use (session-scoped)</div>
           <div style={{ fontSize: 11, color: T.textMid, lineHeight: 1.7 }}>On first connect this session, P2N stores the peer's <em>Ed25519 public key</em> in memory. If they reconnect with the same key — trusted ✓. If the key changes mid-session — <span style={{ color: T.red, fontWeight: 600 }}>MITM warning</span>. TOFU resets when the app closes — this is intentional. P2N is designed for ephemeral secure sessions.</div>
@@ -1519,14 +1513,15 @@ function HelpModal({ onClose, inline = false }) {
       </>}
       {tab === 'sandbox' && <>
         <div style={{ background: T.amber + '08', border: `1px solid ${T.amber}18`, borderRadius: 8, padding: '12px 16px', marginBottom: 18 }}>
-          <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>📦 Sandboxed Archive Extraction</div>
-          <div style={{ fontSize: 12, color: T.textMid, lineHeight: 1.8 }}>Archives extracted to an isolated OS temp folder — never your Desktop or Documents.</div>
+          <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>🛡 Sandbox & Archive Security</div>
+          <div style={{ fontSize: 12, color: T.textMid, lineHeight: 1.8 }}>P2N offers two levels of file inspection: an in-app archive viewer (ZIP/RAR) and OS-level sandboxing (Windows Sandbox / Linux firejail). Both keep suspicious files away from your real system.</div>
         </div>
-        <S n="1" col={T.blue} title="Receive archive" body="When a ZIP/TAR/GZ arrives, click '📦 Extract' on the file message." />
-        <S n="2" col={T.amber} title="Sandbox panel opens" body="Browse the file tree, preview text and images safely inside the sandbox." />
-        <S n="3" col={T.green} title="Save selectively" body="Click ⬇ on any individual file to save it to a location you choose. Nothing is auto-saved." />
-        <S n="4" col={T.purple} title="AV scan via OS" body="Click 'Explorer' — OS file manager opens the temp folder. Windows Defender / ClamAV scans on access automatically." />
-        <div style={{ marginTop: 12, padding: '10px 14px', background: T.red + '0a', border: `1px solid ${T.red}22`, borderRadius: 6, fontSize: 12, color: T.red, lineHeight: 1.7 }}>⚠ <strong>Never</strong> run executables from the sandbox. Preview → AV scan → save to disk if trusted.</div>
+        <S n="1" col={T.blue} title="In-App Archive Viewer" body="ZIP and RAR files can be browsed directly inside P2N — click '📂 Browse' on the file card. Read-only, in-memory, nothing is extracted to disk. Preview text, images, and PDFs safely." />
+        <S n="2" col={T.amber} title="OS Sandbox (Windows / Linux)" body="Click '🛡 Sandbox' on any archive or executable file. On Windows, this launches Windows Sandbox (Hyper-V VM) — a full isolated virtual machine. On Linux, firejail/bubblewrap creates a restricted namespace. Everything is deleted when the sandbox closes." />
+        <S n="3" col={T.green} title="Save selectively" body="After inspecting, click ⬇ on individual files to save to a location you choose. Nothing is auto-saved or auto-extracted to your real filesystem." />
+        <S n="4" col={T.purple} title="AV scan" body="Click 'Explorer' to open the temp folder in your OS file manager — Windows Defender / ClamAV scans on access automatically. P2N also runs its own threat scanner on every received file (magic byte checks, polyglot detection, PDF/image analysis)." />
+        <div style={{ marginTop: 12, padding: '10px 14px', background: T.red + '0a', border: `1px solid ${T.red}22`, borderRadius: 6, fontSize: 12, color: T.red, lineHeight: 1.7 }}>⚠ <strong>Never</strong> run executables directly. Use the sandbox to inspect, AV scan, then save to disk only if trusted.</div>
+        <div style={{ marginTop: 8, padding: '10px 14px', background: T.green + '0a', border: `1px solid ${T.green}22`, borderRadius: 6, fontSize: 12, color: T.green, lineHeight: 1.7 }}>💡 <strong>Requirements:</strong> Windows Sandbox requires Windows 10/11 Pro/Enterprise with virtualization enabled. Linux requires firejail or bubblewrap (<code style={{ background: T.panel, padding: '1px 4px', borderRadius: 3, fontFamily: 'monospace', fontSize: 11 }}>sudo apt install firejail</code>).</div>
       </>}
     </div>
   </>
@@ -1545,7 +1540,7 @@ function HelpModal({ onClose, inline = false }) {
 }
 
 // CHANGE 8: Settings are ephemeral — reset on every restart. Only port persists to disk.
-const DEFAULT_SETTINGS = { lockMin: 15, md: true, warnLinks: true, warnArch: true, torEnabled: true, maxTries: 5, scanFiles: true, exifStrip: false, clearMsgsOnReconnect: true }
+const DEFAULT_SETTINGS = { lockMin: 15, md: true, warnLinks: true, warnArch: true, torEnabled: true, maxTries: 5, scanFiles: true, exifStripSend: false, exifStripRecv: false, clearMsgsOnReconnect: true }
 // sessionStorage survives webContents.reload() (Refresh UI) but NOT app restart.
 // This lets Refresh UI work without terminating the session.
 function readSavedSession() {
@@ -1608,6 +1603,8 @@ export default function App() {
   const [showArchConfirm, setShowArchConfirm] = useState(null)
   const [showRemoveConfirm, setShowRemoveConfirm] = useState(null) // {peerId,peerName}
   const [showRenameConfirm, setShowRenameConfirm] = useState(null) // holds new name string when pending (CHANGE 1)
+  const [renameCountThisSession, setRenameCountThisSession] = useState(0) // tracks renames used this session
+  const [showDangerConfirm, setShowDangerConfirm] = useState(null) // holds File object for executable send confirmation
   // BUG-14 fix: showAttach was dead state (never used in UI) — removed
   const [peerFingerprints, setPeerFingerprints] = useState({})
   const [peerIdentityKeys, setPeerIdentityKeys] = useState({})  // peerId → identityKey for tofuAccept
@@ -1653,6 +1650,7 @@ export default function App() {
   const removedByPeersRef = useRef(new Set())  // peerIds that have explicitly removed us
   // Stores shared folder File objects keyed by fid — sender keeps these until receiver pulls
   const sharedFoldersRef = useRef({})  // {[fid]: {name, files:[File]}}
+  const folderPullFidsRef = useRef(new Set())  // tracks fids from folder-pull ops to suppress standalone FileMsg
 
   const [zipView, setZipView] = useState(null)   // msg to show in ZipViewer
   const [osSandbox, setOsSandbox] = useState(null)   // msg/file to show in OSSandbox
@@ -1699,10 +1697,30 @@ export default function App() {
   useEffect(() => { refreshNet() }, [refreshNet])
   // CHANGE 8: Load saved port from main process on mount
   useEffect(() => {
-    window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => {})
+    window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => { })
   }, [])
   // B4/C1: Load blocked peers on mount
-  useEffect(() => { window.ftps?.getBlocked?.().then(r => { if (r) setBlockedPeers(r) }).catch(() => {}) }, [])
+  useEffect(() => { window.ftps?.getBlocked?.().then(r => { if (r) setBlockedPeers(r) }).catch(() => { }) }, [])
+
+  // Issue 11: Auto-expire pending mDNS connection requests after 30 seconds
+  useEffect(() => {
+    if (pendingPeerRequests.length === 0) return
+    const timer = setInterval(() => {
+      const now = Date.now()
+      setPendingPeerRequests(prev => {
+        const expired = prev.filter(r => now - r.timestamp >= 30000)
+        const remaining = prev.filter(r => now - r.timestamp < 30000)
+        // Auto-decline expired requests
+        expired.forEach(r => {
+          bridgeRef.current?.sendMsg(r.peerId, { type: 'peer_reject' })
+          bridgeRef.current?.disconnect(r.peerId)
+          setPeers(ps => ps.filter(p => p.id !== r.peerId))
+        })
+        return remaining
+      })
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [pendingPeerRequests.length])
 
   // Periodic stats poller
   useEffect(() => {
@@ -1913,34 +1931,34 @@ export default function App() {
             if (file) {
               const singleFid = crypto.randomUUID()
               const relPath = file.webkitRelativePath || file.name
-              ;(bridgeRef.current?.sendFolderFile
-                ? bridgeRef.current.sendFolderFile(pid, file, singleFid, msg.fid, relPath, msg.fileIndex, () => {})
-                : bridgeRef.current?.sendFile(pid, file, () => {})
-              ).then(() => {
-                setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'offered' } : m) }))
-              }).catch(() => {})
+                ; (bridgeRef.current?.sendFolderFile
+                  ? bridgeRef.current.sendFolderFile(pid, file, singleFid, msg.fid, relPath, msg.fileIndex, () => { })
+                  : bridgeRef.current?.sendFile(pid, file, () => { })
+                ).then(() => {
+                  setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'offered' } : m) }))
+                }).catch(() => { })
             }
           } else {
             // Pull all files via full folder transfer — FIX #5: streaming per file
             const files = folder.files
-            ;(async () => {
-              for (let i = 0; i < files.length; i++) {
-                const file = files[i]
-                const fileFid = crypto.randomUUID()
-                const relPath = file.webkitRelativePath || file.name
-                try {
-                  if (bridgeRef.current?.sendFolderFile) {
-                    await bridgeRef.current.sendFolderFile(pid, file, fileFid, msg.fid, relPath, i, () => {})
-                  } else {
-                    await bridgeRef.current?.sendFile(pid, file, () => {})
-                  }
-                } catch { }
-              }
-              setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'done' } : m) }))
-              bridgeRef.current?.sendMsg(pid, { type: 'folder_pull_done', fid: msg.fid })
-            })().catch(() => {
-              setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'offered' } : m) }))
-            })
+              ; (async () => {
+                for (let i = 0; i < files.length; i++) {
+                  const file = files[i]
+                  const fileFid = crypto.randomUUID()
+                  const relPath = file.webkitRelativePath || file.name
+                  try {
+                    if (bridgeRef.current?.sendFolderFile) {
+                      await bridgeRef.current.sendFolderFile(pid, file, fileFid, msg.fid, relPath, i, () => { })
+                    } else {
+                      await bridgeRef.current?.sendFile(pid, file, () => { })
+                    }
+                  } catch { }
+                }
+                setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'done' } : m) }))
+                bridgeRef.current?.sendMsg(pid, { type: 'folder_pull_done', fid: msg.fid })
+              })().catch(() => {
+                setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'offered' } : m) }))
+              })
           }
         }
       },
@@ -1965,7 +1983,12 @@ export default function App() {
         let threats = []
         // A1/B10 FIX: use settRef.current instead of stale `sett` closure
         try { if (blob && settRef.current.scanFiles) threats = await detectThreats(blob, meta.name || '') } catch { }
-        setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === meta.fid + '_in' ? { ...m, type: 'file_done', pct: 1, blob, tmpPath, large: !!tmpPath, threats } : m) }))
+        // Issue 2: Strip metadata on receive if enabled
+        let finalBlob = blob
+        if (blob && settRef.current.exifStripRecv && (IS_IMG.test(meta.name || '') || IS_PDF.test(meta.name || ''))) {
+          try { finalBlob = await stripMetadata(blob, meta.name || '') } catch { finalBlob = blob }
+        }
+        setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === meta.fid + '_in' ? { ...m, type: 'file_done', pct: 1, blob: finalBlob, tmpPath, large: !!tmpPath, threats } : m) }))
         addLog('OK', `Received: ${meta.name}`, fmtSz(meta.size || 0) + (threats.length ? ` ⚠ ${threats.length} threat(s)` : ''))
         if (threats.length) notify(`⚠ Threats in ${meta.name}: ${threats[0]}`, 'err')
         else notify(`Received: ${meta.name}`, 'ok')
@@ -2045,13 +2068,9 @@ export default function App() {
     }
   }, [selPeer, input, pushMsg, notify])
 
-  // doSendFile — read a File and send it to the selected peer
-  const doSendFile = useCallback(async (file) => {
+  // doSendFileInner — actual send logic (called directly or after danger confirmation)
+  const doSendFileInner = useCallback(async (file) => {
     if (!selPeer) return
-    if (removedByPeersRef.current.has(selPeer.id)) {
-      notify('❌ Cannot send file — this peer has removed you from their list', 'err')
-      return
-    }
     // Use a single UUID as the fid for BOTH the UI message AND the wire transfer.
     // This ensures the revoke chain works: sender's message id (fid+'_out') strips '_out'
     // to get rawFid, receiver's message id (fid+'_in') matches on revoke receipt.
@@ -2060,7 +2079,7 @@ export default function App() {
     addLog('INFO', `Sending: ${file.name}`, fmtSz(file.size))
     // EXIF strip: if enabled, strip metadata before sending
     let fileToSend = file
-    if (settRef.current.exifStrip && (IS_IMG.test(file.name) || IS_PDF.test(file.name))) {
+    if (settRef.current.exifStripSend && (IS_IMG.test(file.name) || IS_PDF.test(file.name))) {
       try {
         const stripped = await stripMetadata(file, file.name)
         fileToSend = new File([stripped], file.name, { type: file.type || stripped.type })
@@ -2069,7 +2088,7 @@ export default function App() {
     }
     const ok = await bridgeRef.current?.sendFile(selPeer.id, fileToSend, pct => {
       setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).map(m => m.id === fid + '_out' ? { ...m, pct } : m) }))
-    }, fid)  // pass fid so tcpbridge uses the same one on the wire
+    }, fid, true)  // pass fid + useStream=true so tcpbridge uses file.path when available
     if (!ok) {
       notify(`Send failed: ${file.name}`, 'err')
       setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).filter(m => m.id !== fid + '_out') }))
@@ -2077,6 +2096,21 @@ export default function App() {
       notify(`Sent: ${file.name}`, 'ok')
     }
   }, [selPeer, pushMsg, addLog, notify])
+
+  // doSendFile — read a File and send it to the selected peer
+  const doSendFile = useCallback(async (file) => {
+    if (!selPeer) return
+    if (removedByPeersRef.current.has(selPeer.id)) {
+      notify('❌ Cannot send file — this peer has removed you from their list', 'err')
+      return
+    }
+    // Issue 4: Warn before sending dangerous/executable files
+    if (IS_DANGEROUS.test(file.name)) {
+      setShowDangerConfirm(file)
+      return
+    }
+    await doSendFileInner(file)
+  }, [selPeer, notify])
 
   // doSendFolder — advertise a folder offer to the peer (browse+pull model)
   const doSendFolder = useCallback(async (files) => {
@@ -2285,9 +2319,9 @@ export default function App() {
     setPendingPeerRequests([]); setSentPeerRequests(new Set())
     setBlockedPeers([])
     setSett2Raw({ ...DEFAULT_SETTINGS })
-    folderDataRef.current = {}; sharedFoldersRef.current = {}; removedByPeersRef.current.clear()
+    folderDataRef.current = {}; sharedFoldersRef.current = {}; removedByPeersRef.current.clear(); folderPullFidsRef.current.clear()
     // Restore saved port so the connect tab always shows what the user last saved
-    window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => {})
+    window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => { })
   }
 
   const doListen = async () => {
@@ -2402,12 +2436,11 @@ export default function App() {
       <div style={{ width: '100%', maxWidth: 390 }} className="fadeup">
         <div style={{ textAlign: 'center', marginBottom: 24 }}>
           <div style={{ width: 54, height: 54, borderRadius: 14, background: `linear-gradient(135deg,${T.accent}22,${T.accentDim}18)`, border: `1.5px solid ${T.accent}35`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 26, margin: '0 auto 12px', boxShadow: `0 0 24px ${T.accent}18` }}>🔐</div>
-          <div style={{ fontSize: 26, color: T.text, fontWeight: 800, letterSpacing: 1 }}>P2N-Peer-Networking</div>
+          <div style={{ fontSize: 26, color: T.text, fontWeight: 800, letterSpacing: 1 }}>P2N(Peer-Networking)</div>
           <div style={{ fontSize: 10, color: T.textDim, marginTop: 5, display: 'flex', gap: 5, justifyContent: 'center', flexWrap: 'wrap' }}>
-            <span style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 4, padding: '1px 6px' }}>Direct TCP</span>
-            <span style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 4, padding: '1px 6px' }}>ECDH P-256</span>
-            <span style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 4, padding: '1px 6px' }}>AES-256-GCM</span>
-            <span style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 4, padding: '1px 6px' }}>TOFU</span>
+            {['Direct TCP', 'ECDH P-256', 'Ed25519', 'AES-256-GCM', 'Tor', 'TOFU'].map(b => (
+              <span key={b} style={{ background: T.panel, border: `1px solid ${T.accent}22`, borderRadius: 4, padding: '2px 7px', color: T.textDim }}>{b}</span>
+            ))}
           </div>
         </div>
         <div className="card" style={{ padding: 22 }}>
@@ -2445,15 +2478,18 @@ export default function App() {
       <style>{G}</style><Toast n={toast} />
       <div style={{ width: '100%', maxWidth: 330 }} className="fadeup">
         <div style={{ textAlign: 'center', marginBottom: 22 }}>
-          <div style={{ fontSize: 36, marginBottom: 8 }}>🔒</div>
-          <div style={{ fontSize: 15, color: T.text, fontWeight: 600 }}>Session Locked</div>
-          {lockTries > 0 && <div style={{ fontSize: 12, color: lockTries >= 3 ? T.red : T.amber, marginTop: 6 }}>{lockTries} failed · {sett.maxTries - lockTries} left</div>}
+          <div style={{ fontSize: 20, fontWeight: 800, color: T.text, letterSpacing: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
+            <span style={{ fontSize: 22 }}>🔒</span>
+            <span>Session Locked</span>
+            <span style={{ fontSize: 22 }}>🔒</span>
+          </div>
+          {lockTries > 0 && <div style={{ fontSize: 13, color: lockTries >= 3 ? T.red : T.amber, marginTop: 8, fontWeight: 600 }}>{lockTries} failed · {sett.maxTries - lockTries} left</div>}
         </div>
         <div className="card" style={{ padding: 22 }}>
-          <div style={{ marginBottom: 11 }}><div style={{ fontSize: 11, color: T.textDim, marginBottom: 4 }}>Passphrase</div><input type="password" value={lockForm.pp} placeholder="Enter passphrase" className="inp" onChange={e => setLockForm(p => ({ ...p, pp: e.target.value }))} onKeyDown={e => e.key === 'Enter' && doUnlock()} /></div>
-          <div style={{ marginBottom: 15 }}><div style={{ fontSize: 11, color: T.textDim, marginBottom: 4 }}>Password</div><input type="password" value={lockForm.pw} placeholder="Enter password" className="inp" onChange={e => setLockForm(p => ({ ...p, pw: e.target.value }))} onKeyDown={e => e.key === 'Enter' && doUnlock()} /></div>
-          {lockErr && <div style={{ fontSize: 12, color: T.red, marginBottom: 11 }}>{lockErr}</div>}
-          <button onClick={doUnlock} className="btn btn-amber" style={{ width: '100%', padding: 10, fontSize: 13 }}>Unlock</button>
+          <div style={{ marginBottom: 13 }}><div style={{ fontSize: 12, color: T.textMid, marginBottom: 5, fontWeight: 500 }}>Passphrase</div><input type="password" value={lockForm.pp} placeholder="Enter your passphrase" className="inp" style={{ fontSize: 13 }} onChange={e => setLockForm(p => ({ ...p, pp: e.target.value }))} onKeyDown={e => e.key === 'Enter' && doUnlock()} /></div>
+          <div style={{ marginBottom: 15 }}><div style={{ fontSize: 12, color: T.textMid, marginBottom: 5, fontWeight: 500 }}>Password</div><input type="password" value={lockForm.pw} placeholder="Enter your password" className="inp" style={{ fontSize: 13 }} onChange={e => setLockForm(p => ({ ...p, pw: e.target.value }))} onKeyDown={e => e.key === 'Enter' && doUnlock()} /></div>
+          {lockErr && <div style={{ fontSize: 12, color: T.red, marginBottom: 11, fontWeight: 600 }}>{lockErr}</div>}
+          <button onClick={doUnlock} className="btn btn-amber" style={{ width: '100%', padding: 12, fontSize: 14, fontWeight: 700 }}>🔓 Unlock</button>
         </div>
       </div>
     </div>
@@ -2494,6 +2530,18 @@ export default function App() {
           <button onClick={() => doExtractAction(showArchConfirm)} className="btn btn-amber" style={{ flex: 1 }}>Extract to Sandbox</button>
         </div>
       </div></div>}
+      {/* Issue 4: Executable file send warning */}
+      {showDangerConfirm && <div className="overlay" style={{ zIndex: 600 }}><div className="card fadeup" style={{ width: 380, padding: 22, textAlign: 'center' }}>
+        <div style={{ fontSize: 32, marginBottom: 12 }}>⚠️</div>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 8, color: T.red }}>Send Executable File?</div>
+        <div style={{ fontSize: 12, color: T.textDim, marginBottom: 10, lineHeight: 1.6 }}>You are about to send an <strong style={{ color: T.amber }}>executable file</strong>:</div>
+        <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 10, padding: '6px 10px', background: T.panel, borderRadius: 6, border: `1px solid ${T.red}30`, wordBreak: 'break-all' }}>{showDangerConfirm.name}</div>
+        <div style={{ fontSize: 11, color: T.amber, marginBottom: 18, lineHeight: 1.6 }}>⚠ Executable files (.exe, .dll, .msi, .bat, etc.) can be dangerous. The receiver will see a security warning. Only send executables you trust.</div>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button onClick={() => setShowDangerConfirm(null)} className="btn btn-ghost" style={{ flex: 1 }}>Cancel</button>
+          <button onClick={async () => { const f = showDangerConfirm; setShowDangerConfirm(null); await doSendFileInner(f) }} className="btn btn-danger" style={{ flex: 1 }}>⚠ Send Anyway</button>
+        </div>
+      </div></div>}
       {/* Peer remove confirm — with immediate disconnect note */}
       {/* CHANGE 7a: Clarify remove is one-sided */}
       {showRemoveConfirm && <div className="overlay" style={{ zIndex: 600 }}><div className="card fadeup" style={{ width: 340, padding: 22, textAlign: 'center' }}>
@@ -2510,7 +2558,10 @@ export default function App() {
       {showRenameConfirm && <div className="overlay" style={{ zIndex: 600 }}><div className="card fadeup" style={{ width: 380, padding: 22, textAlign: 'center' }}>
         <div style={{ fontSize: 28, marginBottom: 8 }}>✎</div>
         <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 10 }}>Rename</div>
-        <div style={{ fontSize: 12, color: T.textDim, marginBottom: 18, lineHeight: 1.6, textAlign: 'left' }}>Your new name <strong style={{ color: T.accent }}>{showRenameConfirm}</strong> will be broadcast to all connected peers. No disconnection required.</div>
+        <div style={{ fontSize: 12, color: T.textDim, marginBottom: 14, lineHeight: 1.6, textAlign: 'left' }}>Your new name <strong style={{ color: T.accent }}>{showRenameConfirm}</strong> will be broadcast to all connected peers. No disconnection required.</div>
+        <div style={{ fontSize: 11, color: renameCountThisSession >= 2 ? T.amber : T.muted, marginBottom: 18, padding: '5px 10px', background: T.panel, borderRadius: 5 }}>
+          ✎ {renameCountThisSession} / 3 renames used this session
+        </div>
         <div style={{ display: 'flex', gap: 10 }}>
           <button onClick={() => setShowRenameConfirm(null)} className="btn btn-ghost" style={{ flex: 1 }}>Cancel</button>
           <button onClick={async () => {
@@ -2519,10 +2570,11 @@ export default function App() {
             // Main.js updateName broadcasts peer_rename to all connected peers automatically.
             const res = await window.ftps?.updateName?.(n)
             if (res?.limitReached) {
-              notify(`Rename limit (${res.renameLimit || 5}/session) reached`, 'err')
+              notify(`Rename limit (${res.renameLimit || 3}/session) reached`, 'err')
               setShowRenameConfirm(null)
               return
             }
+            if (res?.renameCount) setRenameCountThisSession(res.renameCount)
             setAccount(a => ({ ...a, name: n }))
             saveSession({ ...account, name: n }, myId.current)
             setEditName(false); setShowRenameConfirm(null)
@@ -2552,9 +2604,10 @@ export default function App() {
                         // FIX #3: updateName only — no setIdentity, no disconnect
                         const res = await window.ftps?.updateName?.(n)
                         if (res?.limitReached) {
-                          notify(`Rename limit (${res.renameLimit || 5}/session) reached`, 'err')
+                          notify(`Rename limit (${res.renameLimit || 3}/session) reached`, 'err')
                           setEditName(false); return
                         }
+                        if (res?.renameCount) setRenameCountThisSession(res.renameCount)
                         setAccount(a => ({ ...a, name: n }))
                         saveSession({ ...account, name: n }, myId.current)
                         addLog('INFO', `Name changed: ${account?.name} → ${n}`)
@@ -2572,7 +2625,7 @@ export default function App() {
                       // FIX #3: updateName only — no setIdentity, no disconnect
                       const res = await window.ftps?.updateName?.(n)
                       if (res?.limitReached) {
-                        notify(`Rename limit (${res.renameLimit || 5}/session) reached`, 'err')
+                        notify(`Rename limit (${res.renameLimit || 3}/session) reached`, 'err')
                         setEditName(false); return
                       }
                       setAccount(a => ({ ...a, name: n }))
@@ -2608,11 +2661,11 @@ export default function App() {
             { id: 'docs', icon: '📖', label: 'Docs' },
           ].map(it => (
             <button key={it.id} onClick={() => {
-                setTab(it.id)
-                if (it.id !== 'peers') setSelPeer(null)
-                if (it.id === 'logs') { setUnreadLogs(0) }
-                else setLogSearch('')  // clear log search when switching away
-              }} className={`nav-item${tab === it.id ? ' act' : ''}`}>
+              setTab(it.id)
+              if (it.id !== 'peers') setSelPeer(null)
+              if (it.id === 'logs') { setUnreadLogs(0) }
+              else setLogSearch('')  // clear log search when switching away
+            }} className={`nav-item${tab === it.id ? ' act' : ''}`}>
               <span style={{ width: 17, textAlign: 'center', fontSize: 13, flexShrink: 0 }}>{it.icon}</span>
               <span style={{ flex: 1 }}>{it.label}</span>
               {it.badge > 0 && <span style={{ fontSize: 9, background: T.red, color: '#fff', borderRadius: 8, padding: '1px 4px', fontWeight: 700 }}>{it.badge}</span>}
@@ -2787,8 +2840,8 @@ export default function App() {
                         <div style={{ fontSize: 10, color: selPeer.removedMe ? T.red : selPeer.reconnecting ? T.amber : selPeer.online ? T.green : T.red, marginTop: 1 }}>
                           {selPeer.removedMe ? '🚫 This peer has removed you — messages cannot be sent'
                             : selPeer.reconnecting ? '⟳ Reconnecting…'
-                            : selPeer.online ? `🔒 E2E Encrypted${verifiedPeers.has(selPeer.id) ? ' · ✓ Verified' : ''}`
-                            : '⚠ Disconnected'}
+                              : selPeer.online ? `🔒 E2E Encrypted${verifiedPeers.has(selPeer.id) ? ' · ✓ Verified' : ''}`
+                                : '⚠ Disconnected'}
                         </div>
                       </div>
                       {selPeer.online && <button onClick={() => setShowVerify({ fingerprint: peerFingerprints[selPeer.id], peerName: selPeer.name })} className="btn btn-xs" style={{ background: verifiedPeers.has(selPeer.id) ? T.green + '16' : T.accent + '12', border: `1px solid ${verifiedPeers.has(selPeer.id) ? T.green : T.accent}30`, color: verifiedPeers.has(selPeer.id) ? T.green : T.accent, flexShrink: 0 }}>{verifiedPeers.has(selPeer.id) ? '✓ Verified' : 'Verify'}</button>}
@@ -2815,15 +2868,16 @@ export default function App() {
                                   else window.ftps?.openExternal(url);
                                 }
                               }}
-                              dangerouslySetInnerHTML={{ __html:
-                                // FIX #1: Code-block messages (sent via CodeEditor or containing ``` fences)
-                                // ALWAYS render with full MD so syntax highlighting is preserved regardless
-                                // of the sett.md toggle. Only plain prose text respects the toggle.
-                                (msg.isCode || /```/.test(msg.text))
-                                  ? renderMD(msg.text)
-                                  : sett.md
+                              dangerouslySetInnerHTML={{
+                                __html:
+                                  // FIX #1: Code-block messages (sent via CodeEditor or containing ``` fences)
+                                  // ALWAYS render with full MD so syntax highlighting is preserved regardless
+                                  // of the sett.md toggle. Only plain prose text respects the toggle.
+                                  (msg.isCode || /```/.test(msg.text))
                                     ? renderMD(msg.text)
-                                    : escH(msg.text.replace(/\*\*\*(.+?)\*\*\*/g,'$1').replace(/\*\*(.+?)\*\*/g,'$1').replace(/\*(.+?)\*/g,'$1').replace(/~~(.+?)~~/g,'$1').replace(/`([^`]+)`/g,'$1').replace(/^#+\s/gm,'')).replace(/\n/g,'<br>')
+                                    : sett.md
+                                      ? renderMD(msg.text)
+                                      : escH(msg.text.replace(/\*\*\*(.+?)\*\*\*/g, '$1').replace(/\*\*(.+?)\*\*/g, '$1').replace(/\*(.+?)\*/g, '$1').replace(/~~(.+?)~~/g, '$1').replace(/`([^`]+)`/g, '$1').replace(/^#+\s/gm, '')).replace(/\n/g, '<br>')
                               }} />
                             <div style={{ fontSize: 10, color: T.muted, marginTop: 3, textAlign: 'right', display: 'flex', justifyContent: 'flex-end', gap: 4 }}>{msg.time}{msg.from === 'me' && <span style={{ color: T.accentDim }}>✓</span>}</div>
                           </div>}
@@ -2845,7 +2899,7 @@ export default function App() {
                       <div style={{ flex: 1 }} />
                       <span
                         title={sett.md ? 'Markdown ON — **bold**, *italic*, `code`, ```blocks```' : 'Markdown OFF — toggle in Settings'}
-                        style={{ fontSize: 9, padding: '1px 5px', borderRadius: 3, background: sett.md ? T.accent+'16' : T.panel, color: sett.md ? T.accent : T.muted, border: `1px solid ${sett.md ? T.accent+'30' : T.border}`, cursor: 'pointer' }}
+                        style={{ fontSize: 9, padding: '1px 5px', borderRadius: 3, background: sett.md ? T.accent + '16' : T.panel, color: sett.md ? T.accent : T.muted, border: `1px solid ${sett.md ? T.accent + '30' : T.border}`, cursor: 'pointer' }}
                         onClick={() => setSett2(p => ({ ...p, md: !p.md }))}
                       >MD {sett.md ? 'ON' : 'OFF'}</span>
                     </div>}
@@ -3034,9 +3088,15 @@ export default function App() {
                     {pendingPeerRequests.length > 0 && (
                       <div style={{ marginTop: 10, padding: '8px 10px', background: T.amber + '08', border: `1px solid ${T.amber}22`, borderRadius: 6 }}>
                         <div style={{ fontSize: 10, color: T.amber, fontWeight: 700, marginBottom: 6 }}>📬 INCOMING REQUESTS</div>
-                        {pendingPeerRequests.map(req => (
+                        {pendingPeerRequests.map(req => {
+                          const elapsed = Math.max(0, Math.round((Date.now() - req.timestamp) / 1000))
+                          const remaining = Math.max(0, 30 - elapsed)
+                          return (
                           <div key={req.peerId} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 0', borderBottom: `1px solid ${T.border}30` }}>
-                            <div style={{ fontSize: 11, color: T.text }}>{req.fromName || req.peerName || req.peerId}</div>
+                            <div>
+                              <div style={{ fontSize: 11, color: T.text }}>{req.fromName || req.peerName || req.peerId}</div>
+                              <div style={{ fontSize: 9, color: remaining < 10 ? T.red : T.muted }}>{remaining}s remaining</div>
+                            </div>
                             <div style={{ display: 'flex', gap: 5 }}>
                               <button onClick={() => {
                                 bridgeRef.current?.sendMsg(req.peerId, { type: 'peer_accept' })
@@ -3053,7 +3113,8 @@ export default function App() {
                               }} className="btn btn-danger btn-xs">✕ Decline</button>
                             </div>
                           </div>
-                        ))}
+                          )
+                        })}
                       </div>
                     )}
                     <div style={{ fontSize: 10, color: T.muted, marginTop: 8 }}>📡 Peers auto-discovered via mDNS on your local network</div>
@@ -3250,20 +3311,30 @@ export default function App() {
                   <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${T.border}` }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: T.text }}>Security scan incoming files</div>
-                      <div style={{ fontSize: 10, color: T.muted }}>Detect threats in PDFs, images, polyglot files</div>
+                      <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>Detect threats in PDFs, images, polyglot files</div>
                     </div>
                     <button onClick={() => setSett2(p => ({ ...p, scanFiles: !p.scanFiles }))} className="btn btn-xs" style={{ background: sett.scanFiles ? T.green + '16' : T.panel, border: `1px solid ${sett.scanFiles ? T.green : T.border}`, color: sett.scanFiles ? T.green : T.textDim, minWidth: 36 }}>
                       {sett.scanFiles ? 'ON' : 'OFF'}
                     </button>
                   </div>
                   {/* EXIF / Metadata strip on send */}
-                  <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${T.border}` }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: T.text }}>Strip metadata before sending</div>
-                      <div style={{ fontSize: 10, color: T.muted }}>Removes EXIF, XMP, IPTC from JPG/PNG · /Info from PDF · Default OFF</div>
+                      <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>Removes EXIF, XMP, IPTC from JPG/PNG · /Info from PDF</div>
                     </div>
-                    <button onClick={() => setSett2(p => ({ ...p, exifStrip: !p.exifStrip }))} className="btn btn-xs" style={{ background: sett.exifStrip ? T.green + '16' : T.panel, border: `1px solid ${sett.exifStrip ? T.green : T.border}`, color: sett.exifStrip ? T.green : T.textDim, minWidth: 36 }}>
-                      {sett.exifStrip ? 'ON' : 'OFF'}
+                    <button onClick={() => setSett2(p => ({ ...p, exifStripSend: !p.exifStripSend }))} className="btn btn-xs" style={{ background: sett.exifStripSend ? T.green + '16' : T.panel, border: `1px solid ${sett.exifStripSend ? T.green : T.border}`, color: sett.exifStripSend ? T.green : T.textDim, minWidth: 36 }}>
+                      {sett.exifStripSend ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                  {/* EXIF / Metadata strip on receive */}
+                  <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0' }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: T.text }}>Strip metadata on receive</div>
+                      <div style={{ fontSize: 10, color: T.muted }}>Auto-strips EXIF/XMP from received images & PDFs before displaying</div>
+                    </div>
+                    <button onClick={() => setSett2(p => ({ ...p, exifStripRecv: !p.exifStripRecv }))} className="btn btn-xs" style={{ background: sett.exifStripRecv ? T.green + '16' : T.panel, border: `1px solid ${sett.exifStripRecv ? T.green : T.border}`, color: sett.exifStripRecv ? T.green : T.textDim, minWidth: 36 }}>
+                      {sett.exifStripRecv ? 'ON' : 'OFF'}
                     </button>
                   </div>
                 </div>
@@ -3294,10 +3365,10 @@ export default function App() {
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                     {[
                       ['🔑', 'Identity keypair', 'Fresh Ed25519 keys generated every launch — in memory only'],
-                      ['🤝', 'TOFU peer trust',  'Verified this session only — resets on close'],
-                      ['🚫', 'Blocked peers',    'Session-only — cleared on close'],
+                      ['🤝', 'TOFU peer trust', 'Verified this session only — resets on close'],
+                      ['🚫', 'Blocked peers', 'Session-only — cleared on close'],
                       ['💬', 'Messages & files', 'Never written to disk by P2N'],
-                      ['🧅', 'Onion address',    'New address each session — share via Signal/Discord each time'],
+                      ['🧅', 'Onion address', 'New address each session — share via Signal/Discord each time'],
                     ].map(([icon, label, desc]) => (
                       <div key={label} style={{ display: 'flex', gap: 9, alignItems: 'flex-start' }}>
                         <span style={{ fontSize: 13, marginTop: 1 }}>{icon}</span>

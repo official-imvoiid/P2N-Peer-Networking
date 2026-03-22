@@ -108,7 +108,7 @@ let reconnectMax = 5
 const RECONNECT_DELAYS = [500, 1000, 2000, 4000, 8000]
 
 // ── RENAME TRACKING ───────────────────────────────────────────────────────────
-const RENAME_LIMIT = 5   // max renames per session
+const RENAME_LIMIT = 3   // max renames per session
 let renameCountThisSession = 0
 
 // ── SECURITY LOG ──────────────────────────────────────────────────────────────
@@ -1717,9 +1717,6 @@ ipcMain.handle('window:control', (_, { action }) => {
     case 'minimize': mainWindow.minimize(); break
     case 'maximize': mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize(); break
     case 'fullscreen': mainWindow.setFullScreen(!mainWindow.isFullScreen()); break
-    case 'devtools': wc.toggleDevTools(); break
-    // FIX: reload refreshes renderer UI only — TCP peers survive, re-announced via did-finish-load
-    case 'reload': wc.reload(); break
     case 'zoomin': wc.setZoomLevel(wc.getZoomLevel() + 0.5); break
     case 'zoomout': wc.setZoomLevel(wc.getZoomLevel() - 0.5); break
     case 'zoomreset': wc.setZoomLevel(0); break
