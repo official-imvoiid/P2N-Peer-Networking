@@ -23,6 +23,7 @@ contextBridge.exposeInMainWorld('ftps', {
   startTor: (port) => ipcRenderer.invoke('ftps:start-tor', { port }),
   stopTor: () => ipcRenderer.invoke('ftps:stop-tor'),
   getTorStatus: () => ipcRenderer.invoke('ftps:get-tor-status'),
+  getMyCard: () => ipcRenderer.invoke('ftps:get-my-card'),
   connectOnion: (addr, port) => ipcRenderer.invoke('ftps:connect-onion', { address: addr, port }),
   getSysStats: () => ipcRenderer.invoke('ftps:get-sys-stats'),
   getNetDetails: () => ipcRenderer.invoke('ftps:get-net-details'),
@@ -60,10 +61,6 @@ contextBridge.exposeInMainWorld('ftps', {
   savePort: (port) => ipcRenderer.invoke('ftps:save-port', { port }),
   getPort: () => ipcRenderer.invoke('ftps:get-port'),
 
-  // Persistence settings
-  getPersistSettings: () => ipcRenderer.invoke('ftps:get-persist-settings'),
-  setPersistSettings: (persist) => ipcRenderer.invoke('ftps:set-persist-settings', { persist }),
-
   // B4/C1: Blocked peers
   blockPeer: (peerId, peerName, reason) => ipcRenderer.invoke('ftps:block-peer', { peerId, peerName, reason }),
   unblockPeer: (peerId) => ipcRenderer.invoke('ftps:unblock-peer', { peerId }),
@@ -76,12 +73,6 @@ contextBridge.exposeInMainWorld('ftps', {
     ipcRenderer.invoke('ftps:send-file-in-folder', { peerId, fid, name, size, mime, filePath, folderFid, folderRelPath: relPath, fileIndex: idx }),
   // FIX #3: Rename info
   getRenameInfo: () => ipcRenderer.invoke('ftps:get-rename-info'),
-  // FIX #10: Identity password (encrypted persistent identity)
-  checkIdentityEncrypted: () => ipcRenderer.invoke('ftps:check-identity-encrypted'),
-  loadIdentityWithPassword: (password) => ipcRenderer.invoke('ftps:load-identity-with-password', { password }),
-  setIdentityPassword: (password) => ipcRenderer.invoke('ftps:set-identity-password', { password }),
-  removeIdentityPassword: () => ipcRenderer.invoke('ftps:remove-identity-password'),
-
   on: (channel, cb) => {
     const allowed = [
       'ftps:peer-connected', 'ftps:peer-disconnected', 'ftps:message',

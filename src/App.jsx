@@ -1482,19 +1482,19 @@ function HelpModal({ onClose, inline = false }) {
         </div>
         <S n="1" col={T.blue} title="Start Listening" body="Connect tab → Start Listening (default port 7900). UPnP auto-maps port on your router. mDNS discovery starts automatically for same-network peers." />
         <S n="2" col={T.green} title="Same Network" body="Open My Network tab — nearby peers appear automatically with a one-click Connect button. No IP typing needed. This uses mDNS multicast (like AirDrop/Bonjour), fully local." />
-        <S n="3" col={T.purple} title="Get Pairing Code (Internet)" body="Click 'Get Code' — P2N discovers your external IP via UPnP → STUN → HTTP fallback. Share the code by any means. Peer pastes it and clicks Connect." />
-        <S n="4" col={T.accent} title="Secure" body="ECDH P-256 handshake derives a fresh AES-256-GCM key. Everything encrypted before leaving the machine. Persistent identity key enables TOFU — warns if peer identity changes." />
+        <S n="3" col={T.purple} title="Different Network (Tor)" body="Connect tab → Different Network → Start Tor → copy your onion address → share via Discord/Signal/any platform → peer pastes it into Connect via Onion → encrypted session begins." />
+        <S n="4" col={T.accent} title="Fully E2E Encrypted" body="ECDH P-256 + Ed25519 handshake. Fresh AES-256-GCM keys every session via HKDF. Every message and file chunk encrypted before leaving your machine. No server, no relay — direct peer-to-peer." />
       </>}
       {tab === 'internet' && <>
-        <div style={{ background: T.accent + '08', border: `1px solid ${T.accent}18`, borderRadius: 8, padding: '12px 16px', marginBottom: 18 }}>
-          <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>🌐 How P2N Connects Over the Internet</div>
-          <div style={{ fontSize: 12, color: T.textMid, lineHeight: 1.8 }}>Three-layer fallback system — tries UPnP first, then STUN, then HTTP lookup. All fully automatic.</div>
+        <div style={{ background: T.purple + '08', border: `1px solid ${T.purple}18`, borderRadius: 8, padding: '12px 16px', marginBottom: 18 }}>
+          <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>🌐 Connecting Across the Internet</div>
+          <div style={{ fontSize: 12, color: T.textMid, lineHeight: 1.8 }}>P2N uses Tor hidden services for cross-network connections. No port forwarding, no public IP, no server — just share your onion address via any platform.</div>
         </div>
-        <S n="1" col={T.green} title="UPnP — Fully automatic" body="P2N sends a SOAP/UPnP request to your router to open the port. Works on most home routers. Enable UPnP in your router admin panel (192.168.1.1) if it shows failed." />
-        <S n="2" col={T.accent} title="STUN — Automatic fallback" body="If UPnP fails, P2N uses STUN (RFC 5389) — the same protocol used by WebRTC. It probes multiple servers (Google, Cloudflare, Nextcloud) simultaneously. Not a 3rd party relay — just IP discovery." />
-        <S n="3" col={T.blue} title="HTTP Fallback" body="If STUN also fails, P2N queries api.ipify.org and api4.my-ip.io to get your public IP. This always works as long as you have basic internet." />
-        <S n="4" col={T.amber} title="Tailscale — For CG-NAT / strict networks" body="If you're behind CG-NAT (common with mobile/ISP networks) direct connections won't work. Both peers install Tailscale (free, tailscale.com) and connect via 100.x.x.x addresses." />
-        <div style={{ marginTop: 10, padding: '10px 14px', background: T.green + '0a', border: `1px solid ${T.green}22`, borderRadius: 6, fontSize: 12, color: T.green, lineHeight: 1.7 }}>💡 <strong>Same WiFi?</strong> Open My Network tab — peers appear automatically, no IP entry needed.</div>
+        <S n="1" col={T.purple} title="Start Tor" body="Connect tab → Different Network section → click 'Start Tor & Generate Link'. Tor starts automatically and generates your unique onion address for this session." />
+        <S n="2" col={T.accent} title="Share your address" body="Copy your onion address (e.g. abc123xyz.onion:7900) and send it to your peer via Discord, Signal, Telegram, email — any platform. The address is just a routing token, not secret." />
+        <S n="3" col={T.green} title="Peer connects" body="Your peer pastes the onion address into the 'Connect via Onion' field and clicks connect. Tor routes the connection anonymously — neither side learns the other's real IP." />
+        <S n="4" col={T.amber} title="New address each session" body="Tor generates a fresh onion address every time the app starts. You need to share the new address with your peer each session. This is by design — no permanent footprint." />
+        <div style={{ marginTop: 10, padding: '10px 14px', background: T.green + '0a', border: `1px solid ${T.green}22`, borderRadius: 6, fontSize: 12, color: T.green, lineHeight: 1.7 }}>💡 <strong>Same network?</strong> Open My Network tab — peers are auto-discovered via mDNS, no address needed.</div>
       </>}
       {tab === 'security' && <>
         <div style={{ background: T.green + '08', border: `1px solid ${T.green}18`, borderRadius: 8, padding: '12px 16px', marginBottom: 18 }}>
@@ -1503,16 +1503,18 @@ function HelpModal({ onClose, inline = false }) {
         </div>
         <R icon="🔑" l="Key Exchange" v="ECDH P-256 — fresh keypair each session" c={T.green} />
         <R icon="🔒" l="Encryption" v="AES-256-GCM — every message, every chunk" c={T.green} />
-        <R icon="🎲" l="Nonce" v="12-byte random per frame — replay-proof" c={T.green} />
+        <R icon="🎲" l="Nonce" v="12-byte random IV per frame" c={T.green} />
+        <R icon="🔢" l="Replay guard" v="8-byte monotonic sequence counter per frame" c={T.green} />
+        <R icon="✍️" l="Identity" v="Ed25519 — signs every handshake, MITM-proof" c={T.green} />
         <R icon="✓" l="Auth Tag" v="16-byte GCM — tamper detection per frame" c={T.green} />
         <R icon="🔌" l="Transport" v="Direct TCP (no relay, no server)" c={T.blue} />
         <R icon="⊘" l="Servers" v="None — fully serverless P2P" c={T.accent} />
         <R icon="📡" l="STUN/mDNS" v="IP discovery + local discovery only — nothing relayed" />
         <R icon="📝" l="Log" v="In-memory only · Click log line to copy" />
-        <R icon="🔄" l="Refresh UI" v="TCP connections survive · session auto-restores" c={T.green} />
+        <R icon="🔄" l="Refresh UI" v="TCP connections survive renderer reload" c={T.green} />
         <div style={{ marginTop: 14, padding: '10px 14px', background: T.accent + '08', border: `1px solid ${T.accent}18`, borderRadius: 6 }}>
-          <div style={{ fontSize: 11, color: T.accent, fontWeight: 700, marginBottom: 5 }}>🔑 TOFU — Trust-On-First-Use</div>
-          <div style={{ fontSize: 11, color: T.textMid, lineHeight: 1.7 }}>Like SSH known_hosts. P2N stores each peer's <em>persistent identity key</em> (not the ephemeral ECDH key — so reconnections never trigger false MITM warnings). If a key change is detected, P2N shows a <span style={{ color: T.red, fontWeight: 600 }}>MITM warning</span>.</div>
+          <div style={{ fontSize: 11, color: T.accent, fontWeight: 700, marginBottom: 5 }}>🔑 TOFU — Trust-On-First-Use (session-scoped)</div>
+          <div style={{ fontSize: 11, color: T.textMid, lineHeight: 1.7 }}>On first connect this session, P2N stores the peer's <em>Ed25519 public key</em> in memory. If they reconnect with the same key — trusted ✓. If the key changes mid-session — <span style={{ color: T.red, fontWeight: 600 }}>MITM warning</span>. TOFU resets when the app closes — this is intentional. P2N is designed for ephemeral secure sessions.</div>
         </div>
       </>}
       {tab === 'sandbox' && <>
@@ -1543,7 +1545,7 @@ function HelpModal({ onClose, inline = false }) {
 }
 
 // CHANGE 8: Settings are ephemeral — reset on every restart. Only port persists to disk.
-const DEFAULT_SETTINGS = { lockMin: 15, md: true, warnLinks: true, warnArch: true, torEnabled: true, maxTries: 5, scanFiles: true, exifStrip: false, persistData: false, clearMsgsOnReconnect: true }
+const DEFAULT_SETTINGS = { lockMin: 15, md: true, warnLinks: true, warnArch: true, torEnabled: true, maxTries: 5, scanFiles: true, exifStrip: false, clearMsgsOnReconnect: true }
 // sessionStorage survives webContents.reload() (Refresh UI) but NOT app restart.
 // This lets Refresh UI work without terminating the session.
 function readSavedSession() {
@@ -1575,102 +1577,6 @@ function getInitialNodeId() {
 // ROOT APP
 // ═════════════════════════════════════════════════════════════════════════════
 // FIX #10: Identity Password Panel — encrypt/decrypt persistent identity key
-// Lets users recover their identity across "New Identity" restarts when persistData=ON
-function IdentityPasswordPanel({ notify, addLog }) {
-  const [status, setStatus] = useState(null)  // null | 'encrypted' | 'plain'
-  const [mode, setMode] = useState(null)  // null | 'set' | 'remove' | 'recover'
-  const [pw, setPw] = useState('')
-  const [pw2, setPw2] = useState('')
-  const [err, setErr] = useState('')
-  const [busy, setBusy] = useState(false)
-
-  useEffect(() => {
-    window.ftps?.checkIdentityEncrypted?.().then(r => {
-      if (r) setStatus(r.encrypted ? 'encrypted' : 'plain')
-    }).catch(() => {})
-  }, [])
-
-  const reset = () => { setMode(null); setPw(''); setPw2(''); setErr('') }
-
-  const doSet = async () => {
-    if (pw.length < 8) { setErr('Password must be at least 8 characters'); return }
-    if (pw !== pw2) { setErr('Passwords do not match'); return }
-    setBusy(true)
-    const r = await window.ftps?.setIdentityPassword?.(pw)
-    setBusy(false)
-    if (r?.ok) {
-      setStatus('encrypted')
-      addLog?.('OK', 'Identity key encrypted with password')
-      notify('Identity key encrypted — password required to recover', 'ok')
-      reset()
-    } else {
-      setErr(r?.error || 'Failed to encrypt')
-    }
-  }
-
-  const doRemove = async () => {
-    setBusy(true)
-    const r = await window.ftps?.removeIdentityPassword?.()
-    setBusy(false)
-    if (r?.ok) {
-      setStatus('plain')
-      addLog?.('INFO', 'Identity password removed')
-      notify('Identity password removed — key stored unencrypted', 'info')
-      reset()
-    } else {
-      setErr(r?.error || 'Failed')
-    }
-  }
-
-  return (
-    <div className="card" style={{ padding: 14, marginBottom: 11, border: `1px solid ${T.purple}30` }}>
-      <div className="sh">Identity Password</div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: mode ? 10 : 0 }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 12, color: T.text }}>Protect your persistent identity key</div>
-          <div style={{ fontSize: 10, color: T.muted, marginTop: 2, lineHeight: 1.5 }}>
-            {status === 'encrypted'
-              ? '🔐 Your identity key is encrypted. You need your password to recover it after reinstall.'
-              : '⚠ Your identity key is stored unencrypted. Anyone with disk access can read it.'}
-          </div>
-        </div>
-        <div style={{ display: 'flex', gap: 5, flexShrink: 0 }}>
-          {status === 'encrypted'
-            ? <button onClick={() => setMode(mode === 'remove' ? null : 'remove')} className="btn btn-danger btn-xs">Remove</button>
-            : <button onClick={() => setMode(mode === 'set' ? null : 'set')} className="btn btn-xs" style={{ background: T.purple+'16', border: `1px solid ${T.purple}40`, color: T.purple }}>Set Password</button>
-          }
-        </div>
-      </div>
-      {mode === 'set' && (
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 7 }}>
-          <input type="password" value={pw} onChange={e => { setPw(e.target.value); setErr('') }} placeholder="New password (min 8 chars)" className="inp" style={{ fontSize: 12 }} />
-          <input type="password" value={pw2} onChange={e => { setPw2(e.target.value); setErr('') }} placeholder="Confirm password" className="inp" style={{ fontSize: 12 }} onKeyDown={e => e.key === 'Enter' && doSet()} />
-          {err && <div style={{ fontSize: 11, color: T.red }}>{err}</div>}
-          <div style={{ display: 'flex', gap: 6 }}>
-            <button onClick={reset} className="btn btn-ghost btn-sm" style={{ flex: 1 }}>Cancel</button>
-            <button onClick={doSet} disabled={busy} className="btn btn-sm" style={{ flex: 1, background: T.purple+'16', border: `1px solid ${T.purple}`, color: T.purple }}>
-              {busy ? '⏳' : '🔐 Encrypt'}
-            </button>
-          </div>
-          <div style={{ fontSize: 10, color: T.amber, lineHeight: 1.5 }}>⚠ If you forget this password, your identity key cannot be recovered. Write it down somewhere safe.</div>
-        </div>
-      )}
-      {mode === 'remove' && (
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 7 }}>
-          <div style={{ fontSize: 11, color: T.amber }}>This will store your identity key unencrypted on disk. Are you sure?</div>
-          {err && <div style={{ fontSize: 11, color: T.red }}>{err}</div>}
-          <div style={{ display: 'flex', gap: 6 }}>
-            <button onClick={reset} className="btn btn-ghost btn-sm" style={{ flex: 1 }}>Cancel</button>
-            <button onClick={doRemove} disabled={busy} className="btn btn-danger btn-sm" style={{ flex: 1 }}>
-              {busy ? '⏳' : 'Remove Password'}
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
 export default function App() {
   const [screen, setScreen] = useState(getInitialScreen)
   const [account, setAccount] = useState(getInitialAccount)
@@ -1794,9 +1700,6 @@ export default function App() {
   // CHANGE 8: Load saved port from main process on mount
   useEffect(() => {
     window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => {})
-    window.ftps?.getPersistSettings?.().then(r => {
-      if (r && typeof r.persistData === 'boolean') setSett2(p => ({ ...p, persistData: r.persistData }))
-    }).catch(() => {})
   }, [])
   // B4/C1: Load blocked peers on mount
   useEffect(() => { window.ftps?.getBlocked?.().then(r => { if (r) setBlockedPeers(r) }).catch(() => {}) }, [])
@@ -2841,9 +2744,10 @@ export default function App() {
                 <div className="card" style={{ padding: 12, fontSize: 11, color: T.textDim, lineHeight: 1.8 }}>
                   <div style={{ color: T.textMid, fontWeight: 600, marginBottom: 4 }}>Quick reference</div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '2px 11px' }}>
-                    <span style={{ color: T.green, fontWeight: 700 }}>Same WiFi</span><span>Local IP:7900 (default) — direct TCP, always works</span>
-                    <span style={{ color: T.purple, fontWeight: 700 }}>Different Network</span><span>Start Tor → Generate onion link → share with peer</span>
-                    <span style={{ color: T.accent, fontWeight: 700 }}>Security</span><span>ECDH P-256 + AES-256-GCM + TOFU on all connections</span>
+                    <span style={{ color: T.green, fontWeight: 700 }}>Same network</span><span>Auto-discovered via mDNS — appears in My Network tab</span>
+                    <span style={{ color: T.purple, fontWeight: 700 }}>Internet</span><span>Start Tor → copy onion address → share via Discord/Signal</span>
+                    <span style={{ color: T.accent, fontWeight: 700 }}>Encryption</span><span>ECDH P-256 + Ed25519 + AES-256-GCM on all connections</span>
+                    <span style={{ color: T.amber, fontWeight: 700 }}>Session</span><span>Fresh identity + new onion address every launch</span>
                   </div>
                 </div>
               </div>
@@ -3383,45 +3287,31 @@ export default function App() {
                     </div>
                   ))}
                 </div>
-                {/* Persistent Data Settings */}
-                <div className="card" style={{ padding: 14, marginBottom: 11, border: `1px solid ${sett.persistData ? T.amber + '40' : T.border}` }}>
-                  <div className="sh">Data Persistence</div>
-                  <div style={{ display: 'flex', alignItems: 'flex-start', padding: '8px 0', gap: 10 }}>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 12, color: T.text }}>Keep identity &amp; peer data between sessions</div>
-                      <div style={{ fontSize: 10, color: T.muted, marginTop: 3, lineHeight: 1.6 }}>
-                        <strong style={{ color: sett.persistData ? T.amber : T.textDim }}>OFF (default):</strong> identity.json, known_peers.json, blocked_peers.json are deleted on exit. Fresh start every time.<br />
-                        <strong style={{ color: sett.persistData ? T.green : T.textDim }}>ON:</strong> Files survive app restarts. Peers stay trusted, blocked list persists.
+                {/* Session Model — ephemeral by design */}
+                <div className="card" style={{ padding: 14, marginBottom: 11, border: `1px solid ${T.green}30`, background: `${T.green}05` }}>
+                  <div className="sh" style={{ color: T.green }}>Session Model</div>
+                  <div style={{ fontSize: 12, color: T.text, marginBottom: 8, fontWeight: 600 }}>🔒 Ephemeral by design — nothing stored between sessions</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {[
+                      ['🔑', 'Identity keypair', 'Fresh Ed25519 keys generated every launch — in memory only'],
+                      ['🤝', 'TOFU peer trust',  'Verified this session only — resets on close'],
+                      ['🚫', 'Blocked peers',    'Session-only — cleared on close'],
+                      ['💬', 'Messages & files', 'Never written to disk by P2N'],
+                      ['🧅', 'Onion address',    'New address each session — share via Signal/Discord each time'],
+                    ].map(([icon, label, desc]) => (
+                      <div key={label} style={{ display: 'flex', gap: 9, alignItems: 'flex-start' }}>
+                        <span style={{ fontSize: 13, marginTop: 1 }}>{icon}</span>
+                        <div>
+                          <span style={{ fontSize: 11, color: T.text, fontWeight: 600 }}>{label}: </span>
+                          <span style={{ fontSize: 11, color: T.muted }}>{desc}</span>
+                        </div>
                       </div>
-                    </div>
-                    <button
-                      onClick={async () => {
-                        const next = !sett.persistData
-                        setSett2(p => ({ ...p, persistData: next }))
-                        await window.ftps?.setPersistSettings?.(next)
-                        notify(next ? 'Data will persist across sessions' : 'Data cleared on exit (default)', next ? 'ok' : 'info')
-                      }}
-                      className="btn btn-xs"
-                      style={{ background: sett.persistData ? T.amber + '16' : T.panel, border: `1px solid ${sett.persistData ? T.amber : T.border}`, color: sett.persistData ? T.amber : T.textDim, minWidth: 36, flexShrink: 0 }}
-                    >
-                      {sett.persistData ? 'ON' : 'OFF'}
-                    </button>
+                    ))}
                   </div>
-                  {/* FIX #7: Clear chat history on peer reconnect */}
-                  <div style={{ display: 'flex', alignItems: 'center', padding: '6px 0', gap: 10, borderTop: `1px solid ${T.border}30` }}>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 12, color: T.text }}>Clear chat on peer reconnect</div>
-                      <div style={{ fontSize: 10, color: T.muted, marginTop: 2 }}>When a peer reconnects after remove/restart, clear old messages for a fresh start.</div>
-                    </div>
-                    <button onClick={() => setSett2(p => ({ ...p, clearMsgsOnReconnect: !p.clearMsgsOnReconnect }))} className="btn btn-xs"
-                      style={{ background: sett.clearMsgsOnReconnect ? T.green+'16' : T.panel, border: `1px solid ${sett.clearMsgsOnReconnect ? T.green : T.border}`, color: sett.clearMsgsOnReconnect ? T.green : T.textDim, minWidth: 36, flexShrink: 0 }}>
-                      {sett.clearMsgsOnReconnect ? 'ON' : 'OFF'}
-                    </button>
+                  <div style={{ marginTop: 10, padding: '7px 10px', background: T.accent + '0a', border: `1px solid ${T.accent}18`, borderRadius: 6, fontSize: 10, color: T.textDim, lineHeight: 1.6 }}>
+                    💡 <strong style={{ color: T.text }}>Workflow:</strong> Start app → Tor generates onion address → share it via Discord / Signal → peer pastes and connects → encrypted session begins. Every session is fresh.
                   </div>
                 </div>
-
-                {/* FIX #10: Identity Password — protect persistent identity key with encryption */}
-                {sett.persistData && <IdentityPasswordPanel notify={notify} addLog={addLog} />}
 
                 <div className="card" style={{ padding: 14, marginBottom: 11 }}>
                   <div className="sh">Session</div>
@@ -3429,9 +3319,10 @@ export default function App() {
                   <div style={{ fontSize: 10, color: T.muted, marginTop: 6, textAlign: 'center' }}>This will disconnect all peers and clear all session data</div>
                 </div>
                 <div style={{ padding: '10px 14px', background: T.panel, borderRadius: 8, fontSize: 12, color: T.textDim, lineHeight: 1.7 }}>
-                  <div>🔒 Session data is memory-only — never written to disk</div>
-                  <div style={{ marginTop: 3 }}>🛡 Archives extracted to isolated location</div>
-                  <div style={{ marginTop: 3 }}>🔑 ECDH P-256 derives a fresh AES-256-GCM key every session</div>
+                  <div>🔒 Zero persistence — identity, peers, messages never written to disk</div>
+                  <div style={{ marginTop: 3 }}>🧅 Share your onion address each session via any platform</div>
+                  <div style={{ marginTop: 3 }}>🛡 Archives extracted to isolated OS temp folder</div>
+                  <div style={{ marginTop: 3 }}>🔑 ECDH P-256 + Ed25519 + AES-256-GCM — fresh keys every session</div>
                 </div>
               </div>
             )}

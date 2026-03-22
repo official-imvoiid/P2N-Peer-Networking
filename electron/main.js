@@ -34,160 +34,66 @@ let activeSession = null  // { name, nodeId, startedAt }
 let totalBytesSent = 0
 let totalBytesReceived = 0
 
-// ── PERSISTENT IDENTITY KEY ───────────────────────────────────────────────────
-// v5 upgrade: identity is now an Ed25519 signing KEY PAIR.
-//   - myIdentityPrivKey  : stays on disk, used to SIGN the HELLO
-//   - myIdentityPubKey   : sent in HELLO, stored in TOFU — peers verify our signature
-// This closes the MITM hole: an attacker can intercept the ECDH pubkey but cannot
-// forge the Ed25519 signature without the private key, so the shared AES key is
-// guaranteed to belong to the claimed identity.
-const identityFile = path.join(app.getPath('userData'), 'identity.json')
-let myIdentityPrivKey = null  // Ed25519 KeyObject (private)
-let myIdentityPubKey  = null  // Ed25519 KeyObject (public)
-let myIdentityPubB64  = ''    // base64-DER of public key — sent in HELLO and TOFU
+// ── EPHEMERAL IDENTITY (Ed25519) ──────────────────────────────────────────────
+// P2N is designed as a temporary secure session tool — no data written to disk.
+// A fresh Ed25519 keypair is generated every time the app starts.
+// Nothing is saved between sessions: no identity file, no TOFU file, no blocked list.
+//
+//   - myIdentityPrivKey : in-memory only, signs every HELLO to prove ownership
+//   - myIdentityPubKey  : sent in HELLO, peers keep it in memory for TOFU this session
+//   - myIdentityPubB64  : base64-DER SPKI — the shareable form
+//
+// TOFU still works perfectly within a session:
+//   peer connects → key stored in memory → reconnects → key matched → trusted
+// It just resets when the app closes, which is intentional.
+
+let myIdentityPrivKey = null
+let myIdentityPubKey  = null
+let myIdentityPubB64  = ''
 
 function _generateIdentityKeypair() {
   const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519')
   myIdentityPrivKey = privateKey
   myIdentityPubKey  = publicKey
   myIdentityPubB64  = publicKey.export({ type: 'spki', format: 'der' }).toString('base64')
+  secEntry('OK', 'Fresh Ed25519 identity keypair generated (session-scoped, not saved to disk)')
 }
 
-function loadIdentity(password = null) {
-  try {
-    if (fs.existsSync(identityFile)) {
-      const d = JSON.parse(fs.readFileSync(identityFile, 'utf8'))
-
-      // ── Password-protected blob (AES-256-GCM + scrypt) ──────────────────
-      if (d?.encrypted) {
-        if (!password) return { ok: false, needsPassword: true }
-        try {
-          const plain = JSON.parse(decryptIdentity(d.encrypted, password))
-          if (plain?.privKey && plain?.pubKey) {
-            myIdentityPrivKey = crypto.createPrivateKey({ key: Buffer.from(plain.privKey, 'base64'), format: 'der', type: 'pkcs8' })
-            myIdentityPubKey  = crypto.createPublicKey({ key: Buffer.from(plain.pubKey, 'base64'), format: 'der', type: 'spki' })
-            myIdentityPubB64  = plain.pubKey
-            secEntry('OK', 'Identity keypair decrypted and loaded')
-            return { ok: true }
-          }
-        } catch {
-          return { ok: false, error: 'Wrong password — identity not loaded' }
-        }
-      }
-
-      // ── Plaintext v5 (Ed25519 keypair) ────────────────────────────────────
-      if (d?.privKey && d?.pubKey) {
-        try {
-          myIdentityPrivKey = crypto.createPrivateKey({ key: Buffer.from(d.privKey, 'base64'), format: 'der', type: 'pkcs8' })
-          myIdentityPubKey  = crypto.createPublicKey({ key: Buffer.from(d.pubKey, 'base64'), format: 'der', type: 'spki' })
-          myIdentityPubB64  = d.pubKey
-          return { ok: true }
-        } catch { /* corrupt, regenerate below */ }
-      }
-
-      // ── Legacy v4 (random 32-byte hex — upgrade silently) ─────────────────
-      if (d?.key && typeof d.key === 'string' && d.key.length === 64) {
-        secEntry('INFO', 'Upgrading identity from v4 (hex) to v5 (Ed25519)')
-        // Keep old hex in file as migration note but generate proper keypair
-      }
-    }
-  } catch { }
-
-  // Generate fresh Ed25519 keypair
-  _generateIdentityKeypair()
-  try {
-    fs.mkdirSync(path.dirname(identityFile), { recursive: true })
-    const privDER = myIdentityPrivKey.export({ type: 'pkcs8', format: 'der' }).toString('base64')
-    fs.writeFileSync(identityFile, JSON.stringify({ privKey: privDER, pubKey: myIdentityPubB64, v: 5, created: new Date().toISOString() }))
-  } catch { }
-  secEntry('OK', 'New Ed25519 identity keypair generated (v5)')
-  return { ok: true, fresh: true }
-}
-
-// ── TOFU STORE ────────────────────────────────────────────────────────────────
-// TOFU stores the peer's Ed25519 PUBLIC key (base64-DER).
-// On every HELLO we verify: (a) signature matches pubkey, (b) pubkey matches stored record.
-// If pubkey changed → MITM warning. First time → store and trust.
+// ── TOFU STORE (in-memory, session-scoped) ────────────────────────────────────
+// Tracks peer Ed25519 public keys seen this session.
+// First contact → stored. Reconnect → verified. Key change → MITM warning.
+// Wiped automatically when app closes — no file written.
 const tofuStore = new Map()
-const tofuFile = path.join(app.getPath('userData'), 'known_peers.json')
-
-function loadTOFU() {
-  try {
-    if (fs.existsSync(tofuFile)) {
-      const data = JSON.parse(fs.readFileSync(tofuFile, 'utf8'))
-      for (const [k, v] of Object.entries(data)) tofuStore.set(k, v)
-    }
-  } catch { }
-}
-function saveTOFU() {
-  try {
-    const obj = {}; tofuStore.forEach((v, k) => obj[k] = v)
-    fs.writeFileSync(tofuFile, JSON.stringify(obj, null, 2))
-  } catch { }
-}
 
 function tofuCheck(nodeId, identityPubB64, name) {
   const existing = tofuStore.get(nodeId)
   if (!existing) {
-    tofuStore.set(nodeId, {
-      identityKey: identityPubB64,  // kept as 'identityKey' for JSON compat
-      name,
-      firstSeen: new Date().toISOString(),
-      lastSeen: new Date().toISOString(),
-    })
-    saveTOFU()
+    tofuStore.set(nodeId, { identityKey: identityPubB64, name, firstSeen: new Date().toISOString(), lastSeen: new Date().toISOString() })
     return { status: 'new' }
   }
   if (existing.identityKey === identityPubB64) {
     existing.lastSeen = new Date().toISOString()
     existing.name = name || existing.name
-    saveTOFU()
     return { status: 'trusted' }
   }
-  // Public key changed — genuine MITM warning
   return { status: 'changed', previousName: existing.name, firstSeen: existing.firstSeen }
 }
 function tofuAcceptNewKey(nodeId, identityPubB64, name) {
-  tofuStore.set(nodeId, {
-    identityKey: identityPubB64, name,
-    firstSeen: new Date().toISOString(),
-    lastSeen: new Date().toISOString(),
-  })
-  saveTOFU()
+  tofuStore.set(nodeId, { identityKey: identityPubB64, name, firstSeen: new Date().toISOString(), lastSeen: new Date().toISOString() })
 }
 
-// ── BLOCKED PEERS (B4/C1) ────────────────────────────────────────────────────
-const blockedPeers = new Map()  // nodeId → { name, blockedAt, reason }
-const blockedFile = path.join(app.getPath('userData'), 'blocked_peers.json')
-// IP rate limiting: track connection attempts per IP
-const connectionAttempts = new Map()  // ip → { count, firstAttempt }
-const RATE_LIMIT_WINDOW = 60000  // 60s window
-const RATE_LIMIT_MAX = 5  // max attempts per window
+// ── BLOCKED PEERS (in-memory, session-scoped) ─────────────────────────────────
+const blockedPeers = new Map()
+const connectionAttempts = new Map()
+const RATE_LIMIT_WINDOW = 60000
+const RATE_LIMIT_MAX = 5
 
-function loadBlocked() {
-  try {
-    if (fs.existsSync(blockedFile)) {
-      const data = JSON.parse(fs.readFileSync(blockedFile, 'utf8'))
-      for (const [k, v] of Object.entries(data)) blockedPeers.set(k, v)
-    }
-  } catch { }
-}
-function saveBlocked() {
-  try {
-    const obj = {}; blockedPeers.forEach((v, k) => obj[k] = v)
-    fs.writeFileSync(blockedFile, JSON.stringify(obj, null, 2))
-  } catch { }
-}
-function isBlocked(nodeId) {
-  return blockedPeers.has(nodeId)
-}
+function isBlocked(nodeId) { return blockedPeers.has(nodeId) }
 function isRateLimited(ip) {
   const now = Date.now()
   const entry = connectionAttempts.get(ip)
   if (!entry) { connectionAttempts.set(ip, { count: 1, firstAttempt: now }); return false }
-  if (now - entry.firstAttempt > RATE_LIMIT_WINDOW) {
-    connectionAttempts.set(ip, { count: 1, firstAttempt: now }); return false
-  }
+  if (now - entry.firstAttempt > RATE_LIMIT_WINDOW) { connectionAttempts.set(ip, { count: 1, firstAttempt: now }); return false }
   entry.count++
   if (entry.count > RATE_LIMIT_MAX) {
     secEntry('WARN', `Rate limited IP: ${ip}`, `${entry.count} attempts in ${Math.round((now - entry.firstAttempt) / 1000)}s`)
@@ -204,30 +110,6 @@ const RECONNECT_DELAYS = [500, 1000, 2000, 4000, 8000]
 // ── RENAME TRACKING ───────────────────────────────────────────────────────────
 const RENAME_LIMIT = 5   // max renames per session
 let renameCountThisSession = 0
-
-// ── IDENTITY ENCRYPTION ───────────────────────────────────────────────────────
-// Encrypts identity key with user password using AES-256-GCM + scrypt KDF.
-// Used for optional password-protected persistent identity (issue #10).
-function encryptIdentity(data, password) {
-  const salt = crypto.randomBytes(16)
-  const key = crypto.scryptSync(password, salt, 32)
-  const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
-  const ct = Buffer.concat([cipher.update(Buffer.from(data, 'utf8')), cipher.final()])
-  const tag = cipher.getAuthTag()
-  return Buffer.concat([salt, iv, tag, ct]).toString('base64')
-}
-function decryptIdentity(encB64, password) {
-  const enc = Buffer.from(encB64, 'base64')
-  const salt = enc.slice(0, 16)
-  const iv   = enc.slice(16, 28)
-  const tag  = enc.slice(28, 44)
-  const ct   = enc.slice(44)
-  const key  = crypto.scryptSync(password, salt, 32)
-  const dec  = crypto.createDecipheriv('aes-256-gcm', key, iv)
-  dec.setAuthTag(tag)
-  return Buffer.concat([dec.update(ct), dec.final()]).toString('utf8')
-}
 
 // ── SECURITY LOG ──────────────────────────────────────────────────────────────
 const secLog = []
@@ -436,67 +318,24 @@ function savePortSettings(port) {
 }
 
 
-// ── PERSISTENCE SETTINGS ──────────────────────────────────────────────────────
-// Controls whether identity.json / known_peers.json / blocked_peers.json survive quit.
-// Default: OFF (false) — every session starts completely fresh.
-// If user enables, files are kept across restarts.
-const persistSettingsFile = path.join(app.getPath('userData'), 'persist_settings.json')
-let persistData = false  // default OFF — no data kept between sessions
-
-function loadPersistSettings() {
-  try {
-    if (fs.existsSync(persistSettingsFile)) {
-      const d = JSON.parse(fs.readFileSync(persistSettingsFile, 'utf8'))
-      if (typeof d?.persistData === 'boolean') persistData = d.persistData
-    }
-  } catch { }
-}
-function savePersistSettings() {
-  try { fs.writeFileSync(persistSettingsFile, JSON.stringify({ persistData, updatedAt: new Date().toISOString() })) } catch { }
-}
-
-// Wipe persistent session data on exit (keep identity.json + port_settings.json)
-function wipePersistentData() {
-  // If persistData is OFF (default), wipe all three files
-  // If persistData is ON, keep them — user wants continuity across sessions
-  if (!persistData) {
-    tofuStore.clear()
-    blockedPeers.clear()
-    try { fs.unlinkSync(tofuFile) } catch { }
-    try { fs.unlinkSync(blockedFile) } catch { }
-    try { fs.unlinkSync(identityFile) } catch { }
-    secEntry('OK', 'Session data wiped — identity, peers, blocked cleared (persistData=OFF)')
-  } else {
-    secEntry('OK', 'Session ended — data kept on disk (persistData=ON)')
-  }
-}
+// ── PORT SETTINGS (only thing we persist — pure convenience, not security data) ─
 
 app.whenReady().then(() => {
-  loadPersistSettings()  // must load first — affects whether identity/tofu/blocked are loaded
-  if (persistData) {
-    loadIdentity()
-    loadTOFU()
-    loadBlocked()
-  } else {
-    // persistData OFF: generate fresh identity every time
-    // persistData OFF: generate fresh Ed25519 keypair every session
-    _generateIdentityKeypair()
-    secEntry('OK', 'Fresh identity generated (persistData=OFF)')
-  }
-  loadPortSettings()
+  _generateIdentityKeypair()   // fresh Ed25519 keypair every session — nothing loaded from disk
+  loadPortSettings()           // port is the only setting that survives restarts
   createWindow()
   app.on('activate', () => { if (!mainWindow) createWindow() })
 })
 app.on('window-all-closed', () => {
   activeSession = null
-  // A8 FIX: wipePersistentData only in before-quit (was called 3x total)
+
   stopServer(); _shutdownDiscovery(); stopTorDaemon()
   peers.forEach((_, id) => disconnectPeer(id))
   cleanupAllSandboxes()
   if (process.platform !== 'darwin') app.quit()
 })
-// A8+A7 FIX: Single before-quit handler for both wipePersistentData and cleanupAllSandboxes
-app.on('before-quit', () => { wipePersistentData(); cleanupAllSandboxes() })
+
+app.on('before-quit', () => { cleanupAllSandboxes() })
 
 function emit(ch, data) {
   if (mainWindow?.webContents && !mainWindow.webContents.isDestroyed())
@@ -1426,7 +1265,7 @@ ipcMain.handle('ftps:update-name', (_, { name }) => {
   return { ok: true, renameCount: renameCountThisSession, renameLimit: RENAME_LIMIT }
 })
 ipcMain.handle('ftps:get-rename-info', () => ({ count: renameCountThisSession, limit: RENAME_LIMIT }))
-ipcMain.handle('ftps:clear-session', () => { activeSession = null; wipePersistentData(); return { ok: true } })
+ipcMain.handle('ftps:clear-session', () => { activeSession = null; tofuStore.clear(); blockedPeers.clear(); return { ok: true } })
 ipcMain.handle('ftps:get-session', () => activeSession ? { ...activeSession, active: true } : { active: false })
 ipcMain.handle('ftps:get-local-ips', () => getLocalIPs())
 ipcMain.handle('ftps:get-logs', () => [...secLog])
@@ -1519,13 +1358,12 @@ ipcMain.handle('ftps:tofu-accept', (_, { peerId, identityKey, name }) => {
   return { ok: true }
 })
 ipcMain.handle('ftps:tofu-get-known', () => { const r = []; tofuStore.forEach((v, k) => r.push({ id: k, ...v })); return r })
-ipcMain.handle('ftps:tofu-remove', (_, { peerId }) => { tofuStore.delete(peerId); saveTOFU(); secEntry('INFO', `TOFU: removed ${peerId}`); return { ok: true } })
+ipcMain.handle('ftps:tofu-remove', (_, { peerId }) => { tofuStore.delete(peerId); secEntry('INFO', `TOFU: removed ${peerId}`); return { ok: true } })
 ipcMain.handle('ftps:get-fingerprint', (_, { peerId }) => { const c = peers.get(peerId); return { fingerprint: c?._fingerprint || null } })
 
 // B4/C1: Blocked peers IPC
 ipcMain.handle('ftps:block-peer', (_, { peerId, peerName, reason }) => {
   blockedPeers.set(peerId, { name: peerName || '', blockedAt: new Date().toISOString(), reason: reason || '' })
-  saveBlocked()
   // Disconnect if currently connected
   const c = peers.get(peerId)
   if (c) c.disconnect()
@@ -1534,7 +1372,6 @@ ipcMain.handle('ftps:block-peer', (_, { peerId, peerName, reason }) => {
 })
 ipcMain.handle('ftps:unblock-peer', (_, { peerId }) => {
   blockedPeers.delete(peerId)
-  saveBlocked()
   secEntry('OK', `Unblocked peer: ${peerId}`)
   return { ok: true }
 })
@@ -1558,7 +1395,35 @@ ipcMain.handle('ftps:stop-tor', async () => {
   stopTorDaemon(); return { ok: true }
 })
 ipcMain.handle('ftps:get-tor-status', () => {
-  return { running: !!torProcess, onionAddress: onionAddress || null, socksPort: torSocksPort, enabled: torEnabled }
+  // FIX: return the TCP listen port (what peers connect to), NOT the internal SOCKS port
+  const listenPort = tcpServer?.address()?.port || savedPort
+  return { running: !!torProcess, onionAddress: onionAddress || null, port: listenPort, socksPort: torSocksPort, enabled: torEnabled }
+})
+
+// ── MY CARD — everything a stranger needs to connect to you ──────────────────
+// Returns: { onion, port, fingerprint, name, nodeId }
+// fingerprint = first 20 hex chars of SHA-256(Ed25519PubKey), grouped 4-4-4-4-4
+// Peers share this card via Discord, Signal, website, etc.
+// The receiver pastes the onion:port to connect, and verifies the fingerprint
+// out-of-band (voice call / video / another message) to confirm no MITM.
+ipcMain.handle('ftps:get-my-card', () => {
+  const listenPort = tcpServer?.address()?.port || savedPort
+  let fingerprint = null
+  try {
+    const raw = Buffer.from(myIdentityPubB64, 'base64')
+    const hash = crypto.createHash('sha256').update(raw).digest('hex')
+    fingerprint = hash.slice(0, 20).toUpperCase().match(/.{4}/g).join('-')
+  } catch { }
+  return {
+    onion: onionAddress || null,
+    port: listenPort,
+    name: myName,
+    nodeId: myNodeId,
+    identityPubKey: myIdentityPubB64,
+    fingerprint,
+    // Full shareable string: paste-able into connect field
+    connectStr: onionAddress ? `${onionAddress}:${listenPort}` : null,
+  }
 })
 
 // Max retries IPC
@@ -1842,57 +1707,7 @@ ipcMain.handle('ftps:launch-os-sandbox', async (_, { name, dataB64, tmpPath }) =
 })
 
 
-// Persistence settings IPC
-ipcMain.handle('ftps:get-persist-settings', () => ({ persistData }))
-ipcMain.handle('ftps:set-persist-settings', (_, { persist }) => {
-  persistData = !!persist
-  savePersistSettings()
-  secEntry('OK', `Persistent data storage ${persistData ? 'ENABLED' : 'DISABLED'}`)
-  return { ok: true, persistData }
-})
-
-// FIX #10: Identity password — encrypt/decrypt persistent identity with user password
-// Allows same identity to survive across "New Identity" restarts
-ipcMain.handle('ftps:check-identity-encrypted', () => {
-  try {
-    if (!fs.existsSync(identityFile)) return { exists: false, encrypted: false }
-    const d = JSON.parse(fs.readFileSync(identityFile, 'utf8'))
-    return { exists: true, encrypted: !!d?.encrypted }
-  } catch { return { exists: false, encrypted: false } }
-})
-ipcMain.handle('ftps:load-identity-with-password', (_, { password }) => {
-  const result = loadIdentity(password)
-  if (result.ok) {
-    secEntry('OK', 'Identity recovered with password')
-    return { ok: true, fresh: !!result.fresh }
-  }
-  if (result.needsPassword) return { ok: false, needsPassword: true }
-  return { ok: false, error: result.error || 'Failed to load identity' }
-})
-ipcMain.handle('ftps:set-identity-password', (_, { password }) => {
-  try {
-    if (!myIdentityPrivKey || !myIdentityPubKey) return { ok: false, error: 'No active identity to protect' }
-    if (!password || password.length < 8) return { ok: false, error: 'Password must be at least 8 characters' }
-    const privDER = myIdentityPrivKey.export({ type: 'pkcs8', format: 'der' }).toString('base64')
-    const payload = JSON.stringify({ privKey: privDER, pubKey: myIdentityPubB64, v: 5, created: new Date().toISOString() })
-    const encrypted = encryptIdentity(payload, password)
-    fs.mkdirSync(path.dirname(identityFile), { recursive: true })
-    fs.writeFileSync(identityFile, JSON.stringify({ encrypted, updatedAt: new Date().toISOString() }))
-    secEntry('OK', 'Ed25519 identity keypair encrypted and saved (password-protected)')
-    return { ok: true }
-  } catch (e) { return { ok: false, error: e.message } }
-})
-ipcMain.handle('ftps:remove-identity-password', () => {
-  try {
-    if (!myIdentityPrivKey) return { ok: false, error: 'No active identity' }
-    const privDER = myIdentityPrivKey.export({ type: 'pkcs8', format: 'der' }).toString('base64')
-    fs.mkdirSync(path.dirname(identityFile), { recursive: true })
-    fs.writeFileSync(identityFile, JSON.stringify({ privKey: privDER, pubKey: myIdentityPubB64, v: 5, created: new Date().toISOString() }))
-    secEntry('OK', 'Identity password removed — keypair stored plaintext')
-    return { ok: true }
-  } catch (e) { return { ok: false, error: e.message } }
-})
-
+// Shell + Window
 // Shell + Window
 ipcMain.handle('shell:open-external', async (_, { url }) => { if (!/^https?:\/\//.test(url)) return { ok: false }; await shell.openExternal(url); secEntry('INFO', 'External URL', url); return { ok: true } })
 ipcMain.handle('window:control', (_, { action }) => {
