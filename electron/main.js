@@ -13,10 +13,9 @@ const crypto = require('crypto')
 const os = require('os')
 const fs = require('fs')
 const dgram = require('dgram')
-const http = require('http')
-const https = require('https')
 const dns = require('dns')
 const { exec, execFile } = require('child_process')
+// Note: http and https modules removed — were imported but never used
 
 // B9 FIX: 512KB chunks (was 64KB) for faster transfers
 const CHUNK = 524288
@@ -347,12 +346,13 @@ function createWindow() {
 
 // CHANGE 8: Port settings persistence
 const portSettingsFile = path.join(app.getPath('userData'), 'port_settings.json')
-let savedPort = 7000
+let savedPort = 7900
 function loadPortSettings() {
   try {
     if (fs.existsSync(portSettingsFile)) {
       const d = JSON.parse(fs.readFileSync(portSettingsFile, 'utf8'))
       if (d?.port && Number.isInteger(d.port) && d.port >= 1024 && d.port <= 65535) savedPort = d.port
+    // else keep savedPort at 7900 default
     }
   } catch { }
 }
@@ -360,17 +360,53 @@ function savePortSettings(port) {
   try { fs.writeFileSync(portSettingsFile, JSON.stringify({ port, updatedAt: new Date().toISOString() })); savedPort = port } catch { }
 }
 
-// CHANGE 2: Wipe persistent session data on exit (keep identity.json + port_settings.json)
+
+// ── PERSISTENCE SETTINGS ──────────────────────────────────────────────────────
+// Controls whether identity.json / known_peers.json / blocked_peers.json survive quit.
+// Default: OFF (false) — every session starts completely fresh.
+// If user enables, files are kept across restarts.
+const persistSettingsFile = path.join(app.getPath('userData'), 'persist_settings.json')
+let persistData = false  // default OFF — no data kept between sessions
+
+function loadPersistSettings() {
+  try {
+    if (fs.existsSync(persistSettingsFile)) {
+      const d = JSON.parse(fs.readFileSync(persistSettingsFile, 'utf8'))
+      if (typeof d?.persistData === 'boolean') persistData = d.persistData
+    }
+  } catch { }
+}
+function savePersistSettings() {
+  try { fs.writeFileSync(persistSettingsFile, JSON.stringify({ persistData, updatedAt: new Date().toISOString() })) } catch { }
+}
+
+// Wipe persistent session data on exit (keep identity.json + port_settings.json)
 function wipePersistentData() {
-  tofuStore.clear()
-  try { fs.unlinkSync(tofuFile) } catch { }
-  secEntry('OK', 'Session data wiped — all known peers cleared')
+  // If persistData is OFF (default), wipe all three files
+  // If persistData is ON, keep them — user wants continuity across sessions
+  if (!persistData) {
+    tofuStore.clear()
+    blockedPeers.clear()
+    try { fs.unlinkSync(tofuFile) } catch { }
+    try { fs.unlinkSync(blockedFile) } catch { }
+    try { fs.unlinkSync(identityFile) } catch { }
+    secEntry('OK', 'Session data wiped — identity, peers, blocked cleared (persistData=OFF)')
+  } else {
+    secEntry('OK', 'Session ended — data kept on disk (persistData=ON)')
+  }
 }
 
 app.whenReady().then(() => {
-  loadIdentity()
-  loadTOFU()
-  loadBlocked()
+  loadPersistSettings()  // must load first — affects whether identity/tofu/blocked are loaded
+  if (persistData) {
+    loadIdentity()
+    loadTOFU()
+    loadBlocked()
+  } else {
+    // persistData OFF: generate fresh identity every time
+    myIdentityKey = require('crypto').randomBytes(32).toString('hex')
+    secEntry('OK', 'Fresh identity generated (persistData=OFF)')
+  }
   loadPortSettings()
   createWindow()
   app.on('activate', () => { if (!mainWindow) createWindow() })
@@ -1083,7 +1119,6 @@ async function connectToPeerWithFallback(host, port) {
   } catch (primaryErr) {
     // If this was a local IP, try other local interfaces on same subnet
     if (isLocalIP(host)) {
-      const localIPs = getLocalIPs().map(i => i.address)
       // Find peers discovered via mDNS that match this port
       for (const [, peer] of discoveredPeers) {
         if (peer.port === parseInt(port) && peer.address !== host) {
@@ -1110,11 +1145,11 @@ ipcMain.handle('ftps:set-identity', async (_, { name, nodeId }) => {
   // Start passive mDNS discovery immediately
   startPassiveDiscovery()
 
-  // FIX: Auto-start TCP server + Tor when a session begins.
-  // This makes Tor start with the program — no manual "Start Listening" needed.
+  // FIX: Auto-start TCP server + Tor when a session begins using the user's SAVED port.
+  // savedPort defaults to 7900 but is updated when user saves a different port in Settings.
   if (!tcpServer) {
     try {
-      const r = await startServer(7000)
+      const r = await startServer(savedPort)
       startDiscovery(r.port)
       emit('ftps:listen-auto', { ok: true, port: r.port, localIPs: r.localIPs })
       secEntry('OK', `TCP server auto-started on port ${r.port}`)
@@ -1186,7 +1221,7 @@ ipcMain.handle('ftps:send-folder-complete', (_, { peerId, fid, name, fileCount }
 })
 // CHANGE 8: Port settings persistence
 ipcMain.handle('ftps:save-port', (_, { port }) => {
-  const p = Math.max(1024, Math.min(65535, parseInt(port) || 7000))
+  const p = Math.max(1024, Math.min(65535, parseInt(port) || 7900))
   savePortSettings(p); secEntry('OK', `Port setting saved: ${p}`); return { ok: true, port: p }
 })
 ipcMain.handle('ftps:get-port', () => ({ port: savedPort }))
@@ -1285,8 +1320,7 @@ ipcMain.handle('ftps:connect-onion', async (_, { address, port }) => {
 
 ipcMain.handle('ftps:get-sys-stats', async () => {
   const mem = process.memoryUsage()
-  const cpus = os.cpus()
-  // Basic CPU Load calculation (average load)
+  // cpus removed — os.cpus() was called but result was never used
   const load = os.loadavg() // [1m, 5m, 15m]
   return {
     bytesSent: totalBytesSent,
@@ -1520,6 +1554,16 @@ ipcMain.handle('ftps:launch-os-sandbox', async (_, { name, dataB64, tmpPath }) =
   } catch (e) {
     return { ok: false, error: e.message }
   }
+})
+
+
+// Persistence settings IPC
+ipcMain.handle('ftps:get-persist-settings', () => ({ persistData }))
+ipcMain.handle('ftps:set-persist-settings', (_, { persist }) => {
+  persistData = !!persist
+  savePersistSettings()
+  secEntry('OK', `Persistent data storage ${persistData ? 'ENABLED' : 'DISABLED'}`)
+  return { ok: true, persistData }
 })
 
 // Shell + Window

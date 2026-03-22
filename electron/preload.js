@@ -59,6 +59,10 @@ contextBridge.exposeInMainWorld('ftps', {
   savePort: (port) => ipcRenderer.invoke('ftps:save-port', { port }),
   getPort: () => ipcRenderer.invoke('ftps:get-port'),
 
+  // Persistence settings
+  getPersistSettings: () => ipcRenderer.invoke('ftps:get-persist-settings'),
+  setPersistSettings: (persist) => ipcRenderer.invoke('ftps:set-persist-settings', { persist }),
+
   // B4/C1: Blocked peers
   blockPeer: (peerId, peerName, reason) => ipcRenderer.invoke('ftps:block-peer', { peerId, peerName, reason }),
   unblockPeer: (peerId) => ipcRenderer.invoke('ftps:unblock-peer', { peerId }),

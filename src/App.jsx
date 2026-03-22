@@ -201,6 +201,80 @@ async function detectThreats(blob, filename) {
   } catch { return [] }
 }
 
+// ── EXIF / METADATA STRIPPER ──────────────────────────────────────────────────
+// Strips metadata from images (EXIF, XMP, IPTC, ICC) and PDFs (/Info dict)
+// before sending. Pure JS, no native deps. Default OFF — user must enable.
+async function stripMetadata(blob, filename) {
+  try {
+    const buf = await blob.arrayBuffer()
+    const bytes = new Uint8Array(buf)
+
+    // ── JPEG: Remove all APP0-APP15 segments except APP0 (JFIF) ──────────────
+    if (/\.(jpg|jpeg)$/i.test(filename)) {
+      const out = []
+      let i = 0
+      // Copy SOI marker
+      if (bytes[0] !== 0xFF || bytes[1] !== 0xD8) return blob  // not JPEG
+      out.push(0xFF, 0xD8)
+      i = 2
+      while (i < bytes.length - 1) {
+        if (bytes[i] !== 0xFF) break
+        const marker = bytes[i + 1]
+        // Keep SOS (0xDA) and everything after (compressed image data)
+        if (marker === 0xDA) {
+          for (let j = i; j < bytes.length; j++) out.push(bytes[j])
+          break
+        }
+        const segLen = (bytes[i + 2] << 8) | bytes[i + 3]
+        // Drop APP1 (EXIF/XMP), APP2 (ICC), APP13 (IPTC), APP14, APP15
+        const isMetaSeg = marker >= 0xE1 && marker <= 0xEF
+        if (!isMetaSeg) {
+          for (let j = i; j < i + 2 + segLen; j++) out.push(bytes[j])
+        }
+        i += 2 + segLen
+      }
+      return new Blob([new Uint8Array(out)], { type: 'image/jpeg' })
+    }
+
+    // ── PNG: Remove all non-critical chunks (tEXt, iTXt, zTXt, eXIf, etc.) ──
+    if (/\.png$/i.test(filename)) {
+      const KEEP = new Set(['IHDR','PLTE','IDAT','IEND','tRNS','gAMA','cHRM','sRGB','bKGD','pHYs','sBIT','hIST','sPLT','tIME'])
+      const out = []
+      // PNG signature
+      for (let j = 0; j < 8; j++) out.push(bytes[j])
+      let i = 8
+      while (i < bytes.length) {
+        const len = (bytes[i]<<24|bytes[i+1]<<16|bytes[i+2]<<8|bytes[i+3]) >>> 0
+        const name = String.fromCharCode(bytes[i+4],bytes[i+5],bytes[i+6],bytes[i+7])
+        const totalChunk = 4 + 4 + len + 4
+        if (KEEP.has(name)) {
+          for (let j = i; j < i + totalChunk; j++) out.push(bytes[j])
+        }
+        i += totalChunk
+        if (name === 'IEND') break
+      }
+      return new Blob([new Uint8Array(out)], { type: 'image/png' })
+    }
+
+    // ── PDF: Strip /Info dictionary and XMP metadata streams ─────────────────
+    if (/\.pdf$/i.test(filename)) {
+      let text = new TextDecoder('latin1').decode(bytes)
+      // Remove /Info reference from trailer
+      text = text.replace(/\/Info\s+\d+\s+\d+\s+R/g, '')
+      // Remove XMP metadata streams
+      text = text.replace(/<\?xpacket[\s\S]*?<\/x:xmpmeta>[\s\S]*?<\?xpacket.*?\?>/g, '')
+      return new Blob([new TextEncoder().encode(text)], { type: 'application/pdf' })
+    }
+
+    // All other file types: return unchanged
+    return blob
+  } catch (e) {
+    console.warn('stripMetadata failed:', e)
+    return blob  // fail safe — return original
+  }
+}
+
+
 function _fileToB64(file) {
   return new Promise((res, rej) => {
     const r = new FileReader()
@@ -313,7 +387,7 @@ function CloseConfirm({ onCancel, onTerminate }) {
 }
 
 // ── TITLE BAR ─────────────────────────────────────────────────────────────────
-function TitleBar({ account, nodeId, onlinePeers, onLock, onTerminate, uptime, onHelp, lockTimer, lockMin }) {
+function TitleBar({ account, nodeId, onlinePeers, listenActive, onLock, onTerminate, uptime, onHelp, lockTimer, lockMin }) {
   const [vOpen, setVOpen] = useState(false)
   const vRef = useRef(null)
   const wc = a => window.ftps?.windowControl(a)
@@ -361,7 +435,9 @@ function TitleBar({ account, nodeId, onlinePeers, onLock, onTerminate, uptime, o
       <span style={{ color: T.muted }}>·</span>
       <span style={{ color: T.accent, fontWeight: 600 }}>{nodeId}</span>
       <span style={{ color: T.muted }}>·</span>
-      <span style={{ color: onlinePeers > 0 ? T.green : T.muted }}>{onlinePeers > 0 ? `● ${onlinePeers} online` : '○ offline'}</span>
+      <span style={{ color: onlinePeers > 0 ? T.green : listenActive ? T.blue : T.muted }}>
+        {onlinePeers > 0 ? `● ${onlinePeers} peer${onlinePeers !== 1 ? 's' : ''} online` : listenActive ? '◉ listening' : '○ offline'}
+      </span>
     </div>
     <div style={{ display: 'flex', alignItems: 'center', gap: 3, WebkitAppRegion: 'no-drag' }}>
       <span style={{ fontSize: 10, color: T.muted, fontVariantNumeric: 'tabular-nums', marginRight: 6 }}>{fmt(uptime)}</span>
@@ -1198,7 +1274,7 @@ function HelpModal({ onClose, inline = false }) {
           <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>⚡ Quick Start</div>
           <div style={{ fontSize: 12, color: T.textMid, lineHeight: 1.8 }}>One peer listens. The other dials. No servers, no codes required for same WiFi — peers are <strong style={{ color: T.green }}>auto-discovered</strong> via mDNS. For internet connections, use pairing codes.</div>
         </div>
-        <S n="1" col={T.blue} title="Start Listening" body="Connect tab → set port 7000 → Start Listening. UPnP auto-maps port on your router. mDNS discovery starts automatically for same-network peers." />
+        <S n="1" col={T.blue} title="Start Listening" body="Connect tab → Start Listening (default port 7900). UPnP auto-maps port on your router. mDNS discovery starts automatically for same-network peers." />
         <S n="2" col={T.green} title="Same Network" body="Open My Network tab — nearby peers appear automatically with a one-click Connect button. No IP typing needed. This uses mDNS multicast (like AirDrop/Bonjour), fully local." />
         <S n="3" col={T.purple} title="Get Pairing Code (Internet)" body="Click 'Get Code' — P2N discovers your external IP via UPnP → STUN → HTTP fallback. Share the code by any means. Peer pastes it and clicks Connect." />
         <S n="4" col={T.accent} title="Secure" body="ECDH P-256 handshake derives a fresh AES-256-GCM key. Everything encrypted before leaving the machine. Persistent identity key enables TOFU — warns if peer identity changes." />
@@ -1261,7 +1337,7 @@ function HelpModal({ onClose, inline = false }) {
 }
 
 // CHANGE 8: Settings are ephemeral — reset on every restart. Only port persists to disk.
-const DEFAULT_SETTINGS = { lockMin: 15, md: true, warnLinks: true, warnArch: true, torEnabled: true, maxTries: 5, scanFiles: true }
+const DEFAULT_SETTINGS = { lockMin: 15, md: true, warnLinks: true, warnArch: true, torEnabled: true, maxTries: 5, scanFiles: true, exifStrip: false, persistData: false }
 // sessionStorage survives webContents.reload() (Refresh UI) but NOT app restart.
 // This lets Refresh UI work without terminating the session.
 function readSavedSession() {
@@ -1331,7 +1407,7 @@ export default function App() {
   const [pendingPeerRequests, setPendingPeerRequests] = useState([]) // CHANGE 7b
   const [sentPeerRequests, setSentPeerRequests] = useState(new Set()) // CHANGE 7b
   // connection state
-  const [listenPort, setListenPort] = useState('7000')
+  const [listenPort, setListenPort] = useState('7900')
   const [listenActive, setListenActive] = useState(false)
   const [listenInfo, setListenInfo] = useState(null)
   const [connectAddr, setConnectAddr] = useState('')
@@ -1352,6 +1428,7 @@ export default function App() {
   const [uptime, setUptime] = useState(0)
   const [lockTimer, setLockTimer] = useState(900)
   const [logs, setLogs] = useState([])
+  const [unreadLogs, setUnreadLogs] = useState(0)  // clears when user opens Logs tab
   const [editName, setEditName] = useState(false)
   const [nameInput, setNameInput] = useState('')
   const [sysStats, setSysStats] = useState(null)
@@ -1363,6 +1440,7 @@ export default function App() {
   const fileInp = useRef(null), folderInp = useRef(null), lastAct = useRef(Date.now()), myId = useRef(getInitialNodeId())
   // Stores received folder file data keyed by folderFid — kept in ref to avoid re-renders per-chunk
   const folderDataRef = useRef({})  // {[folderFid]: {name, files:[{relPath,name,size,dataB64?,tmpPath?}]}}
+  const removedByPeersRef = useRef(new Set())  // peerIds that have explicitly removed us
   // Stores shared folder File objects keyed by fid — sender keeps these until receiver pulls
   const sharedFoldersRef = useRef({})  // {[fid]: {name, files:[File]}}
 
@@ -1378,7 +1456,10 @@ export default function App() {
   // B10 FIX: Keep settRef in sync so TCPBridge handlers always see current settings
   const settRef = useRef(sett)
   useEffect(() => { settRef.current = sett }, [sett])
-  const addLog = useCallback((level, msg, detail = '') => setLogs(p => [{ ts: new Date().toTimeString().slice(0, 8), level, msg, detail }, ...p].slice(0, 300)), [])
+  const addLog = useCallback((level, msg, detail = '') => {
+    setLogs(p => [{ ts: new Date().toTimeString().slice(0, 8), level, msg, detail }, ...p].slice(0, 300))
+    setUnreadLogs(n => n + 1)
+  }, [])
 
   // Activity tracking for auto-lock
   useEffect(() => {
@@ -1407,7 +1488,12 @@ export default function App() {
   }, [])
   useEffect(() => { refreshNet() }, [refreshNet])
   // CHANGE 8: Load saved port from main process on mount
-  useEffect(() => { window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => {}) }, [])
+  useEffect(() => {
+    window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => {})
+    window.ftps?.getPersistSettings?.().then(r => {
+      if (r && typeof r.persistData === 'boolean') setSett2(p => ({ ...p, persistData: r.persistData }))
+    }).catch(() => {})
+  }, [])
   // B4/C1: Load blocked peers on mount
   useEffect(() => { window.ftps?.getBlocked?.().then(r => { if (r) setBlockedPeers(r) }).catch(() => {}) }, [])
 
@@ -1442,7 +1528,10 @@ export default function App() {
       }),
       // FIX: KNOWN-02 — removed dead subscriptions: ftps:upnp-status, ftps:pairing-status, ftps:stun-result
       // None of these channels are emitted by main.js
-      window.ftps?.on('p2n:log', e => setLogs(p => [{ ts: e.ts || '', level: e.level, msg: e.msg, detail: e.detail || '' }, ...p].slice(0, 300))),
+      window.ftps?.on('p2n:log', e => {
+        setLogs(p => [{ ts: e.ts || '', level: e.level, msg: e.msg, detail: e.detail || '' }, ...p].slice(0, 300))
+        setUnreadLogs(n => n + 1)
+      }),
       window.ftps?.on('app:request-close', () => setShowCloseConfirm(true)),
       // FIX: mDNS discovered peers
       window.ftps?.on('ftps:peers-discovered', list => setDiscoveredPeers(list || [])),
@@ -1572,18 +1661,23 @@ export default function App() {
         else if (msg.type === 'folder_pull_done') {
           setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fb_' + msg.fid ? { ...m, status: 'done' } : m) }))
         }
-        // B2 FIX: Other side was removed — show notification, mark offline
+        // B2 FIX: Other side removed us — mark in ref so send gives specific error
         else if (msg.type === 'peer_removed') {
-          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `⚠ ${pn} has removed you from their peer list`, time: now8() })
-          setPeers(ps => ps.map(p => p.id === pid ? { ...p, online: false } : p))
-          notify(`${pn} removed you`, 'info')
+          removedByPeersRef.current.add(pid)
+          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `🚫 ${pn} has removed you from their peer list. Messages cannot be sent.`, time: now8() })
+          setPeers(ps => ps.map(p => p.id === pid ? { ...p, online: false, removedMe: true } : p))
+          notify(`${pn} removed you — you can no longer message them`, 'info')
         }
-        // B7 FIX: Peer renamed — update name without disconnecting
+        // B7 FIX: Peer renamed — update peers list AND selPeer so ALL names refresh instantly
         else if (msg.type === 'name_update') {
           const newName = msg.newName
+          // Update peers list (sidebar + network tab)
           setPeers(ps => ps.map(p => p.id === pid ? { ...p, name: newName } : p))
-          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `✎ ${pn} renamed to ${newName}`, time: now8() })
-          notify(`${pn} → ${newName}`, 'info')
+          // Update selPeer so the chat header name changes immediately if this peer is open
+          setSelPeer(sp => sp?.id === pid ? { ...sp, name: newName } : sp)
+          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `✎ ${pn} renamed to "${newName}"`, time: now8() })
+          notify(`${pn} is now "${newName}"`, 'info')
+          addLog('INFO', `Peer renamed: ${pn} → ${newName}`, pid)
         }
         // Sender receives pull request → start sending files
         else if (msg.type === 'folder_pull') {
@@ -1682,23 +1776,48 @@ export default function App() {
     if (!selPeer || !input.trim()) return
     const text = input.trim()
     setInput('')
+    // Check if this peer has explicitly removed us before trying to send
+    if (removedByPeersRef.current.has(selPeer.id)) {
+      notify('❌ Cannot send — this peer has removed you from their list', 'err')
+      setInput(text)  // restore the typed text so user doesn't lose it
+      return
+    }
     if (await bridgeRef.current?.sendMsg(selPeer.id, text)) {
       pushMsg(selPeer.id, { id: Date.now(), from: 'me', type: 'text', text, time: now8() })
     } else {
-      notify('Send failed — peer may have disconnected', 'err')
+      // Peer is offline but didn't explicitly remove us — could be a crash/disconnect
+      const wasRemoved = peersRef.current.find(p => p.id === selPeer.id)?.removedMe
+      notify(wasRemoved
+        ? '❌ Not delivered — this peer removed you from their list'
+        : '⚠ Not delivered — peer appears to be offline or disconnected', 'err')
     }
   }, [selPeer, input, pushMsg, notify])
 
   // doSendFile — read a File and send it to the selected peer
   const doSendFile = useCallback(async (file) => {
     if (!selPeer) return
-    const fid = 'fo_' + Date.now() + '_' + Math.random().toString(36).slice(2)
-    // A2 FIX: Start at 0% instead of 100% to prevent flash
+    if (removedByPeersRef.current.has(selPeer.id)) {
+      notify('❌ Cannot send file — this peer has removed you from their list', 'err')
+      return
+    }
+    // Use a single UUID as the fid for BOTH the UI message AND the wire transfer.
+    // This ensures the revoke chain works: sender's message id (fid+'_out') strips '_out'
+    // to get rawFid, receiver's message id (fid+'_in') matches on revoke receipt.
+    const fid = crypto.randomUUID()
     pushMsg(selPeer.id, { id: fid + '_out', from: 'me', type: 'file_out', meta: { name: file.name, size: file.size }, pct: 0, time: now8() })
     addLog('INFO', `Sending: ${file.name}`, fmtSz(file.size))
-    const ok = await bridgeRef.current?.sendFile(selPeer.id, file, pct => {
+    // EXIF strip: if enabled, strip metadata before sending
+    let fileToSend = file
+    if (settRef.current.exifStrip && (IS_IMG.test(file.name) || IS_PDF.test(file.name))) {
+      try {
+        const stripped = await stripMetadata(file, file.name)
+        fileToSend = new File([stripped], file.name, { type: file.type || stripped.type })
+        addLog('INFO', `Metadata stripped: ${file.name}`)
+      } catch { fileToSend = file }
+    }
+    const ok = await bridgeRef.current?.sendFile(selPeer.id, fileToSend, pct => {
       setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).map(m => m.id === fid + '_out' ? { ...m, pct } : m) }))
-    })
+    }, fid)  // pass fid so tcpbridge uses the same one on the wire
     if (!ok) {
       notify(`Send failed: ${file.name}`, 'err')
       setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).filter(m => m.id !== fid + '_out') }))
@@ -1821,6 +1940,7 @@ export default function App() {
       bridgeRef.current?.disconnect(peerId)
       setPeers(ps => ps.filter(p => p.id !== peerId))
       setMsgs(p => { const n = { ...p }; delete n[peerId]; return n })
+      removedByPeersRef.current.delete(peerId)  // clear if we removed them first
       if (selPeer?.id === peerId) setSelPeer(null)
       addLog('INFO', 'Peer removed', peerId)
       notify('Peer removed', 'ok')
@@ -1892,20 +2012,26 @@ export default function App() {
   }
 
   const doLock = () => { setScreen('locked'); setLockForm({ pp: '', pw: '' }); addLog('INFO', 'Session locked') }
-  // CHANGE 2: Expanded doTerminate — wipe all local state
+  // doTerminate — complete session wipe, ALL state reset to clean slate
   const doTerminate = () => {
     clearSavedSession(); window.ftps?.clearSession(); addLog('INFO', 'Session ended')
     bridgeRef.current?.closeAll()
     setAccount(null); setScreen('setup'); setMsgs({}); setPeers([])
     setForm({ name: '', passphrase: '', password: '' })
+    setLockForm({ pp: '', pw: '' }); setLockErr(''); setLockTries(0)
     setConnState('idle'); setConnErr(''); setConnectAddr('')
     setTorConnState('idle'); setTorConnErr(''); setOnionInput('')
     setTorStatus('off'); setOnionAddr(''); setTorError('')
     setListenActive(false); setListenInfo(null)
     setDiscoveredPeers([]); setPeerFingerprints({}); setPeerIdentityKeys({})
     setVerifiedPeers(new Set()); setSysStats(null); setLogs([])
-    setListenPort('7000'); setPendingPeerRequests([]); setSentPeerRequests(new Set())
+    setSelPeer(null); setTab('connect'); setInput('')
+    setPendingPeerRequests([]); setSentPeerRequests(new Set())
+    setBlockedPeers([])
     setSett2Raw({ ...DEFAULT_SETTINGS })
+    folderDataRef.current = {}; sharedFoldersRef.current = {}; removedByPeersRef.current.clear()
+    // Restore saved port so the connect tab always shows what the user last saved
+    window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => {})
   }
 
   const doListen = async () => {
@@ -1923,7 +2049,7 @@ export default function App() {
 
   const doConnect = async () => {
     const t = connectAddr.trim(); if (!t) { notify('Enter IP:port', 'err'); return }
-    const parts = t.split(':'); if (parts.length < 2 || !parts[0] || !parts[1]) { notify('Format: 192.168.x.x:7000', 'err'); return }
+    const parts = t.split(':'); if (parts.length < 2 || !parts[0] || !parts[1]) { notify('Format: 192.168.x.x:7900', 'err'); return }
     setConnState('connecting'); setConnErr('')
     const r = await window.ftps?.connect(parts[0], parts[1])
     if (!r) { notify('Electron API unavailable', 'err'); setConnState('idle'); return }
@@ -1989,7 +2115,7 @@ export default function App() {
     if (!parts[0].endsWith('.onion')) { notify('Address must end in .onion', 'err'); return }
     if (parts[0].length < 16) { notify('Invalid .onion address (too short)', 'err'); return }
     const port = parseInt(parts[1])
-    if (!parts[1] || isNaN(port) || port < 1 || port > 65535) { notify('Invalid port — format: xxxx.onion:7000', 'err'); return }
+    if (!parts[1] || isNaN(port) || port < 1 || port > 65535) { notify('Invalid port — format: xxxx.onion:7900', 'err'); return }
     setTorConnState('connecting'); setTorConnErr('')
     addLog('INFO', `Connecting via Tor to ${addr}`)
     const r = await window.ftps?.connectOnion(parts[0], port)
@@ -2150,7 +2276,7 @@ export default function App() {
         <div style={{ color: T.textDim, fontSize: 13 }}>Extracting archive…</div>
       </div>}
 
-      <TitleBar account={account} nodeId={myId.current} onlinePeers={onlinePeers.length} onLock={doLock} onTerminate={() => setShowCloseConfirm(true)} uptime={uptime} onHelp={() => setTab('docs')} lockTimer={lockTimer} lockMin={sett.lockMin} />
+      <TitleBar account={account} nodeId={myId.current} onlinePeers={onlinePeers.length} listenActive={listenActive} onLock={doLock} onTerminate={() => setShowCloseConfirm(true)} uptime={uptime} onHelp={() => setTab('docs')} lockTimer={lockTimer} lockMin={sett.lockMin} />
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         {/* ── SIDEBAR ── */}
@@ -2160,10 +2286,39 @@ export default function App() {
             {editName ? (
               <div>
                 <input value={nameInput} onChange={e => setNameInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') { const n = nameInput.trim(); if (n && n !== account?.name) setShowRenameConfirm(n); else if (n) setEditName(false) }; if (e.key === 'Escape') setEditName(false) }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      const n = nameInput.trim()
+                      if (n && n !== account?.name) {
+                        setAccount(a => ({ ...a, name: n }))
+                        myId.current = makeId(n)
+                        window.ftps?.setIdentity(n, myId.current)
+                        peersRef.current.filter(p => p.online).forEach(p => {
+                          bridgeRef.current?.sendMsg(p.id, { type: 'name_update', newName: n })
+                        })
+                        saveSession({ ...account, name: n }, myId.current)
+                        notify('Name updated — peers notified', 'ok')
+                      }
+                      setEditName(false)
+                    }
+                    if (e.key === 'Escape') setEditName(false)
+                  }}
                   className="inp" style={{ fontSize: 11, padding: '4px 7px', marginBottom: 4 }} autoFocus />
                 <div style={{ display: 'flex', gap: 4 }}>
-                  <button onClick={() => { const n = nameInput.trim(); if (n && n !== account?.name) setShowRenameConfirm(n); else if (n) setEditName(false) }} className="btn btn-green btn-xs" style={{ flex: 1 }}>✓</button>
+                  <button onClick={() => {
+                    const n = nameInput.trim()
+                    if (n && n !== account?.name) {
+                      setAccount(a => ({ ...a, name: n }))
+                      myId.current = makeId(n)
+                      window.ftps?.setIdentity(n, myId.current)
+                      peersRef.current.filter(p => p.online).forEach(p => {
+                        bridgeRef.current?.sendMsg(p.id, { type: 'name_update', newName: n })
+                      })
+                      saveSession({ ...account, name: n }, myId.current)
+                      notify('Name updated — peers notified', 'ok')
+                    }
+                    setEditName(false)
+                  }} className="btn btn-green btn-xs" style={{ flex: 1 }}>✓</button>
                   <button onClick={() => setEditName(false)} className="btn btn-ghost btn-xs" style={{ flex: 1 }}>✕</button>
                 </div>
               </div>
@@ -2183,13 +2338,17 @@ export default function App() {
           {[
             { id: 'connect', icon: '⊕', label: 'Connect' },
             { id: 'peers', icon: '◉', label: 'Network' },
-            { id: 'logs', icon: '📋', label: 'Logs', badge: logs.filter(l => l.level === 'ERR').length },
+            { id: 'logs', icon: '📋', label: 'Logs', badge: tab !== 'logs' ? unreadLogs : 0 },
             { id: 'network', icon: '⬡', label: 'My Network' },
             { id: 'stats', icon: '▲', label: 'Stats' },
             { id: 'settings', icon: '⚙', label: 'Settings' },
             { id: 'docs', icon: '📖', label: 'Docs' },
           ].map(it => (
-            <button key={it.id} onClick={() => { setTab(it.id); if (it.id !== 'peers') setSelPeer(null) }} className={`nav-item${tab === it.id ? ' act' : ''}`}>
+            <button key={it.id} onClick={() => {
+                setTab(it.id)
+                if (it.id !== 'peers') setSelPeer(null)
+                if (it.id === 'logs') setUnreadLogs(0)
+              }} className={`nav-item${tab === it.id ? ' act' : ''}`}>
               <span style={{ width: 17, textAlign: 'center', fontSize: 13, flexShrink: 0 }}>{it.icon}</span>
               <span style={{ flex: 1 }}>{it.label}</span>
               {it.badge > 0 && <span style={{ fontSize: 9, background: T.red, color: '#fff', borderRadius: 8, padding: '1px 4px', fontWeight: 700 }}>{it.badge}</span>}
@@ -2199,12 +2358,19 @@ export default function App() {
           {/* Peer quick-list */}
           {peers.length > 0 && <div style={{ marginTop: 9, borderTop: `1px solid ${T.border}`, paddingTop: 7 }}>
             <div style={{ fontSize: 9, color: T.muted, letterSpacing: 1.5, fontWeight: 600, padding: '0 6px', marginBottom: 3 }}>PEERS</div>
-            {peers.map(p => (
-              <button key={p.id} onClick={() => { setSelPeer(p); setTab('peers') }} className={`nav-item${selPeer?.id === p.id ? ' act' : ''}`} style={{ gap: 6 }}>
-                <Av name={p.name} id={p.id} size={20} online={p.online} />
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: p.online ? T.text : T.textDim }}>{p.name || p.id.slice(0, 8)}</span>
-              </button>
-            ))}
+            {peers.map(p => {
+              const pMsgs = msgs[p.id] || []
+              const lastMsg = pMsgs[pMsgs.length - 1]
+              const hasUnread = selPeer?.id !== p.id && lastMsg && lastMsg.from !== 'me' && lastMsg.from !== 'sys'
+              return (
+                <button key={p.id} onClick={() => { setSelPeer(p); setTab('peers') }} className={`nav-item${selPeer?.id === p.id ? ' act' : ''}`} style={{ gap: 6 }}>
+                  <Av name={p.name} id={p.id} size={20} online={p.online} />
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: p.online ? T.text : T.textDim, flex: 1 }}>{p.name || p.id.slice(0, 8)}</span>
+                  {hasUnread && <span style={{ width: 7, height: 7, borderRadius: '50%', background: T.accent, flexShrink: 0 }} />}
+                  {p.reconnecting && <span style={{ fontSize: 9, color: T.amber }}>⟳</span>}
+                </button>
+              )
+            })}
           </div>}
           <div style={{ flex: 1 }} />
           <div style={{ fontSize: 10, color: T.muted, textAlign: 'center', padding: '5px 0', fontVariantNumeric: 'tabular-nums' }}>{fmt(uptime)}</div>
@@ -2224,8 +2390,11 @@ export default function App() {
                   {/* SAME WIFI */}
                   <div className="card glass glow-blue" style={{ padding: 16 }}>
                     <div style={{ fontSize: 10, color: T.blue, letterSpacing: 1.5, marginBottom: 11, fontWeight: 700 }}>① SAME NETWORK</div>
-                    <div style={{ fontSize: 11, color: T.textDim, marginBottom: 4 }}>Port</div>
-                    <input value={listenPort} onChange={e => setListenPort(e.target.value)} className="inp" placeholder="7000" style={{ marginBottom: 9 }} disabled={listenActive} />
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <div style={{ fontSize: 11, color: T.textDim }}>Port</div>
+                      <button onClick={() => setTab('settings')} style={{ background: 'none', border: 'none', color: T.accent, fontSize: 10, cursor: 'pointer' }}>⚙ Change in Settings</button>
+                    </div>
+                    <div style={{ background: T.bg, border: `1px solid ${T.border}`, borderRadius: 6, padding: '6px 10px', marginBottom: 9, fontSize: 13, color: T.text, fontVariantNumeric: 'tabular-nums' }}>{listenPort}</div>
                     {!listenActive
                       ? <button onClick={doListen} className="btn btn-blue" style={{ width: '100%', padding: 9 }}>▶ Start Listening</button>
                       : <button onClick={doStopListen} className="btn btn-danger" style={{ width: '100%', padding: 9 }}>■ Stop</button>}
@@ -2245,7 +2414,7 @@ export default function App() {
                   <div className="card" style={{ padding: 14 }}>
                     <div style={{ fontSize: 10, color: T.purple, letterSpacing: 1.5, marginBottom: 11, fontWeight: 700 }}>② CONNECT TO PEER</div>
                     <div style={{ fontSize: 10, color: T.textDim, marginBottom: 5, letterSpacing: 1, fontWeight: 600 }}>IP:PORT (Same Network)</div>
-                    <input value={connectAddr} onChange={e => setConnectAddr(e.target.value)} onKeyDown={e => e.key === 'Enter' && doConnect()} className="inp" placeholder="192.168.1.x:7000" style={{ marginBottom: 7 }} disabled={connState === 'connecting'} />
+                    <input value={connectAddr} onChange={e => setConnectAddr(e.target.value)} onKeyDown={e => e.key === 'Enter' && doConnect()} className="inp" placeholder="192.168.1.x:7900" style={{ marginBottom: 7 }} disabled={connState === 'connecting'} />
                     <button onClick={doConnect} className="btn btn-purple" style={{ width: '100%', padding: 8 }} disabled={connState === 'connecting' || !connectAddr.trim()}>
                       {connState === 'connecting' ? '⟳ Connecting…' : '→ Connect'}
                     </button>
@@ -2292,7 +2461,7 @@ export default function App() {
                     </div>
                     <div>
                       <div style={{ fontSize: 10, color: T.purple, fontWeight: 700, marginBottom: 6, letterSpacing: 1 }}>CONNECT VIA ONION</div>
-                      <input value={onionInput} onChange={e => setOnionInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && doConnectOnion()} className="inp" placeholder="xxxx.onion:7000" style={{ marginBottom: 6, fontSize: 11, fontFamily: 'monospace' }} />
+                      <input value={onionInput} onChange={e => setOnionInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && doConnectOnion()} className="inp" placeholder="xxxx.onion:7900" style={{ marginBottom: 6, fontSize: 11, fontFamily: 'monospace' }} />
                       <button onClick={doConnectOnion} className="btn btn-purple" style={{ width: '100%', padding: 8 }} disabled={torConnState === 'connecting' || !onionInput.trim()}>
                         {torConnState === 'connecting' ? '⟳ Connecting via Tor…' : '🧅 Connect via Onion'}
                       </button>
@@ -2311,7 +2480,7 @@ export default function App() {
                 <div className="card" style={{ padding: 12, fontSize: 11, color: T.textDim, lineHeight: 1.8 }}>
                   <div style={{ color: T.textMid, fontWeight: 600, marginBottom: 4 }}>Quick reference</div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '2px 11px' }}>
-                    <span style={{ color: T.green, fontWeight: 700 }}>Same WiFi</span><span>Local IP:7000 — direct TCP, always works</span>
+                    <span style={{ color: T.green, fontWeight: 700 }}>Same WiFi</span><span>Local IP:7900 (default) — direct TCP, always works</span>
                     <span style={{ color: T.purple, fontWeight: 700 }}>Different Network</span><span>Start Tor → Generate onion link → share with peer</span>
                     <span style={{ color: T.accent, fontWeight: 700 }}>Security</span><span>ECDH P-256 + AES-256-GCM + TOFU on all connections</span>
                   </div>
@@ -2350,7 +2519,12 @@ export default function App() {
                       <Av name={selPeer.name} id={selPeer.id} size={32} online={selPeer.online} />
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <input value={selPeer.name || ''} onChange={e => { const n = e.target.value; setPeers(ps => ps.map(p => p.id === selPeer.id ? { ...p, name: n } : p)); setSelPeer(p => ({ ...p, name: n })) }} placeholder="Name this peer…" style={{ background: 'none', border: 'none', color: selPeer.name ? T.text : T.muted, fontFamily: 'inherit', fontSize: 13, fontStyle: selPeer.name ? 'normal' : 'italic', width: '100%', outline: 'none', fontWeight: 600, padding: 0 }} />
-                        <div style={{ fontSize: 10, color: selPeer.reconnecting ? T.amber : selPeer.online ? T.green : T.red, marginTop: 1 }}>{selPeer.reconnecting ? '⟳ Reconnecting…' : selPeer.online ? `🔒 E2E Encrypted${verifiedPeers.has(selPeer.id) ? ' · ✓ Verified' : ''}` : "⚠ Disconnected"}</div>
+                        <div style={{ fontSize: 10, color: selPeer.removedMe ? T.red : selPeer.reconnecting ? T.amber : selPeer.online ? T.green : T.red, marginTop: 1 }}>
+                          {selPeer.removedMe ? '🚫 This peer has removed you — messages cannot be sent'
+                            : selPeer.reconnecting ? '⟳ Reconnecting…'
+                            : selPeer.online ? `🔒 E2E Encrypted${verifiedPeers.has(selPeer.id) ? ' · ✓ Verified' : ''}`
+                            : '⚠ Disconnected'}
+                        </div>
                       </div>
                       {selPeer.online && <button onClick={() => setShowVerify({ fingerprint: peerFingerprints[selPeer.id], peerName: selPeer.name })} className="btn btn-xs" style={{ background: verifiedPeers.has(selPeer.id) ? T.green + '16' : T.accent + '12', border: `1px solid ${verifiedPeers.has(selPeer.id) ? T.green : T.accent}30`, color: verifiedPeers.has(selPeer.id) ? T.green : T.accent, flexShrink: 0 }}>{verifiedPeers.has(selPeer.id) ? '✓ Verified' : 'Verify'}</button>}
                       <button
@@ -2394,11 +2568,17 @@ export default function App() {
                       <button onClick={() => fileInp.current?.click()} className="btn btn-ghost btn-xs">📄 File</button>
                       <button onClick={() => folderInp.current?.click()} className="btn btn-ghost btn-xs">📂 Folder</button>
                       <button onClick={() => setShowCode(true)} className="btn btn-ghost btn-xs">{'</>'} Code</button>
+                      <div style={{ flex: 1 }} />
+                      <span
+                        title={sett.md ? 'Markdown ON — **bold**, *italic*, `code`, ```blocks```' : 'Markdown OFF — toggle in Settings'}
+                        style={{ fontSize: 9, padding: '1px 5px', borderRadius: 3, background: sett.md ? T.accent+'16' : T.panel, color: sett.md ? T.accent : T.muted, border: `1px solid ${sett.md ? T.accent+'30' : T.border}`, cursor: 'pointer' }}
+                        onClick={() => setSett2(p => ({ ...p, md: !p.md }))}
+                      >MD {sett.md ? 'ON' : 'OFF'}</span>
                     </div>}
                     {/* Input */}
                     <div style={{ padding: '8px 11px', borderTop: `1px solid ${T.border}`, background: T.surface, flexShrink: 0 }}>
                       <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
-                        <textarea value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend() } }} placeholder="Message… Shift+Enter = newline" rows={2} style={{ flex: 1, background: T.bg, border: `1px solid ${T.border}`, borderRadius: 8, padding: '7px 11px', color: T.text, fontFamily: 'inherit', fontSize: 13, resize: 'none', lineHeight: 1.5, transition: 'border-color .12s' }} onFocus={e => e.target.style.borderColor = T.accentDim} onBlur={e => e.target.style.borderColor = T.border} />
+                        <textarea value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend() } }} placeholder={selPeer.removedMe ? '🚫 Cannot send — this peer removed you' : 'Message… Shift+Enter = newline'} disabled={!!selPeer.removedMe} rows={2} style={{ flex: 1, background: T.bg, border: `1px solid ${T.border}`, borderRadius: 8, padding: '7px 11px', color: T.text, fontFamily: 'inherit', fontSize: 13, resize: 'none', lineHeight: 1.5, transition: 'border-color .12s' }} onFocus={e => e.target.style.borderColor = T.accentDim} onBlur={e => e.target.style.borderColor = T.border} />
                         <button onClick={doSend} style={{ width: 34, height: 34, borderRadius: 8, background: input.trim() ? T.accent : T.panel, border: `1px solid ${input.trim() ? T.accent : T.border}`, color: input.trim() ? '#0d1117' : T.textDim, fontSize: 15, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, transition: 'all .12s', fontWeight: 700 }}>↑</button>
                       </div>
                     </div>
@@ -2420,7 +2600,7 @@ export default function App() {
                     const txt = logs.map(l => `[${l.ts}] ${l.level}: ${l.msg} ${l.detail || ''}`).join('\n')
                     const blob = new Blob([txt], { type: 'text/plain' })
                     const url = URL.createObjectURL(blob); const a = document.createElement('a')
-                    a.href = url; a.download = 'p2n_security_log.txt'; a.click(); URL.revokeObjectURL(url)
+                    a.href = url; a.download = 'security_logs.txt'; a.click(); URL.revokeObjectURL(url)
                   }} className="btn btn-ghost btn-xs">Download .txt</button>
                   <button onClick={async () => { await window.ftps?.clearLogs(); setLogs([]); notify('Logs cleared') }} className="btn btn-ghost btn-xs">Clear</button>
                 </div>
@@ -2587,8 +2767,20 @@ export default function App() {
                   </div>
                 )}
                 {discoveredPeers.length === 0 && listenActive && (
-                  <div style={{ padding: '10px 12px', background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, fontSize: 11, color: T.textDim, marginBottom: 10 }}>
-                    📡 Scanning for nearby peers… (mDNS discovery active)
+                  <div style={{ padding: '10px 12px', background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, fontSize: 11, color: T.textDim, marginBottom: 10, lineHeight: 1.7 }}>
+                    <div>📡 Scanning for nearby peers on local network… (mDNS port 7476)</div>
+                    <div style={{ marginTop: 4, color: T.amber, fontSize: 10 }}>
+                      ⚠ If no peers appear: both devices must be on the same WiFi/LAN.
+                      On Windows, allow the app through Windows Defender Firewall, or run:
+                    </div>
+                    <div style={{ fontFamily: 'monospace', fontSize: 10, color: T.blue, marginTop: 3, background: T.bg, padding: '3px 7px', borderRadius: 4 }}>
+                      netsh advfirewall firewall add rule name="P2N mDNS" dir=in action=allow protocol=UDP localport=7476
+                    </div>
+                  </div>
+                )}
+                {discoveredPeers.length === 0 && !listenActive && (
+                  <div style={{ padding: '10px 12px', background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, fontSize: 11, color: T.muted, marginBottom: 10 }}>
+                    📡 mDNS discovery starts automatically when you click "Start Listening" in the Connect tab.
                   </div>
                 )}
               </div>
@@ -2695,14 +2887,31 @@ export default function App() {
                   <div className="sh">Network</div>
                   <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${T.border}` }}>
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 12, color: T.text }}>Default Listen Port</div>
-                      <div style={{ fontSize: 10, color: T.muted, marginTop: 1 }}>Saved permanently · other settings reset on close</div>
+                      <div style={{ fontSize: 12, color: T.text }}>Listen Port</div>
+                      <div style={{ fontSize: 10, color: T.muted, marginTop: 1 }}>
+                        {listenActive ? '⚠ Stop listening first to change port' : 'Enter port → press Save. This is the only place to change port.'}
+                      </div>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <input type="number" min="1024" max="65535" value={listenPort} onChange={e => setListenPort(e.target.value)} className="inp" style={{ width: 80, padding: '4px 8px', fontSize: 12, textAlign: 'center' }} disabled={listenActive} />
-                      {!listenActive && (
-                        <button onClick={async () => { const r = await window.ftps?.savePort(parseInt(listenPort) || 7000); if (r?.ok) notify(`Port ${r.port} saved`, 'ok') }} className="btn btn-green btn-xs" title="Save this port permanently">💾</button>
-                      )}
+                      <input
+                        type="number" min="1024" max="65535"
+                        value={listenPort}
+                        onChange={e => setListenPort(e.target.value)}
+                        className="inp"
+                        style={{ width: 80, padding: '4px 8px', fontSize: 12, textAlign: 'center' }}
+                        disabled={listenActive}
+                      />
+                      <button
+                        onClick={async () => {
+                          const p = Math.max(1024, Math.min(65535, parseInt(listenPort) || 7000))
+                          setListenPort(String(p))
+                          const r = await window.ftps?.savePort(p)
+                          if (r?.ok) notify(`Port ${r.port} saved — takes effect on next session start`, 'ok')
+                        }}
+                        className="btn btn-green btn-xs"
+                        disabled={listenActive}
+                        title="Save port permanently"
+                      >💾 Save</button>
                     </div>
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0' }}>
@@ -2745,13 +2954,23 @@ export default function App() {
                     </button>
                   </div>
                   {/* A1 FIX: scanFiles toggle */}
-                  <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${T.border}` }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: T.text }}>Security scan incoming files</div>
                       <div style={{ fontSize: 10, color: T.muted }}>Detect threats in PDFs, images, polyglot files</div>
                     </div>
                     <button onClick={() => setSett2(p => ({ ...p, scanFiles: !p.scanFiles }))} className="btn btn-xs" style={{ background: sett.scanFiles ? T.green + '16' : T.panel, border: `1px solid ${sett.scanFiles ? T.green : T.border}`, color: sett.scanFiles ? T.green : T.textDim, minWidth: 36 }}>
                       {sett.scanFiles ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                  {/* EXIF / Metadata strip on send */}
+                  <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0' }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: T.text }}>Strip metadata before sending</div>
+                      <div style={{ fontSize: 10, color: T.muted }}>Removes EXIF, XMP, IPTC from JPG/PNG · /Info from PDF · Default OFF</div>
+                    </div>
+                    <button onClick={() => setSett2(p => ({ ...p, exifStrip: !p.exifStrip }))} className="btn btn-xs" style={{ background: sett.exifStrip ? T.green + '16' : T.panel, border: `1px solid ${sett.exifStrip ? T.green : T.border}`, color: sett.exifStrip ? T.green : T.textDim, minWidth: 36 }}>
+                      {sett.exifStrip ? 'ON' : 'OFF'}
                     </button>
                   </div>
                 </div>
@@ -2773,6 +2992,31 @@ export default function App() {
                       }} className="btn btn-ghost btn-xs" style={{ color: T.green }}>Unblock</button>
                     </div>
                   ))}
+                </div>
+                {/* Persistent Data Settings */}
+                <div className="card" style={{ padding: 14, marginBottom: 11, border: `1px solid ${sett.persistData ? T.amber + '40' : T.border}` }}>
+                  <div className="sh">Data Persistence</div>
+                  <div style={{ display: 'flex', alignItems: 'flex-start', padding: '8px 0', gap: 10 }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: T.text }}>Keep identity &amp; peer data between sessions</div>
+                      <div style={{ fontSize: 10, color: T.muted, marginTop: 3, lineHeight: 1.6 }}>
+                        <strong style={{ color: sett.persistData ? T.amber : T.textDim }}>OFF (default):</strong> identity.json, known_peers.json, blocked_peers.json are deleted on exit. Fresh start every time.<br />
+                        <strong style={{ color: sett.persistData ? T.green : T.textDim }}>ON:</strong> Files survive app restarts. Peers stay trusted, blocked list persists.
+                      </div>
+                    </div>
+                    <button
+                      onClick={async () => {
+                        const next = !sett.persistData
+                        setSett2(p => ({ ...p, persistData: next }))
+                        await window.ftps?.setPersistSettings?.(next)
+                        notify(next ? 'Data will persist across sessions' : 'Data cleared on exit (default)', next ? 'ok' : 'info')
+                      }}
+                      className="btn btn-xs"
+                      style={{ background: sett.persistData ? T.amber + '16' : T.panel, border: `1px solid ${sett.persistData ? T.amber : T.border}`, color: sett.persistData ? T.amber : T.textDim, minWidth: 36, flexShrink: 0 }}
+                    >
+                      {sett.persistData ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
                 </div>
                 <div className="card" style={{ padding: 14, marginBottom: 11 }}>
                   <div className="sh">Session</div>

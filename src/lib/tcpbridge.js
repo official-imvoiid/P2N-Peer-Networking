@@ -6,6 +6,11 @@
 export class TCPBridge {
   constructor(handlers = {}) {
     this.h = handlers
+    // Cache for folder-file blobs/tmpPaths: fid → { blob, tmpPath }
+    // main.js emits ftps:file-done (with data) then ftps:folder-file-done (metadata only)
+    // for the same file. We stash the payload here so onFolderFileDone gets both.
+    this._folderFileCache = new Map()
+
     this._unsubs = [
       window.ftps.on('ftps:peer-connected', ({ peerId, peerName, fingerprint, identityKey, tofu, tofuDetail }) => {
         this.h.onOpen?.(peerId, peerName, fingerprint, tofu, tofuDetail, identityKey)
@@ -16,8 +21,20 @@ export class TCPBridge {
       window.ftps.on('ftps:file-start',   ({ peerId, meta }) => this.h.onFileStart?.(peerId, meta)),
       window.ftps.on('ftps:file-progress',({ peerId, fid, pct }) => this.h.onFileProg?.(peerId, fid, pct)),
       window.ftps.on('ftps:file-done', ({ peerId, meta, dataB64, tmpPath }) => {
-        // BUG-06 fix: large files (>32MB) arrive with tmpPath and no dataB64
-        // Renderer shows a Save button; actual file stays on disk until user saves
+        // If this file belongs to a folder transfer, stash blob/tmpPath for
+        // ftps:folder-file-done (which arrives right after) then return early —
+        // App.jsx's onFileDone skips folder files anyway.
+        if (meta.folderFid !== undefined) {
+          if (tmpPath && !dataB64) {
+            this._folderFileCache.set(meta.fid, { blob: null, tmpPath })
+          } else if (dataB64) {
+            const bytes = Uint8Array.from(atob(dataB64), c => c.charCodeAt(0))
+            const blob = new Blob([bytes], { type: meta.mime || 'application/octet-stream' })
+            this._folderFileCache.set(meta.fid, { blob, tmpPath: null })
+          }
+          return
+        }
+        // BUG-06 fix: large standalone files (>32MB) arrive with tmpPath and no dataB64
         if (tmpPath && !dataB64) {
           this.h.onFileDone?.(peerId, meta, null, tmpPath)
           return
@@ -26,14 +43,35 @@ export class TCPBridge {
         this.h.onFileDone?.(peerId, meta, new Blob([bytes], { type: meta.mime || 'application/octet-stream' }), null)
       }),
       window.ftps.on('ftps:send-progress',({ peerId, fid, pct }) => this.h.onSendProg?.(peerId, fid, pct)),
+
+      // ── Folder protocol events ──────────────────────────────────────────────
+      // main.js emits this when a folder_manifest message arrives from the sender
+      window.ftps.on('ftps:folder-manifest', ({ peerId, manifest }) => {
+        this.h.onFolderManifest?.(peerId, manifest)
+      }),
+
+      // main.js emits this immediately after ftps:file-done for every file that
+      // belongs to a folder transfer. We retrieve the cached blob/tmpPath here.
+      window.ftps.on('ftps:folder-file-done', ({ peerId, folderFid, fileIndex, meta }) => {
+        const cached = this._folderFileCache.get(meta.fid) || { blob: null, tmpPath: null }
+        this._folderFileCache.delete(meta.fid)
+        this.h.onFolderFileDone?.(peerId, folderFid, fileIndex, meta, cached.blob, cached.tmpPath)
+      }),
+
+      // main.js emits this when the sender's folder_complete message is received
+      window.ftps.on('ftps:folder-complete', ({ peerId, fid, name, fileCount }) => {
+        this.h.onFolderComplete?.(peerId, fid, name, fileCount)
+      }),
     ]
   }
   async sendMsg(peerId, payload) {
     const msg = typeof payload === 'string' ? { type:'chat', text:payload, t:Date.now() } : payload
     return (await window.ftps.send(peerId, msg)).ok
   }
-  async sendFile(peerId, file, onProg) {
-    const fid = crypto.randomUUID()
+  async sendFile(peerId, file, onProg, fidOverride) {
+    // fidOverride lets the caller control the fid so it matches the UI message id,
+    // which fixes the revoke chain: sender message id === wire fid === receiver message id prefix.
+    const fid = fidOverride || crypto.randomUUID()
     const dataB64 = await fileToBase64(file)
     const unsub = window.ftps.on('ftps:send-progress', ({ peerId:pid, fid:f2, pct }) => {
       if (pid === peerId && f2 === fid) onProg?.(pct)
@@ -60,7 +98,7 @@ export class TCPBridge {
   }
   disconnect(peerId) { window.ftps.disconnect(peerId) }
   closeAll()         { window.ftps.closeAll() }
-  destroy()          { this._unsubs.forEach(f => f?.()); this._unsubs = [] }
+  destroy()          { this._unsubs.forEach(f => f?.()); this._unsubs = []; this._folderFileCache.clear() }
 }
 
 function fileToBase64(file) {
