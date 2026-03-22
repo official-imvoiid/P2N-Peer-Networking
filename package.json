@@ -1,7 +1,7 @@
 {
   "name": "ftps",
   "version": "2.0.0",
-  "description": "FTPS \u2014 Encrypted P2P File Transfer & Chat. No servers. No WebRTC.",
+  "description": "FTPS — Encrypted P2P File Transfer & Chat. No servers. No WebRTC.",
   "private": true,
   "main": "electron/main.js",
   "scripts": {
@@ -26,7 +26,7 @@
   "build": {
     "appId": "com.ftps.app",
     "productName": "FTPS",
-    "copyright": "Copyright \u00a9 2025 FTPS",
+    "copyright": "Copyright © 2025 FTPS",
     "files": [
       "dist/**/*",
       "electron/**/*",

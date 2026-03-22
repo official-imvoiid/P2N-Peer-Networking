@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('ftps', {
   setIdentity: (name, nodeId) => ipcRenderer.invoke('ftps:set-identity', { name, nodeId }),
+  updateName: (name) => ipcRenderer.invoke('ftps:update-name', { name }),
   clearSession: () => ipcRenderer.invoke('ftps:clear-session'),
   getSession: () => ipcRenderer.invoke('ftps:get-session'),
   getLocalIPs: () => ipcRenderer.invoke('ftps:get-local-ips'),
@@ -67,6 +68,19 @@ contextBridge.exposeInMainWorld('ftps', {
   blockPeer: (peerId, peerName, reason) => ipcRenderer.invoke('ftps:block-peer', { peerId, peerName, reason }),
   unblockPeer: (peerId) => ipcRenderer.invoke('ftps:unblock-peer', { peerId }),
   getBlocked: () => ipcRenderer.invoke('ftps:get-blocked'),
+
+  // FIX #2/#5: Streaming file send (path-based, no RAM limit)
+  sendFileStream: (peerId, fid, name, size, mime, filePath, extraMeta) =>
+    ipcRenderer.invoke('ftps:send-file-stream', { peerId, fid, name, size, mime, filePath, extraMeta }),
+  sendFileInFolderStream: (peerId, fid, name, size, mime, filePath, folderFid, relPath, idx) =>
+    ipcRenderer.invoke('ftps:send-file-in-folder', { peerId, fid, name, size, mime, filePath, folderFid, folderRelPath: relPath, fileIndex: idx }),
+  // FIX #3: Rename info
+  getRenameInfo: () => ipcRenderer.invoke('ftps:get-rename-info'),
+  // FIX #10: Identity password (encrypted persistent identity)
+  checkIdentityEncrypted: () => ipcRenderer.invoke('ftps:check-identity-encrypted'),
+  loadIdentityWithPassword: (password) => ipcRenderer.invoke('ftps:load-identity-with-password', { password }),
+  setIdentityPassword: (password) => ipcRenderer.invoke('ftps:set-identity-password', { password }),
+  removeIdentityPassword: () => ipcRenderer.invoke('ftps:remove-identity-password'),
 
   on: (channel, cb) => {
     const allowed = [

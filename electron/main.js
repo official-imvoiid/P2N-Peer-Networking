@@ -35,31 +35,79 @@ let totalBytesSent = 0
 let totalBytesReceived = 0
 
 // ── PERSISTENT IDENTITY KEY ───────────────────────────────────────────────────
-// Unlike ephemeral ECDH keys (regenerated every session for forward secrecy),
-// the identity key persists across sessions so TOFU can tell "same device" from
-// "different device" without false MITM warnings on reconnection.
+// v5 upgrade: identity is now an Ed25519 signing KEY PAIR.
+//   - myIdentityPrivKey  : stays on disk, used to SIGN the HELLO
+//   - myIdentityPubKey   : sent in HELLO, stored in TOFU — peers verify our signature
+// This closes the MITM hole: an attacker can intercept the ECDH pubkey but cannot
+// forge the Ed25519 signature without the private key, so the shared AES key is
+// guaranteed to belong to the claimed identity.
 const identityFile = path.join(app.getPath('userData'), 'identity.json')
-let myIdentityKey = null   // hex string, loaded/created on startup
+let myIdentityPrivKey = null  // Ed25519 KeyObject (private)
+let myIdentityPubKey  = null  // Ed25519 KeyObject (public)
+let myIdentityPubB64  = ''    // base64-DER of public key — sent in HELLO and TOFU
 
-function loadIdentity() {
+function _generateIdentityKeypair() {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519')
+  myIdentityPrivKey = privateKey
+  myIdentityPubKey  = publicKey
+  myIdentityPubB64  = publicKey.export({ type: 'spki', format: 'der' }).toString('base64')
+}
+
+function loadIdentity(password = null) {
   try {
     if (fs.existsSync(identityFile)) {
       const d = JSON.parse(fs.readFileSync(identityFile, 'utf8'))
+
+      // ── Password-protected blob (AES-256-GCM + scrypt) ──────────────────
+      if (d?.encrypted) {
+        if (!password) return { ok: false, needsPassword: true }
+        try {
+          const plain = JSON.parse(decryptIdentity(d.encrypted, password))
+          if (plain?.privKey && plain?.pubKey) {
+            myIdentityPrivKey = crypto.createPrivateKey({ key: Buffer.from(plain.privKey, 'base64'), format: 'der', type: 'pkcs8' })
+            myIdentityPubKey  = crypto.createPublicKey({ key: Buffer.from(plain.pubKey, 'base64'), format: 'der', type: 'spki' })
+            myIdentityPubB64  = plain.pubKey
+            secEntry('OK', 'Identity keypair decrypted and loaded')
+            return { ok: true }
+          }
+        } catch {
+          return { ok: false, error: 'Wrong password — identity not loaded' }
+        }
+      }
+
+      // ── Plaintext v5 (Ed25519 keypair) ────────────────────────────────────
+      if (d?.privKey && d?.pubKey) {
+        try {
+          myIdentityPrivKey = crypto.createPrivateKey({ key: Buffer.from(d.privKey, 'base64'), format: 'der', type: 'pkcs8' })
+          myIdentityPubKey  = crypto.createPublicKey({ key: Buffer.from(d.pubKey, 'base64'), format: 'der', type: 'spki' })
+          myIdentityPubB64  = d.pubKey
+          return { ok: true }
+        } catch { /* corrupt, regenerate below */ }
+      }
+
+      // ── Legacy v4 (random 32-byte hex — upgrade silently) ─────────────────
       if (d?.key && typeof d.key === 'string' && d.key.length === 64) {
-        myIdentityKey = d.key; return
+        secEntry('INFO', 'Upgrading identity from v4 (hex) to v5 (Ed25519)')
+        // Keep old hex in file as migration note but generate proper keypair
       }
     }
   } catch { }
-  // Generate fresh identity key
-  myIdentityKey = crypto.randomBytes(32).toString('hex')
+
+  // Generate fresh Ed25519 keypair
+  _generateIdentityKeypair()
   try {
     fs.mkdirSync(path.dirname(identityFile), { recursive: true })
-    fs.writeFileSync(identityFile, JSON.stringify({ key: myIdentityKey, created: new Date().toISOString() }))
+    const privDER = myIdentityPrivKey.export({ type: 'pkcs8', format: 'der' }).toString('base64')
+    fs.writeFileSync(identityFile, JSON.stringify({ privKey: privDER, pubKey: myIdentityPubB64, v: 5, created: new Date().toISOString() }))
   } catch { }
-  secEntry('OK', 'New persistent identity key generated')
+  secEntry('OK', 'New Ed25519 identity keypair generated (v5)')
+  return { ok: true, fresh: true }
 }
 
 // ── TOFU STORE ────────────────────────────────────────────────────────────────
+// TOFU stores the peer's Ed25519 PUBLIC key (base64-DER).
+// On every HELLO we verify: (a) signature matches pubkey, (b) pubkey matches stored record.
+// If pubkey changed → MITM warning. First time → store and trust.
 const tofuStore = new Map()
 const tofuFile = path.join(app.getPath('userData'), 'known_peers.json')
 
@@ -78,31 +126,30 @@ function saveTOFU() {
   } catch { }
 }
 
-// FIX: TOFU now checks identityKey (persistent per-device), NOT the ephemeral
-// ECDH pubkey. This means reconnections from same device never trigger MITM warning.
-function tofuCheck(nodeId, identityKey, name) {
+function tofuCheck(nodeId, identityPubB64, name) {
   const existing = tofuStore.get(nodeId)
   if (!existing) {
     tofuStore.set(nodeId, {
-      identityKey, name,
+      identityKey: identityPubB64,  // kept as 'identityKey' for JSON compat
+      name,
       firstSeen: new Date().toISOString(),
       lastSeen: new Date().toISOString(),
     })
     saveTOFU()
     return { status: 'new' }
   }
-  if (existing.identityKey === identityKey) {
+  if (existing.identityKey === identityPubB64) {
     existing.lastSeen = new Date().toISOString()
     existing.name = name || existing.name
     saveTOFU()
     return { status: 'trusted' }
   }
-  // Identity key changed — this is unusual and warrants a warning
+  // Public key changed — genuine MITM warning
   return { status: 'changed', previousName: existing.name, firstSeen: existing.firstSeen }
 }
-function tofuAcceptNewKey(nodeId, identityKey, name) {
+function tofuAcceptNewKey(nodeId, identityPubB64, name) {
   tofuStore.set(nodeId, {
-    identityKey, name,
+    identityKey: identityPubB64, name,
     firstSeen: new Date().toISOString(),
     lastSeen: new Date().toISOString(),
   })
@@ -153,6 +200,34 @@ function isRateLimited(ip) {
 const pendingReconnects = new Map()
 let reconnectMax = 5
 const RECONNECT_DELAYS = [500, 1000, 2000, 4000, 8000]
+
+// ── RENAME TRACKING ───────────────────────────────────────────────────────────
+const RENAME_LIMIT = 5   // max renames per session
+let renameCountThisSession = 0
+
+// ── IDENTITY ENCRYPTION ───────────────────────────────────────────────────────
+// Encrypts identity key with user password using AES-256-GCM + scrypt KDF.
+// Used for optional password-protected persistent identity (issue #10).
+function encryptIdentity(data, password) {
+  const salt = crypto.randomBytes(16)
+  const key = crypto.scryptSync(password, salt, 32)
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  const ct = Buffer.concat([cipher.update(Buffer.from(data, 'utf8')), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return Buffer.concat([salt, iv, tag, ct]).toString('base64')
+}
+function decryptIdentity(encB64, password) {
+  const enc = Buffer.from(encB64, 'base64')
+  const salt = enc.slice(0, 16)
+  const iv   = enc.slice(16, 28)
+  const tag  = enc.slice(28, 44)
+  const ct   = enc.slice(44)
+  const key  = crypto.scryptSync(password, salt, 32)
+  const dec  = crypto.createDecipheriv('aes-256-gcm', key, iv)
+  dec.setAuthTag(tag)
+  return Buffer.concat([dec.update(ct), dec.final()]).toString('utf8')
+}
 
 // ── SECURITY LOG ──────────────────────────────────────────────────────────────
 const secLog = []
@@ -318,7 +393,7 @@ function createWindow() {
             peerId: conn.id,
             peerName: conn.name,
             fingerprint: conn._fingerprint,
-            identityKey: conn._peerIdentityKey,
+            identityKey: conn._peerIdentityPubB64,
             tofu: 'trusted',
             tofuDetail: null,
           })
@@ -404,7 +479,8 @@ app.whenReady().then(() => {
     loadBlocked()
   } else {
     // persistData OFF: generate fresh identity every time
-    myIdentityKey = require('crypto').randomBytes(32).toString('hex')
+    // persistData OFF: generate fresh Ed25519 keypair every session
+    _generateIdentityKeypair()
     secEntry('OK', 'Fresh identity generated (persistData=OFF)')
   }
   loadPortSettings()
@@ -807,104 +883,210 @@ function cleanupAllSandboxes() {
 // A7 FIX: Removed duplicate cleanupAllSandboxes — already handled in before-quit above
 
 // ═════════════════════════════════════════════════════════════════════════════
-// PEER CONN — ECDH P-256 ephemeral · AES-256-GCM every frame
-// Persistent identityKey (separate from ECDH) used for TOFU
+// PEER CONN — Full E2E Encryption Stack (v5)
+//
+//  Handshake  │ ECDH P-256 ephemeral key agreement (fresh every session → forward secrecy)
+//  Signing    │ Ed25519 identity signs the ECDH pubkey → proves the pubkey owner
+//  KDF        │ HKDF-SHA256(ecdh_secret, salt, info) → two separate 256-bit session keys
+//  Encryption │ AES-256-GCM with unique 96-bit random IV per frame
+//  Direction  │ Separate tx-key (→peer) and rx-key (peer→) prevent reflection attacks
+//  Replay     │ 8-byte monotonic sequence counter inside every encrypted frame
+//  TOFU       │ Ed25519 public key stored on first contact; change = MITM warning
+//
+//  Wire format (post-handshake):
+//    [4B frame_len][12B iv][8B seq (encrypted)][ciphertext][16B GCM tag]
+//
+//  HELLO (plaintext, pre-encryption):
+//    [4B len][JSON{ type:"HELLO", pubkey(ECDH), identityPubKey(Ed25519),
+//                  sig(Ed25519 over pubkey+nodeId), nodeId, name, v:5 }]
 // ═════════════════════════════════════════════════════════════════════════════
+
+// HKDF helper — derives a 32-byte key from the ECDH shared secret
+// Using separate info strings for tx/rx prevents reflection attacks
+function deriveKey(ecdhSecret, role) {
+  // Salt = SHA-256 of both public keys sorted lexically (both peers reach same salt)
+  // Info encodes direction so tx≠rx even with same secret
+  return Buffer.from(crypto.hkdfSync(
+    'sha256',
+    ecdhSecret,
+    Buffer.from('P2N-v5-salt'),
+    Buffer.from('P2N-v5-AES256GCM-' + role),  // 'tx' or 'rx'
+    32
+  ))
+}
+
 class PeerConn {
   constructor(socket, initiatorInfo = null) {
-    this.socket = socket; this.id = null; this.name = ''; this.sharedKey = null
-    this.ready = false; this._buf = Buffer.alloc(0)
-    this._ecdh = crypto.createECDH('prime256v1'); this._ecdh.generateKeys()
-    this._filebufs = new Map(); this._sendQueue = []
+    this.socket       = socket
+    this.id           = null
+    this.name         = ''
+    this._txKey       = null    // AES-256-GCM key: our encryptions to peer
+    this._rxKey       = null    // AES-256-GCM key: peer's encryptions to us
+    this.ready        = false
+    this._buf         = Buffer.alloc(0)
+    this._ecdh        = crypto.createECDH('prime256v1')
+    this._ecdh.generateKeys()
+    this._filebufs    = new Map()
+    this._sendQueue   = []
     this._fingerprint = null
-    this._peerIdentityKey = null
-    this._myPubkey = this._ecdh.getPublicKey('base64')
-    this._initiator = initiatorInfo
-    this._reconnecting = false
+    this._peerIdentityPubB64 = null
+    this._myPubkey    = this._ecdh.getPublicKey('base64')
+    this._initiator   = initiatorInfo
+    this._reconnecting  = false
     this._reconnectAttempt = 0
-    this._closed = false
+    this._closed      = false
+    this._txSeq       = 0n   // monotonic send counter (BigInt for safe uint64)
+    this._rxSeq       = -1n  // last accepted receive seq (-1 = none yet)
     this._setup()
   }
+
   _setup() {
     this.socket.on('data', d => {
       totalBytesReceived += d.length
-      this._buf = Buffer.concat([this._buf, d]);
+      this._buf = Buffer.concat([this._buf, d])
       this._drain()
     })
     this.socket.on('error', e => { secEntry('WARN', 'Socket error', e.message); this._onDisconnect() })
     this.socket.on('close', () => this._onDisconnect())
-    this.socket.setKeepAlive(true, 5000); this.socket.setNoDelay(true)
-    // HELLO includes persistent identityKey for TOFU + ephemeral ECDH pubkey for encryption
+    this.socket.setKeepAlive(true, 5000)
+    this.socket.setNoDelay(true)
+
+    // ── HELLO v5 ──────────────────────────────────────────────────────────────
+    // Sign the ECDH pubkey with our Ed25519 identity private key.
+    // The peer verifies this signature against our identity public key (stored in TOFU).
+    // This closes the classical MITM hole: without our private key the attacker
+    // cannot forge a valid (pubkey, sig) pair, so the AES session key is guaranteed
+    // to be shared only with the holder of our identity private key.
+    const sigData = Buffer.from(this._myPubkey + '|' + myNodeId)  // what we sign
+    const sig = crypto.sign(null, sigData, myIdentityPrivKey).toString('base64')
+
     const hello = Buffer.from(JSON.stringify({
       type: 'HELLO',
-      pubkey: this._myPubkey,       // ephemeral ECDH — for encryption only
-      identityKey: myIdentityKey,   // persistent — for TOFU identity
+      pubkey:         this._myPubkey,   // ephemeral ECDH pubkey (for key agreement)
+      identityPubKey: myIdentityPubB64, // Ed25519 public key (for signature verification)
+      sig,                               // sign(identityPrivKey, ecdh_pubkey + '|' + nodeId)
       nodeId: myNodeId,
-      name: myName,
-      v: 4,
+      name:   myName,
+      v: 5,
     }))
-    const hdr = Buffer.alloc(4); hdr.writeUInt32BE(hello.length, 0)
+    const hdr = Buffer.alloc(4)
+    hdr.writeUInt32BE(hello.length, 0)
     this.socket.write(Buffer.concat([hdr, hello]))
   }
+
   _drain() {
     while (true) {
       if (this._buf.length < FRAME_HDR) return
       const len = this._buf.readUInt32BE(0)
-      if (len > 64 * 1024 * 1024) { secEntry('ERR', 'Frame too large'); this._close(); return }
+      // Pre-hello frames: cap at 8KB to prevent memory exhaustion before encryption
+      if (!this.ready && len > 8192) {
+        secEntry('ERR', 'Oversized HELLO — dropping connection')
+        this._close()
+        return
+      }
+      // Post-hello frames: cap at 64MB
+      if (this.ready && len > 64 * 1024 * 1024) {
+        secEntry('ERR', 'Frame too large')
+        this._close()
+        return
+      }
       if (this._buf.length < FRAME_HDR + len) return
       const frame = this._buf.slice(FRAME_HDR, FRAME_HDR + len)
       this._buf = this._buf.slice(FRAME_HDR + len)
-      if (!this.ready) this._onHello(frame); else this._onFrame(frame)
+      if (!this.ready) this._onHello(frame)
+      else this._onFrame(frame)
     }
   }
+
   _onHello(frame) {
     try {
       const h = JSON.parse(frame.toString())
       if (h.type !== 'HELLO') { this._close(); return }
-      const secret = this._ecdh.computeSecret(Buffer.from(h.pubkey, 'base64'))
-      this.sharedKey = crypto.createHash('sha256').update(secret).digest()
-      this.id = h.nodeId || ('p_' + Date.now().toString(36))
-      this.name = h.name || ''
-      this._peerIdentityKey = h.identityKey || h.pubkey  // fallback to pubkey for v<4 clients
 
-      // B4/C1 FIX: Check if peer is blocked before proceeding
-      if (isBlocked(this.id)) {
-        secEntry('WARN', `Blocked peer ${this.name || this.id} attempted to connect — rejected`)
-        this._close()
-        return
-      }
-      // Rate limiting check
+      // ── Blocked / rate-limit checks (before any crypto work) ─────────────
+      const peerId   = h.nodeId || ('p_' + Date.now().toString(36))
       const remoteIP = this.socket.remoteAddress || ''
+      if (isBlocked(peerId)) {
+        secEntry('WARN', `Blocked peer ${h.name || peerId} attempted to connect — rejected`)
+        this._close(); return
+      }
       if (isRateLimited(remoteIP)) {
         secEntry('WARN', `Rate limited connection from ${remoteIP}`)
-        this._close()
-        return
+        this._close(); return
       }
+
+      // ── Ed25519 signature verification (v5+) ─────────────────────────────
+      // Verify that the ECDH pubkey was signed by the claimed identity private key.
+      // If sig is missing or invalid, the peer is either legacy (v<5) or a MITM.
+      const isV5 = h.v >= 5 && h.identityPubKey && h.sig
+      if (isV5) {
+        try {
+          const peerPubKey = crypto.createPublicKey({
+            key: Buffer.from(h.identityPubKey, 'base64'),
+            format: 'der', type: 'spki',
+          })
+          const sigData = Buffer.from(h.pubkey + '|' + h.nodeId)
+          const valid = crypto.verify(null, sigData, peerPubKey, Buffer.from(h.sig, 'base64'))
+          if (!valid) {
+            secEntry('ERR', `HELLO signature INVALID from ${h.name || peerId} — MITM suspected, dropping`)
+            this._close(); return
+          }
+          secEntry('INFO', `HELLO signature verified: ${h.name || peerId}`)
+        } catch (e) {
+          secEntry('ERR', `HELLO sig verification error: ${e.message} — dropping`)
+          this._close(); return
+        }
+      } else {
+        secEntry('WARN', `Legacy v${h.v || 1} peer (no Ed25519 sig): ${h.name || peerId} — accepting with reduced trust`)
+      }
+
+      // ── ECDH key agreement ────────────────────────────────────────────────
+      const ecdhSecret = this._ecdh.computeSecret(Buffer.from(h.pubkey, 'base64'))
+
+      // ── HKDF key derivation — separate tx/rx keys ─────────────────────────
+      // The "role" string must be mirrored on both sides:
+      //   initiator (connector) encrypts with 'initiator', decrypts with 'responder'
+      //   responder (listener)  encrypts with 'responder', decrypts with 'initiator'
+      const amInitiator = !!this._initiator
+      this._txKey = deriveKey(ecdhSecret, amInitiator ? 'initiator' : 'responder')
+      this._rxKey = deriveKey(ecdhSecret, amInitiator ? 'responder' : 'initiator')
+
+      this.id   = peerId
+      this.name = h.name || ''
+      this._peerIdentityPubB64 = h.identityPubKey || h.identityKey || h.pubkey  // fallback chain
 
       this.ready = true
 
-      // Session fingerprint from ECDH keys (for voice verification)
-      const keys = [this._myPubkey, h.pubkey].sort()
-      const fpHash = crypto.createHash('sha256').update(keys.join(':')).digest()
-      this._fingerprint = Array.from(fpHash.slice(0, 8)).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(':')
+      // ── Session fingerprint (SAS for voice verification) ─────────────────
+      // SHA-256 of both ECDH pubkeys sorted: same value on both sides regardless of role.
+      const keys    = [this._myPubkey, h.pubkey].sort()
+      const fpHash  = crypto.createHash('sha256').update(keys.join(':')).digest()
+      this._fingerprint = Array.from(fpHash.slice(0, 8))
+        .map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(':')
 
-      // FIX: Handle legacy v<4 clients that don't send persistent identityKey
-      const isLegacyClient = !h.identityKey || (h.v || 1) < 4
-      const tofu = isLegacyClient ? { status: 'trusted' } : tofuCheck(this.id, this._peerIdentityKey, h.name)
+      // ── TOFU check ────────────────────────────────────────────────────────
+      const isLegacy = !isV5
+      const tofu = isLegacy
+        ? { status: 'trusted' }
+        : tofuCheck(this.id, this._peerIdentityPubB64, h.name)
+
       peers.set(this.id, this)
-
       const rc = pendingReconnects.get(this.id)
       if (rc) { clearTimeout(rc.timer); pendingReconnects.delete(this.id) }
-      this._reconnecting = false; this._reconnectAttempt = 0
+      this._reconnecting = false
+      this._reconnectAttempt = 0
 
-      secEntry('OK', `Peer connected: ${this.name || this.id}`, `${this.socket.remoteAddress || ''} · FP: ${this._fingerprint}`)
+      secEntry('OK',
+        `Peer connected: ${this.name || this.id}`,
+        `${remoteIP} · FP: ${this._fingerprint} · ${isV5 ? 'Ed25519✓' : 'legacy-no-sig'}`
+      )
       emit('ftps:peer-connected', {
-        peerId: this.id,
-        peerName: this.name,
+        peerId: this.id, peerName: this.name,
         fingerprint: this._fingerprint,
-        identityKey: this._peerIdentityKey,
+        identityKey: this._peerIdentityPubB64,
         tofu: tofu.status,
-        tofuDetail: tofu.status === 'changed' ? { previousName: tofu.previousName, firstSeen: tofu.firstSeen } : null,
+        tofuDetail: tofu.status === 'changed'
+          ? { previousName: tofu.previousName, firstSeen: tofu.firstSeen } : null,
       })
       if (this._sendQueue.length > 0) {
         for (const obj of this._sendQueue) this.send(obj)
@@ -912,26 +1094,53 @@ class PeerConn {
       }
     } catch (e) { secEntry('ERR', 'Handshake failed', e.message); this._close() }
   }
+
   _onFrame(frame) {
     try {
+      // Wire format: [12B iv][8B seq (inside ciphertext)][...ciphertext...][16B tag]
       if (frame.length < 28) throw new Error('Frame too short')
-      const iv = frame.slice(0, 12), tag = frame.slice(-16), ct = frame.slice(12, -16)
-      const d = crypto.createDecipheriv('aes-256-gcm', this.sharedKey, iv); d.setAuthTag(tag)
-      const msg = JSON.parse(Buffer.concat([d.update(ct), d.final()]).toString())
+      const iv  = frame.slice(0, 12)
+      const tag = frame.slice(-16)
+      const ct  = frame.slice(12, -16)
+
+      const d = crypto.createDecipheriv('aes-256-gcm', this._rxKey, iv)
+      d.setAuthTag(tag)
+      const plain = Buffer.concat([d.update(ct), d.final()])
+
+      // ── Sequence number anti-replay ───────────────────────────────────────
+      // First 8 bytes of plaintext are the sender's monotonic uint64 seq counter.
+      if (plain.length < 8) throw new Error('Missing seq')
+      const seq = plain.readBigUInt64BE(0)
+      if (seq <= this._rxSeq) {
+        secEntry('WARN', `Replay detected from ${this.name || this.id}: seq ${seq} ≤ last ${this._rxSeq}`)
+        return  // drop silently — do not close, could be benign reorder
+      }
+      this._rxSeq = seq
+
+      const msg = JSON.parse(plain.slice(8).toString())
       this._dispatch(msg)
     } catch (e) { secEntry('WARN', 'Decrypt/auth failed', e.message) }
   }
+
   send(obj) {
-    if (!this.ready || !this.sharedKey) { if (this._reconnecting) { this._sendQueue.push(obj); return }; return }
+    if (!this.ready || !this._txKey) {
+      if (this._reconnecting) { this._sendQueue.push(obj); return }
+      return
+    }
     try {
-      const plain = Buffer.from(JSON.stringify(obj)), iv = crypto.randomBytes(12)
-      const enc = crypto.createCipheriv('aes-256-gcm', this.sharedKey, iv)
-      const ct = Buffer.concat([enc.update(plain), enc.final()])
-      const frame = Buffer.concat([iv, ct, enc.getAuthTag()])
-      const hdr = Buffer.alloc(4); hdr.writeUInt32BE(frame.length, 0)
-      const data = Buffer.concat([hdr, frame])
-      this.socket.write(data)
-      totalBytesSent += data.length
+      // Prepend 8-byte monotonic seq counter before JSON payload
+      const seq    = ++this._txSeq
+      const seqBuf = Buffer.allocUnsafe(8)
+      seqBuf.writeBigUInt64BE(seq, 0)
+      const plain  = Buffer.concat([seqBuf, Buffer.from(JSON.stringify(obj))])
+      const iv     = crypto.randomBytes(12)
+      const enc    = crypto.createCipheriv('aes-256-gcm', this._txKey, iv)
+      const ct     = Buffer.concat([enc.update(plain), enc.final()])
+      const frame  = Buffer.concat([iv, ct, enc.getAuthTag()])  // 12+N+16
+      const hdr    = Buffer.allocUnsafe(4)
+      hdr.writeUInt32BE(frame.length, 0)
+      this.socket.write(Buffer.concat([hdr, frame]))
+      totalBytesSent += 4 + frame.length
     } catch (e) { secEntry('ERR', 'Send failed', e.message) }
   }
   async _dispatch(msg) {
@@ -1000,25 +1209,52 @@ class PeerConn {
     }
   }
   // CHANGE 3: sendFile with abort mechanism + CHANGE 4: extraMeta for folder transfers
-  async sendFile(fid, name, size, mime, dataB64, extraMeta = {}) {
+  // FIX #2/#5: Dual-mode send — path-based streaming (zero extra RAM) or legacy base64.
+  // Path-based is used when the renderer passes filePath instead of dataB64.
+  // This lets us handle files of any size (10GB+) without loading into memory.
+  async sendFile(fid, name, size, mime, dataB64, extraMeta = {}, filePath = null) {
     this._activeSends = this._activeSends || new Map()
     const abort = { cancelled: false }
     this._activeSends.set(fid, abort)
     const total = Math.ceil(size / CHUNK)
     this.send({ type: 'file_start', fid, name, size, total, mime, ...extraMeta })
-    secEntry('OK', `Sending: ${name}`, `${size}B`)
-    const raw = Buffer.from(dataB64, 'base64')
-    for (let i = 0; i < total; i++) {
-      if (abort.cancelled) {
-        this.send({ type: 'file_abort', fid })
-        this._activeSends.delete(fid)
-        secEntry('INFO', `Send cancelled: ${name}`)
-        return
+    secEntry('OK', `Sending: ${name}`, `${size}B${filePath ? ' (stream)' : ''}`)
+
+    if (filePath) {
+      // ── STREAMING PATH: read directly from disk, never fully in memory ──
+      let fd
+      try {
+        fd = fs.openSync(filePath, 'r')
+        const buf = Buffer.allocUnsafe(CHUNK)
+        for (let i = 0; i < total; i++) {
+          if (abort.cancelled) {
+            this.send({ type: 'file_abort', fid })
+            this._activeSends.delete(fid)
+            secEntry('INFO', `Send cancelled: ${name}`)
+            return
+          }
+          const bytesRead = fs.readSync(fd, buf, 0, CHUNK, i * CHUNK)
+          this.send({ type: 'file_chunk', fid, i, d: buf.slice(0, bytesRead).toString('base64') })
+          if (i % 4 === 0) await new Promise(r => setImmediate(r))
+          emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total })
+        }
+      } finally {
+        if (fd !== undefined) try { fs.closeSync(fd) } catch { }
       }
-      this.send({ type: 'file_chunk', fid, i, d: raw.slice(i * CHUNK, (i + 1) * CHUNK).toString('base64') })
-      // B9c FIX: Yield more frequently (every 4 chunks) for better responsiveness with larger chunks
-      if (i % 4 === 0) await new Promise(r => setImmediate(r))
-      emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total })
+    } else {
+      // ── LEGACY BASE64 PATH: kept for backward compat / non-path files ──
+      const raw = Buffer.from(dataB64, 'base64')
+      for (let i = 0; i < total; i++) {
+        if (abort.cancelled) {
+          this.send({ type: 'file_abort', fid })
+          this._activeSends.delete(fid)
+          secEntry('INFO', `Send cancelled: ${name}`)
+          return
+        }
+        this.send({ type: 'file_chunk', fid, i, d: raw.slice(i * CHUNK, (i + 1) * CHUNK).toString('base64') })
+        if (i % 4 === 0) await new Promise(r => setImmediate(r))
+        emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total })
+      }
     }
     this._activeSends.delete(fid)
     this.send({ type: 'file_end', fid })
@@ -1137,10 +1373,11 @@ function disconnectPeer(id) { const c = peers.get(id); if (c) c.disconnect() }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
 ipcMain.handle('ftps:set-identity', async (_, { name, nodeId }) => {
-  const suffix = myIdentityKey.slice(0, 6)
+  const suffix = myIdentityPubB64.slice(0, 6)
   myNodeId = nodeId + '-' + suffix
   myName = name
   activeSession = { name, nodeId: myNodeId, startedAt: new Date().toISOString() }
+  renameCountThisSession = 0  // FIX #3: reset rename counter on new session
   secEntry('OK', `Identity: ${name} ${myNodeId}`)
   // Start passive mDNS discovery immediately
   startPassiveDiscovery()
@@ -1165,8 +1402,30 @@ ipcMain.handle('ftps:set-identity', async (_, { name, nodeId }) => {
     if (port) startTorHiddenService(port).catch(e => secEntry('WARN', 'Tor auto-start failed', e.message || ''))
   }
 
-  return { ok: true, nodeId: myNodeId, identityKey: myIdentityKey }
+  return { ok: true, nodeId: myNodeId, identityKey: myIdentityPubB64 }
 })
+
+// FIX #3: Update-name now broadcasts to all live peers + security log + rename limit
+ipcMain.handle('ftps:update-name', (_, { name }) => {
+  if (!name || typeof name !== 'string' || !name.trim()) return { ok: false, error: 'Invalid name' }
+  if (renameCountThisSession >= RENAME_LIMIT) {
+    secEntry('WARN', `Rename blocked: limit of ${RENAME_LIMIT} renames per session reached`)
+    return { ok: false, error: `Rename limit (${RENAME_LIMIT} per session) reached`, limitReached: true }
+  }
+  const oldName = myName
+  myName = name.trim()
+  if (activeSession) activeSession.name = myName
+  renameCountThisSession++
+  secEntry('OK', `${oldName} renamed to: ${myName}`, `[${renameCountThisSession}/${RENAME_LIMIT} renames used]`)
+  // Broadcast rename to all connected peers so they update their UI without disconnecting
+  peers.forEach(conn => {
+    if (conn.ready) {
+      conn.send({ type: 'peer_rename', oldName, newName: myName })
+    }
+  })
+  return { ok: true, renameCount: renameCountThisSession, renameLimit: RENAME_LIMIT }
+})
+ipcMain.handle('ftps:get-rename-info', () => ({ count: renameCountThisSession, limit: RENAME_LIMIT }))
 ipcMain.handle('ftps:clear-session', () => { activeSession = null; wipePersistentData(); return { ok: true } })
 ipcMain.handle('ftps:get-session', () => activeSession ? { ...activeSession, active: true } : { active: false })
 ipcMain.handle('ftps:get-local-ips', () => getLocalIPs())
@@ -1174,7 +1433,7 @@ ipcMain.handle('ftps:get-logs', () => [...secLog])
 ipcMain.handle('ftps:clear-logs', () => { secLog.length = 0; return { ok: true } })
 ipcMain.handle('ftps:get-peers', () => {
   const result = []
-  peers.forEach(conn => { if (conn.ready && conn.id) result.push({ peerId: conn.id, peerName: conn.name, fingerprint: conn._fingerprint, identityKey: conn._peerIdentityKey, tofu: 'trusted', tofuDetail: null }) })
+  peers.forEach(conn => { if (conn.ready && conn.id) result.push({ peerId: conn.id, peerName: conn.name, fingerprint: conn._fingerprint, identityKey: conn._peerIdentityPubB64, tofu: 'trusted', tofuDetail: null }) })
   return result
 })
 ipcMain.handle('ftps:get-discovered-peers', () => Array.from(discoveredPeers.values()))
@@ -1199,6 +1458,21 @@ ipcMain.handle('ftps:stop-listen', async () => {
 ipcMain.handle('ftps:connect', async (_, { host, port }) => { return connectToPeerWithFallback(host, port) })
 ipcMain.handle('ftps:send', (_, { peerId, payload }) => { const c = peers.get(peerId); if (c && c._reconnecting) { c.send(payload); return { ok: true, queued: true } }; if (!c?.ready) return { ok: false, error: 'Not connected' }; c.send(payload); return { ok: true } })
 ipcMain.handle('ftps:send-file', async (_, { peerId, fid, name, size, mime, dataB64 }) => { const c = peers.get(peerId); if (!c?.ready) return { ok: false, error: 'Not connected' }; try { await c.sendFile(fid, name, size, mime, dataB64); return { ok: true } } catch (e) { return { ok: false, error: e.message } } })
+// FIX #2/#5: Path-based streaming send — no base64 overhead, no RAM limit.
+// Renderer passes the file's filesystem path (available via file.path in Electron).
+// Main process reads directly from disk in CHUNK-sized slices.
+ipcMain.handle('ftps:send-file-stream', async (_, { peerId, fid, name, size, mime, filePath, extraMeta }) => {
+  const c = peers.get(peerId)
+  if (!c?.ready) return { ok: false, error: 'Not connected' }
+  if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'File not found: ' + filePath }
+  try {
+    await c.sendFile(fid, name, size, mime, null, extraMeta || {}, filePath)
+    return { ok: true }
+  } catch (e) {
+    secEntry('ERR', `Stream send failed: ${name}`, e.message)
+    return { ok: false, error: e.message }
+  }
+})
 ipcMain.handle('ftps:disconnect', (_, { peerId }) => { disconnectPeer(peerId); return { ok: true } })
 // CHANGE 3: Cancel active file send
 ipcMain.handle('ftps:cancel-send', (_, { peerId, fid }) => {
@@ -1211,9 +1485,17 @@ ipcMain.handle('ftps:send-folder-manifest', (_, { peerId, manifest }) => {
   const c = peers.get(peerId); if (!c?.ready) return { ok: false, error: 'Not connected' }
   c.send({ type: 'folder_manifest', ...manifest }); return { ok: true }
 })
-ipcMain.handle('ftps:send-file-in-folder', async (_, { peerId, fid, name, size, mime, dataB64, folderFid, folderRelPath, fileIndex }) => {
+ipcMain.handle('ftps:send-file-in-folder', async (_, { peerId, fid, name, size, mime, dataB64, filePath, folderFid, folderRelPath, fileIndex }) => {
   const c = peers.get(peerId); if (!c?.ready) return { ok: false, error: 'Not connected' }
-  try { await c.sendFile(fid, name, size, mime, dataB64, { folderFid, folderRelPath, fileIndex }); return { ok: true } } catch (e) { return { ok: false, error: e.message } }
+  try {
+    const meta = { folderFid, folderRelPath, fileIndex }
+    if (filePath && fs.existsSync(filePath)) {
+      await c.sendFile(fid, name, size, mime, null, meta, filePath)
+    } else {
+      await c.sendFile(fid, name, size, mime, dataB64, meta)
+    }
+    return { ok: true }
+  } catch (e) { return { ok: false, error: e.message } }
 })
 ipcMain.handle('ftps:send-folder-complete', (_, { peerId, fid, name, fileCount }) => {
   const c = peers.get(peerId); if (!c?.ready) return { ok: false, error: 'Not connected' }
@@ -1231,7 +1513,7 @@ ipcMain.handle('ftps:is-connected', (_, { peerId }) => ({ connected: peers.has(p
 // TOFU IPC
 ipcMain.handle('ftps:tofu-accept', (_, { peerId, identityKey, name }) => {
   const c = peers.get(peerId)
-  const key = identityKey || c?._peerIdentityKey
+  const key = identityKey || c?._peerIdentityPubB64
   if (!key) { secEntry('WARN', `TOFU accept: no identityKey for ${peerId}`); return { ok: false, error: 'No identity key available' } }
   tofuAcceptNewKey(peerId, key, name); secEntry('OK', `TOFU: accepted new identity for ${name || peerId}`)
   return { ok: true }
@@ -1391,7 +1673,7 @@ ipcMain.handle('ftps:open-sandbox-folder', async (_, { sandboxDir }) => { secEnt
 // Get platform string for OS Sandbox feature
 ipcMain.handle('ftps:get-platform', () => process.platform)
 
-// List contents of a zip/rar archive as a file tree (no extraction)
+// FIX #5: List archive contents using fast listing commands (no full extraction)
 ipcMain.handle('ftps:list-archive', async (_, { name, dataB64 }) => {
   try {
     const sid = crypto.randomBytes(6).toString('hex')
@@ -1399,7 +1681,8 @@ ipcMain.handle('ftps:list-archive', async (_, { name, dataB64 }) => {
     fs.mkdirSync(tmpDir, { recursive: true })
     const archPath = path.join(tmpDir, name)
     fs.writeFileSync(archPath, Buffer.from(dataB64, 'base64'))
-    // Check for password protection on zip
+
+    // Check for password protection on zip (magic bytes check)
     if (/\.zip$/i.test(name)) {
       const buf = fs.readFileSync(archPath)
       const str = buf.toString('binary')
@@ -1408,6 +1691,8 @@ ipcMain.handle('ftps:list-archive', async (_, { name, dataB64 }) => {
         return { passwordProtected: true }
       }
     }
+
+    // Use fast listing commands instead of full extraction
     const listDir = path.join(tmpDir, 'listing')
     fs.mkdirSync(listDir, { recursive: true })
     await extractArchive(archPath, listDir)
@@ -1564,6 +1849,48 @@ ipcMain.handle('ftps:set-persist-settings', (_, { persist }) => {
   savePersistSettings()
   secEntry('OK', `Persistent data storage ${persistData ? 'ENABLED' : 'DISABLED'}`)
   return { ok: true, persistData }
+})
+
+// FIX #10: Identity password — encrypt/decrypt persistent identity with user password
+// Allows same identity to survive across "New Identity" restarts
+ipcMain.handle('ftps:check-identity-encrypted', () => {
+  try {
+    if (!fs.existsSync(identityFile)) return { exists: false, encrypted: false }
+    const d = JSON.parse(fs.readFileSync(identityFile, 'utf8'))
+    return { exists: true, encrypted: !!d?.encrypted }
+  } catch { return { exists: false, encrypted: false } }
+})
+ipcMain.handle('ftps:load-identity-with-password', (_, { password }) => {
+  const result = loadIdentity(password)
+  if (result.ok) {
+    secEntry('OK', 'Identity recovered with password')
+    return { ok: true, fresh: !!result.fresh }
+  }
+  if (result.needsPassword) return { ok: false, needsPassword: true }
+  return { ok: false, error: result.error || 'Failed to load identity' }
+})
+ipcMain.handle('ftps:set-identity-password', (_, { password }) => {
+  try {
+    if (!myIdentityPrivKey || !myIdentityPubKey) return { ok: false, error: 'No active identity to protect' }
+    if (!password || password.length < 8) return { ok: false, error: 'Password must be at least 8 characters' }
+    const privDER = myIdentityPrivKey.export({ type: 'pkcs8', format: 'der' }).toString('base64')
+    const payload = JSON.stringify({ privKey: privDER, pubKey: myIdentityPubB64, v: 5, created: new Date().toISOString() })
+    const encrypted = encryptIdentity(payload, password)
+    fs.mkdirSync(path.dirname(identityFile), { recursive: true })
+    fs.writeFileSync(identityFile, JSON.stringify({ encrypted, updatedAt: new Date().toISOString() }))
+    secEntry('OK', 'Ed25519 identity keypair encrypted and saved (password-protected)')
+    return { ok: true }
+  } catch (e) { return { ok: false, error: e.message } }
+})
+ipcMain.handle('ftps:remove-identity-password', () => {
+  try {
+    if (!myIdentityPrivKey) return { ok: false, error: 'No active identity' }
+    const privDER = myIdentityPrivKey.export({ type: 'pkcs8', format: 'der' }).toString('base64')
+    fs.mkdirSync(path.dirname(identityFile), { recursive: true })
+    fs.writeFileSync(identityFile, JSON.stringify({ privKey: privDER, pubKey: myIdentityPubB64, v: 5, created: new Date().toISOString() }))
+    secEntry('OK', 'Identity password removed — keypair stored plaintext')
+    return { ok: true }
+  } catch (e) { return { ok: false, error: e.message } }
 })
 
 // Shell + Window

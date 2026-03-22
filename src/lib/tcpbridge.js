@@ -68,17 +68,61 @@ export class TCPBridge {
     const msg = typeof payload === 'string' ? { type:'chat', text:payload, t:Date.now() } : payload
     return (await window.ftps.send(peerId, msg)).ok
   }
+  // FIX #2/#5: Use path-based streaming when file.path is available (Electron exposes this).
+  // This means files of ANY size (10GB+) are sent without loading into RAM.
+  // Falls back to FileReader base64 only if no path (e.g., generated Blob).
   async sendFile(peerId, file, onProg, fidOverride) {
-    // fidOverride lets the caller control the fid so it matches the UI message id,
-    // which fixes the revoke chain: sender message id === wire fid === receiver message id prefix.
     const fid = fidOverride || crypto.randomUUID()
-    const dataB64 = await fileToBase64(file)
-    const unsub = window.ftps.on('ftps:send-progress', ({ peerId:pid, fid:f2, pct }) => {
-      if (pid === peerId && f2 === fid) onProg?.(pct)
-    })
-    const res = await window.ftps.sendFile(peerId, fid, file.name, file.size, file.type||'application/octet-stream', dataB64)
-    unsub?.()
-    return res.ok ? fid : false
+    const filePath = file.path || null  // Electron File objects expose .path
+
+    if (filePath) {
+      // FAST PATH: stream directly from disk — no RAM overhead, no base64 encode/decode on sender side
+      const unsub = window.ftps.on('ftps:send-progress', ({ peerId: pid, fid: f2, pct }) => {
+        if (pid === peerId && f2 === fid) onProg?.(pct)
+      })
+      const res = await window.ftps.sendFileStream(
+        peerId, fid, file.name, file.size,
+        file.type || 'application/octet-stream', filePath
+      )
+      unsub?.()
+      return res?.ok ? fid : false
+    } else {
+      // FALLBACK PATH: legacy FileReader base64 (Blobs, generated data, etc.)
+      const dataB64 = await fileToBase64(file)
+      const unsub = window.ftps.on('ftps:send-progress', ({ peerId: pid, fid: f2, pct }) => {
+        if (pid === peerId && f2 === fid) onProg?.(pct)
+      })
+      const res = await window.ftps.sendFile(peerId, fid, file.name, file.size, file.type || 'application/octet-stream', dataB64)
+      unsub?.()
+      return res.ok ? fid : false
+    }
+  }
+  // FIX #5: Folder send also uses streaming per file
+  async sendFolderFile(peerId, file, fid, folderFid, relPath, fileIndex, onProg) {
+    const filePath = file.path || null
+    if (filePath) {
+      const unsub = window.ftps.on('ftps:send-progress', ({ peerId: pid, fid: f2, pct }) => {
+        if (pid === peerId && f2 === fid) onProg?.(pct)
+      })
+      const res = await window.ftps.sendFileInFolderStream(
+        peerId, fid, file.name, file.size,
+        file.type || 'application/octet-stream',
+        filePath, folderFid, relPath, fileIndex
+      )
+      unsub?.()
+      return res?.ok ? fid : false
+    } else {
+      const dataB64 = await fileToBase64(file)
+      const unsub = window.ftps.on('ftps:send-progress', ({ peerId: pid, fid: f2, pct }) => {
+        if (pid === peerId && f2 === fid) onProg?.(pct)
+      })
+      const res = await window.ftps.sendFileInFolder(
+        peerId, fid, file.name, file.size, file.type || 'application/octet-stream',
+        dataB64, folderFid, relPath, fileIndex
+      )
+      unsub?.()
+      return res?.ok ? fid : false
+    }
   }
   async sendFolder(peerId, files, onEvent) {
     // Send all files in the folder sequentially
