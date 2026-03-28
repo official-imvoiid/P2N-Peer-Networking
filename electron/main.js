@@ -19,6 +19,8 @@ const { exec, execFile } = require('child_process')
 
 // B9 FIX: 512KB chunks (was 64KB) for faster transfers
 const CHUNK = 524288
+// <!-- FIX: Issue 2 --> 2MB chunks for streaming path (path-based sends)
+const STREAM_CHUNK = 2097152
 const FRAME_HDR = 4
 
 // ── MUTABLE STATE ─────────────────────────────────────────────────────────────
@@ -84,11 +86,15 @@ function tofuAcceptNewKey(nodeId, identityPubB64, name) {
 
 // ── BLOCKED PEERS (in-memory, session-scoped) ─────────────────────────────────
 const blockedPeers = new Map()
+// <!-- FIX: Issue 9 --> IP-based block list for incoming connections before HELLO
+const blockedIPs = new Set()
 const connectionAttempts = new Map()
 const RATE_LIMIT_WINDOW = 60000
 const RATE_LIMIT_MAX = 5
 
 function isBlocked(nodeId) { return blockedPeers.has(nodeId) }
+// <!-- FIX: Issue 9 --> Check IP-based block list
+function isBlockedIP(ip) { return blockedIPs.has(ip) }
 function isRateLimited(ip) {
   const now = Date.now()
   const entry = connectionAttempts.get(ip)
@@ -106,6 +112,10 @@ function isRateLimited(ip) {
 const pendingReconnects = new Map()
 let reconnectMax = 5
 const RECONNECT_DELAYS = [500, 1000, 2000, 4000, 8000]
+// <!-- FIX: Issue 5 --> Track all reconnect timer IDs for cleanup on quit
+const reconnectTimers = new Set()
+// <!-- FIX: Issue 5 --> Network online polling state
+let wasOffline = false
 
 // ── RENAME TRACKING ───────────────────────────────────────────────────────────
 const RENAME_LIMIT = 3   // max renames per session
@@ -113,11 +123,21 @@ let renameCountThisSession = 0
 
 // ── SECURITY LOG ──────────────────────────────────────────────────────────────
 const secLog = []
+// <!-- FIX: Issue 14 --> Debounced log emission to avoid IPC spam during Tor bootstrap
+let _logBatch = []
+let _logTimer = null
+function _flushLogBatch() {
+  if (_logBatch.length === 0) return
+  for (const entry of _logBatch) emit('p2n:log', entry)
+  _logBatch = []
+  _logTimer = null
+}
 function secEntry(level, msg, detail = '') {
   const entry = { ts: new Date().toISOString().slice(11, 19), level, msg, detail }
   secLog.push(entry)
   if (secLog.length > 500) secLog.shift()
-  emit('p2n:log', entry)
+  _logBatch.push(entry)
+  if (!_logTimer) _logTimer = setTimeout(_flushLogBatch, 200)
 }
 
 // ── mDNS LOCAL PEER DISCOVERY ─────────────────────────────────────────────────
@@ -328,14 +348,28 @@ app.whenReady().then(() => {
 })
 app.on('window-all-closed', () => {
   activeSession = null
-
+  // <!-- FIX: Issue 5 --> Clear all pending reconnect timers
+  for (const tid of reconnectTimers) clearTimeout(tid)
+  reconnectTimers.clear()
+  pendingReconnects.forEach(rc => { if (rc.timer) clearTimeout(rc.timer) })
+  pendingReconnects.clear()
+  // <!-- FIX: Issue 5 --> Clear network polling
+  if (_networkPollTimer) { clearInterval(_networkPollTimer); _networkPollTimer = null }
   stopServer(); _shutdownDiscovery(); stopTorDaemon()
-  peers.forEach((_, id) => disconnectPeer(id))
+  // <!-- FIX: Issue 14 --> Avoid mutating Map during iteration
+  ;[...peers.keys()].forEach(id => disconnectPeer(id))
   cleanupAllSandboxes()
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => { cleanupAllSandboxes() })
+app.on('before-quit', () => {
+  // <!-- FIX: Issue 5 --> Clear all pending reconnect timers on quit
+  for (const tid of reconnectTimers) clearTimeout(tid)
+  reconnectTimers.clear()
+  pendingReconnects.forEach(rc => { if (rc.timer) clearTimeout(rc.timer) })
+  pendingReconnects.clear()
+  cleanupAllSandboxes()
+})
 
 function emit(ch, data) {
   if (mainWindow?.webContents && !mainWindow.webContents.isDestroyed())
@@ -492,7 +526,8 @@ async function startTorHiddenService(localPort) {
       }
       torProcess = proc
       let started = false
-      let logBuffer = ''
+      // <!-- FIX: Issue 13 --> Use line buffer to handle split log lines
+      let lineBuffer = ''
 
       const timeout = setTimeout(() => {
         if (!started) {
@@ -507,18 +542,29 @@ async function startTorHiddenService(localPort) {
 
       const onTorLog = (d) => {
         const chunk = d.toString()
-        logBuffer += chunk
+        lineBuffer += chunk
         
-        // Log to UI
-        chunk.split('\n').filter(l => l.trim()).forEach(l => {
+        // <!-- FIX: Issue 13 --> Process only complete lines to avoid split-line misses
+        const lines = lineBuffer.split('\n')
+        lineBuffer = lines.pop() || '' // keep incomplete last line in buffer
+        
+        lines.filter(l => l.trim()).forEach(l => {
           emit('p2n:log', { ts: new Date().toTimeString().slice(0, 8), level: 'INFO', msg: 'Tor: ' + l.trim() })
+          
+          // <!-- FIX: Issue 13 --> Emit bootstrap progress events
+          const bootMatch = l.match(/Bootstrapped\s+(\d+)%/)
+          if (bootMatch) {
+            const progress = parseInt(bootMatch[1])
+            emit('ftps:tor-status', { status: 'starting', progress })
+          }
         })
 
-        if (logBuffer.includes('Bootstrapped 100%') && !started) {
+        // Check complete lines for bootstrap completion
+        if (lines.some(l => l.includes('Bootstrapped 100%')) && !started) {
           started = true
           clearTimeout(timeout)
-          // A3 FIX: Clear log buffer after bootstrap to prevent unbounded memory growth
-          logBuffer = ''
+          // A3 FIX: Clear line buffer after bootstrap to prevent unbounded memory growth
+          lineBuffer = ''
           // Poll for hostname file (Tor might take a moment to write it after bootstrap)
           const hostnamePath = path.join(hsDir, 'hostname')
           let retries = 0
@@ -606,7 +652,37 @@ function connectViaTor(onionHost, port) {
     let step = 'greeting'
     let settled = false
 
-    const fail = (err) => { if (!settled) { settled = true; try { sock.destroy() } catch { }; reject(err) } }
+    // <!-- FIX: Issue 11 --> Map SOCKS5 errors to user-friendly messages
+    const fail = (err) => {
+      if (!settled) {
+        settled = true
+        try { sock.destroy() } catch { }
+        // Map raw errors to friendly messages
+        let friendlyMsg = err.message
+        if (err.code === 'ECONNREFUSED' || err.message.includes('ECONNREFUSED')) {
+          friendlyMsg = 'Tor daemon not running — restart the app or enable Tor in Settings'
+          // Attempt Tor restart if server is up
+          if (tcpServer) {
+            const port = tcpServer.address()?.port
+            if (port) {
+              secEntry('WARN', 'Tor SOCKS port refused — attempting restart')
+              emit('ftps:tor-status', { status: 'error', error: 'Tor crashed — restarting…' })
+              stopTorDaemon()
+              startTorHiddenService(port).catch(() => {})
+            }
+          }
+        } else if (err.message.includes('network unreachable')) {
+          friendlyMsg = 'Network unreachable — check your internet connection'
+        } else if (err.message.includes('host unreachable')) {
+          friendlyMsg = 'Peer is offline or onion address has changed'
+        } else if (err.message.includes('connection refused') && !err.message.includes('ECONNREFUSED')) {
+          friendlyMsg = 'Peer is not listening — they may need to restart'
+        } else if (err.message.includes('timeout') || err.message.includes('Timeout')) {
+          friendlyMsg = 'Connection timed out — check internet connection and try again'
+        }
+        reject(new Error(friendlyMsg))
+      }
+    }
     const succeed = () => {
       if (!settled) {
         settled = true
@@ -659,7 +735,17 @@ function connectViaTor(onionHost, port) {
         // → JSON.parse failed → every onion connection died silently.
         if (rxBuf.length < 4) return  // wait for VER REP RSV ATYP
         if (rxBuf[0] !== 0x05 || rxBuf[1] !== 0x00) {
-          const codes = { 1: 'general failure', 2: 'connection not allowed', 3: 'network unreachable', 4: 'host unreachable', 5: 'connection refused', 6: 'TTL expired', 7: 'command not supported', 8: 'address type not supported' }
+          // <!-- FIX: Issue 11 --> User-friendly SOCKS5 error codes
+          const codes = {
+            1: 'Tor internal error — try restarting',
+            2: 'Connection not allowed by ruleset',
+            3: 'Network unreachable — check your internet connection',
+            4: 'Peer is offline or onion address has changed',
+            5: 'Peer is not listening on that port',
+            6: 'Connection timed out — network too slow',
+            7: 'Command not supported',
+            8: 'Address type not supported'
+          }
           fail(new Error(`SOCKS5 connect failed: ${codes[rxBuf[1]] || 'error code ' + rxBuf[1]}`))
           return
         }
@@ -683,6 +769,42 @@ function connectViaTor(onionHost, port) {
   })
 }
 
+// <!-- FIX: Issue 5 --> Network online polling — detect internet recovery and trigger reconnects
+let _networkPollTimer = null
+function startNetworkPolling() {
+  if (_networkPollTimer) return
+  _networkPollTimer = setInterval(() => {
+    const ips = getLocalIPs()
+    if (ips.length > 0 && wasOffline) {
+      wasOffline = false
+      secEntry('INFO', 'Network back online — attempting reconnects')
+      pendingReconnects.forEach((info, peerId) => {
+        if (info.timer) clearTimeout(info.timer)
+        // Trigger immediate reconnect attempt
+        const sock = net.createConnection({ host: info.host, port: info.port }, () => {
+          const nc = new PeerConn(sock, { host: info.host, port: info.port })
+          if (peerId) { peers.delete(peerId); peers.set(peerId, nc) }
+          pendingReconnects.delete(peerId)
+        })
+        sock.on('error', () => {})
+        sock.setTimeout(8000, () => { sock.destroy() })
+      })
+    } else if (ips.length === 0 && !wasOffline) {
+      wasOffline = true
+      secEntry('WARN', 'Network appears offline')
+    }
+  }, 5000)
+}
+
+// <!-- FIX: Issue 13 --> Keepalive ping to prevent NAT/Tor circuit timeouts
+setInterval(() => {
+  peers.forEach(conn => {
+    if (conn.ready) {
+      try { conn.send({ type: 'ping', t: Date.now() }) } catch { }
+    }
+  })
+}, 30000)
+
 // ── ARCHIVE SANDBOX ───────────────────────────────────────────────────────────
 const sandboxes = new Map()
 
@@ -697,22 +819,104 @@ function buildFileTree(dir, base) {
   } catch { }
   return out
 }
-function extractArchive(src, dest) {
+// <!-- FIX: Issue 12 --> 7z binary search
+function find7zBin() {
+  if (process.platform === 'win32') {
+    const paths = [
+      'C:\\Program Files\\7-Zip\\7z.exe',
+      'C:\\Program Files (x86)\\7-Zip\\7z.exe',
+      path.join(process.env.LOCALAPPDATA || '', 'Programs\\7-Zip\\7z.exe')
+    ]
+    for (const p of paths) if (fs.existsSync(p)) return p
+  } else {
+    try { execSync('which 7z', { stdio: 'ignore' }); return '7z' } catch {}
+  }
+  return null
+}
+
+// <!-- FIX: Issue 3 & 12 --> Fast archive listing without extraction
+async function listArchive(src) {
   return new Promise((resolve, reject) => {
-    const e = src.toLowerCase(); let cmd, args
-    if (process.platform === 'win32') {
-      if (/\.(zip|tar|tgz|tar\.gz|tar\.bz2)$/.test(e)) { cmd = 'tar'; args = ['-xf', src, '-C', dest] }
-      else if (/\.(7z|rar)$/.test(e)) { cmd = '7z'; args = ['x', src, `-o${dest}`, '-y'] }
-      else return reject(new Error('Unsupported format'))
+    const e = src.toLowerCase(), files = []
+    const _7z = find7zBin()
+
+    if (_7z && /\.(7z|zip|rar|tar(\.gz|\.bz2|\.xz)?|tgz|tbz2)$/i.test(e)) {
+      // Use 7z if available — it supports everything and has a standard list format `-slt`
+      execFile(_7z, ['l', '-slt', src], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return reject(new Error('7-Zip list failed'))
+        let current = {}, blocks = stdout.split('\n\n')
+        for (const block of blocks) {
+          const dict = {}
+          for (const line of block.split('\n')) {
+            const m = line.match(/^([^=]+)\s+=\s+(.*)$/)
+            if (m) dict[m[1].trim()] = m[2].trim()
+          }
+          if (dict.Path && dict.Path !== src && dict.Attributes !== 'D') {
+            const size = parseInt(dict.Size || '0', 10)
+            files.push({ path: dict.Path.replace(/\\/g, '/'), size: isNaN(size) ? 0 : size })
+          }
+        }
+        resolve(files)
+      })
+    } else if (process.platform === 'win32' && e.endsWith('.zip')) {
+      // Fallback Windows ZIP
+      execFile('tar', ['-tf', src], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return reject(new Error('tar list failed'))
+        stdout.split('\n').filter(Boolean).forEach(l => {
+          const p = l.trim().replace(/\\/g, '/')
+          if (p && !p.endsWith('/')) files.push({ path: p, size: 0 }) // size unknown
+        })
+        resolve(files)
+      })
+    } else if (process.platform !== 'win32' && e.endsWith('.zip')) {
+      // Fallback Unix ZIP
+      execFile('unzip', ['-l', src], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return reject(new Error('unzip list failed'))
+        const lines = stdout.split('\n')
+        for (let i = 3; i < lines.length - 2; i++) {
+          const m = lines[i].match(/^\s*\d+\s+[\d-]+\s+[\d:]+\s+(.+)$/)
+          if (m && !m[1].endsWith('/')) files.push({ path: m[1], size: 0 })
+        }
+        resolve(files)
+      })
+    } else if (/\.(tar|tar\.gz|tgz|tar\.bz2|tbz2)$/.test(e)) {
+      // Fallback TAR
+      const args = ['-tvf', src]
+      if (/\.(gz|tgz)$/.test(e)) args.splice(1, 0, '-z')
+      if (/\.(bz2|tbz2)$/.test(e)) args.splice(1, 0, '-j')
+      execFile('tar', args, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return reject(new Error('tar list failed'))
+        stdout.split('\n').filter(Boolean).forEach(l => {
+          const parts = l.trim().split(/\s+/)
+          if (parts.length >= 6 && !parts[0].startsWith('d')) {
+            const size = parseInt(parts[2] || '0', 10)
+            const p = parts.slice(5).join(' ')
+            if (p) files.push({ path: p, size: isNaN(size) ? 0 : size })
+          }
+        })
+        resolve(files)
+      })
     } else {
-      if (e.endsWith('.zip')) { cmd = 'unzip'; args = ['-o', src, '-d', dest] }
-      else if (/\.(tar\.gz|tgz)$/.test(e)) { cmd = 'tar'; args = ['-xzf', src, '-C', dest] }
-      else if (/\.(tar\.bz2|tbz2)$/.test(e)) { cmd = 'tar'; args = ['-xjf', src, '-C', dest] }
-      else if (e.endsWith('.tar')) { cmd = 'tar'; args = ['-xf', src, '-C', dest] }
-      else if (/\.(7z|rar)$/.test(e)) { cmd = '7z'; args = ['x', src, `-o${dest}`, '-y'] }
-      else return reject(new Error('Unsupported format'))
+      reject(new Error('Unsupported archive format OR 7-Zip not installed'))
     }
-    execFile(cmd, args, { timeout: 60000 }, err => err ? reject(err) : resolve())
+  })
+}
+
+// Full extraction is now only used explicitly when the user requests a specific file preview
+function extractSingleFile(src, fileRelPath, destDir) {
+  return new Promise((resolve, reject) => {
+    const e = src.toLowerCase(), _7z = find7zBin()
+    if (_7z) {
+      execFile(_7z, ['e', src, `-o${destDir}`, fileRelPath, '-y', '-r'], { timeout: 60000 }, err => err ? reject(err) : resolve())
+    } else if (process.platform === 'win32' && /\.(zip|tar|tgz|tar\.gz|tar\.bz2)$/.test(e)) {
+      execFile('tar', ['-xf', src, '-C', destDir, fileRelPath], { timeout: 60000 }, err => err ? reject(err) : resolve())
+    } else if (process.platform !== 'win32' && e.endsWith('.zip')) {
+      execFile('unzip', ['-j', '-o', src, fileRelPath, '-d', destDir], { timeout: 60000 }, err => err ? reject(err) : resolve())
+    } else if (process.platform !== 'win32' && /\.(tar|tgz|tar\.gz|tbz2|tar\.bz2)$/.test(e)) {
+      execFile('tar', ['-xf', src, '-C', destDir, fileRelPath], { timeout: 60000 }, err => err ? reject(err) : resolve())
+    } else {
+      reject(new Error('Unsupported format for extraction OR 7-Zip missing'))
+    }
   })
 }
 function cleanupAllSandboxes() {
@@ -776,6 +980,9 @@ class PeerConn {
     this._closed      = false
     this._txSeq       = 0n   // monotonic send counter (BigInt for safe uint64)
     this._rxSeq       = -1n  // last accepted receive seq (-1 = none yet)
+    // <!-- FIX: Issue 5 --> Store remote address for bidirectional reconnect
+    this._remoteAddress = socket.remoteAddress || null
+    this._remotePort    = socket.remotePort || null
     this._setup()
   }
 
@@ -845,6 +1052,11 @@ class PeerConn {
       // ── Blocked / rate-limit checks (before any crypto work) ─────────────
       const peerId   = h.nodeId || ('p_' + Date.now().toString(36))
       const remoteIP = this.socket.remoteAddress || ''
+      // <!-- FIX: Issue 9 --> Check IP-based block list before peer ID is known
+      if (isBlockedIP(remoteIP)) {
+        secEntry('WARN', `Blocked IP ${remoteIP} attempted to connect — rejected`)
+        this._close(); return
+      }
       if (isBlocked(peerId)) {
         secEntry('WARN', `Blocked peer ${h.name || peerId} attempted to connect — rejected`)
         this._close(); return
@@ -1055,7 +1267,8 @@ class PeerConn {
     this._activeSends = this._activeSends || new Map()
     const abort = { cancelled: false }
     this._activeSends.set(fid, abort)
-    const total = Math.ceil(size / CHUNK)
+    const chunkSize = filePath ? STREAM_CHUNK : CHUNK
+    const total = Math.ceil(size / chunkSize)
     this.send({ type: 'file_start', fid, name, size, total, mime, ...extraMeta })
     secEntry('OK', `Sending: ${name}`, `${size}B${filePath ? ' (stream)' : ''}`)
 
@@ -1064,7 +1277,7 @@ class PeerConn {
       let fd
       try {
         fd = fs.openSync(filePath, 'r')
-        const buf = Buffer.allocUnsafe(CHUNK)
+        const buf = Buffer.allocUnsafe(chunkSize)
         for (let i = 0; i < total; i++) {
           if (abort.cancelled) {
             this.send({ type: 'file_abort', fid })
@@ -1072,10 +1285,12 @@ class PeerConn {
             secEntry('INFO', `Send cancelled: ${name}`)
             return
           }
-          const bytesRead = fs.readSync(fd, buf, 0, CHUNK, i * CHUNK)
+          const bytesRead = fs.readSync(fd, buf, 0, chunkSize, i * chunkSize)
           this.send({ type: 'file_chunk', fid, i, d: buf.slice(0, bytesRead).toString('base64') })
-          if (i % 4 === 0) await new Promise(r => setImmediate(r))
-          emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total })
+          // <!-- FIX: Issue 2 --> Yield less often (16) to increase streaming throughput
+          if (i % 16 === 0) await new Promise(r => setImmediate(r))
+          // <!-- FIX: Issue 2 --> Add bytesSent for UI speed computation
+          emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total, bytesSent: Math.min((i + 1) * chunkSize, size) })
         }
       } finally {
         if (fd !== undefined) try { fs.closeSync(fd) } catch { }
@@ -1090,9 +1305,10 @@ class PeerConn {
           secEntry('INFO', `Send cancelled: ${name}`)
           return
         }
-        this.send({ type: 'file_chunk', fid, i, d: raw.slice(i * CHUNK, (i + 1) * CHUNK).toString('base64') })
+        this.send({ type: 'file_chunk', fid, i, d: raw.slice(i * chunkSize, (i + 1) * chunkSize).toString('base64') })
         if (i % 4 === 0) await new Promise(r => setImmediate(r))
-        emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total })
+        // <!-- FIX: Issue 2 --> Add bytesSent
+        emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total, bytesSent: Math.min((i + 1) * chunkSize, size) })
       }
     }
     this._activeSends.delete(fid)
@@ -1106,15 +1322,30 @@ class PeerConn {
     if (this._closed) return
     const id = this.id, name = this.name, wasReady = this.ready
     this.ready = false; try { this.socket.destroy() } catch { }
-    if (wasReady && this._initiator && !this._closed && this._reconnectAttempt < reconnectMax) {
+    
+    // Determine if we can reconnect. Either we initiated it, OR we have their remote IP/Port
+    const canReconnect = this._initiator || (this._remoteAddress && this._remotePort && this._remoteAddress !== '127.0.0.1')
+    
+    // <!-- FIX: Issue 5 --> Bidirectional reconnects using remote address
+    if (wasReady && canReconnect && !this._closed && this._reconnectAttempt < reconnectMax) {
       this._reconnecting = true; this._reconnectAttempt++
       const delay = RECONNECT_DELAYS[Math.min(this._reconnectAttempt - 1, RECONNECT_DELAYS.length - 1)]
       secEntry('INFO', `Reconnecting to ${name || id} (${this._reconnectAttempt}/${reconnectMax})`, `in ${delay}ms`)
       emit('ftps:peer-reconnecting', { peerId: id, attempt: this._reconnectAttempt, maxAttempts: reconnectMax })
+      
+      const host = this._initiator?.host || this._remoteAddress
+      const port = this._initiator?.port || this._remotePort
+      
       const timer = setTimeout(() => {
         pendingReconnects.delete(id); if (this._closed) return
-        const sock = net.createConnection({ host: this._initiator.host, port: this._initiator.port }, () => {
-          const nc = new PeerConn(sock, this._initiator)
+        
+        // Track the reconnect timer globally so we can clean it up on quit (Issue 5)
+        const tid = setInterval(()=>{},999999); clearInterval(tid); // dummy to get type
+        reconnectTimers.add(timer)
+        
+        const sock = net.createConnection({ host, port }, () => {
+          reconnectTimers.delete(timer)
+          const nc = new PeerConn(sock, this._initiator || null)
           nc._sendQueue = this._sendQueue
           nc._reconnectAttempt = this._reconnectAttempt
           // BUG-10 fix: pre-register new PeerConn under the old id so the peers map
@@ -1124,10 +1355,11 @@ class PeerConn {
             peers.set(id, nc)
           }
         })
-        sock.on('error', () => this._onDisconnect())
-        sock.setTimeout(8000, () => { sock.destroy(); this._onDisconnect() })
+        sock.on('error', () => { reconnectTimers.delete(timer); this._onDisconnect() })
+        sock.setTimeout(8000, () => { reconnectTimers.delete(timer); sock.destroy(); this._onDisconnect() })
       }, delay)
-      pendingReconnects.set(id, { ...this._initiator, attempt: this._reconnectAttempt, timer, maxAttempts: reconnectMax })
+      
+      pendingReconnects.set(id, { host, port, attempt: this._reconnectAttempt, timer, maxAttempts: reconnectMax })
       return
     }
     this._close()
@@ -1361,6 +1593,18 @@ ipcMain.handle('ftps:tofu-get-known', () => { const r = []; tofuStore.forEach((v
 ipcMain.handle('ftps:tofu-remove', (_, { peerId }) => { tofuStore.delete(peerId); secEntry('INFO', `TOFU: removed ${peerId}`); return { ok: true } })
 ipcMain.handle('ftps:get-fingerprint', (_, { peerId }) => { const c = peers.get(peerId); return { fingerprint: c?._fingerprint || null } })
 
+// <!-- FIX: Issue 9 --> Add IP blocking
+ipcMain.handle('ftps:block-ip', (_, { ip, reason }) => {
+  if (!ip) return { ok: false }
+  blockedIPs.add(ip)
+  secEntry('OK', `Blocked IP: ${ip}`, reason || '')
+  // Also disconnect any active peers from this IP
+  peers.forEach(c => {
+    if (c.socket?.remoteAddress === ip) c.disconnect()
+  })
+  return { ok: true }
+})
+
 // B4/C1: Blocked peers IPC
 ipcMain.handle('ftps:block-peer', (_, { peerId, peerName, reason }) => {
   blockedPeers.set(peerId, { name: peerName || '', blockedAt: new Date().toISOString(), reason: reason || '' })
@@ -1368,6 +1612,7 @@ ipcMain.handle('ftps:block-peer', (_, { peerId, peerName, reason }) => {
   const c = peers.get(peerId)
   if (c) c.disconnect()
   secEntry('OK', `Blocked peer: ${peerName || peerId}`)
+  emit('ftps:peer-blocked', { peerId })  // <!-- FIX: Issue 9 --> emit event for UI
   return { ok: true }
 })
 ipcMain.handle('ftps:unblock-peer', (_, { peerId }) => {
@@ -1557,17 +1802,70 @@ ipcMain.handle('ftps:list-archive', async (_, { name, dataB64 }) => {
       }
     }
 
-    // Use fast listing commands instead of full extraction
-    const listDir = path.join(tmpDir, 'listing')
-    fs.mkdirSync(listDir, { recursive: true })
-    await extractArchive(archPath, listDir)
-    const tree = buildFileTree(listDir, listDir)
+    // <!-- FIX: Issue 3 & 12 --> Use fast listing commands instead of full extraction
+    const files = await listArchive(archPath)
+    
+    // Build tree from flat list
+    const tree = {}
+    for (const f of files) {
+      if (!f.path) continue
+      const parts = f.path.split('/')
+      let current = tree
+      for (let i = 0; i < parts.length; i++) {
+        const p = parts[i]
+        if (!p) continue
+        if (i === parts.length - 1) {
+          current[p] = { type: 'file', size: f.size }
+        } else {
+          current[p] = current[p] || { type: 'dir', children: {} }
+          current = current[p].children
+        }
+      }
+    }
+
     fs.rmSync(tmpDir, { recursive: true, force: true })
     return { ok: true, tree }
   } catch (e) {
     if (e.message?.toLowerCase().includes('password') || e.message?.toLowerCase().includes('encrypted')) {
       return { passwordProtected: true }
     }
+    return { error: e.message }
+  }
+})
+
+// <!-- FIX: Issue 9 --> Extract large archive from disk path (no base64 memory overhead)
+ipcMain.handle('ftps:extract-archive-from-path', async (_, { name, archPath }) => {
+  try {
+    if (!fs.existsSync(archPath)) return { ok: false, error: 'File not found on disk' }
+    
+    // Check password protection for zip
+    if (/\.zip$/i.test(name)) {
+      const fd = fs.openSync(archPath, 'r'), buf = Buffer.alloc(100)
+      fs.readSync(fd, buf, 0, 100, 0); fs.closeSync(fd)
+      const str = buf.toString('binary')
+      if (str.includes('\x09\x08\x06\x00') || (buf[6] & 0x01)) {
+        return { passwordProtected: true }
+      }
+    }
+
+    const files = await listArchive(archPath)
+    
+    // Build tree
+    const tree = {}
+    for (const f of files) {
+      if (!f.path) continue
+      const parts = f.path.split('/')
+      let current = tree
+      for (let i = 0; i < parts.length; i++) {
+        const p = parts[i]
+        if (!p) continue
+        if (i === parts.length - 1) current[p] = { type: 'file', size: f.size }
+        else { current[p] = current[p] || { type: 'dir', children: {} }; current = current[p].children }
+      }
+    }
+    return { ok: true, tree }
+  } catch (e) {
+    if (e.message?.toLowerCase().includes('password') || e.message?.toLowerCase().includes('encrypted')) return { passwordProtected: true }
     return { error: e.message }
   }
 })
@@ -1582,14 +1880,25 @@ ipcMain.handle('ftps:read-archive-entry', async (_, { name, dataB64, entryPath }
     fs.writeFileSync(archPath, Buffer.from(dataB64, 'base64'))
     const extractDir = path.join(tmpDir, 'entry')
     fs.mkdirSync(extractDir, { recursive: true })
-    await extractArchive(archPath, extractDir)
-    const targetPath = path.resolve(extractDir, entryPath)
-    // Path traversal guard
-    if (!targetPath.startsWith(path.resolve(extractDir))) {
-      fs.rmSync(tmpDir, { recursive: true, force: true })
-      return { ok: false, error: 'Path traversal detected' }
+    
+    // <!-- FIX: Issue 3/12 --> Extract only the requested file
+    await extractSingleFile(archPath, entryPath, extractDir)
+    
+    // tar/unzip handles extraction paths differently depending on OS.
+    // Try to find the file recursively in extractDir
+    let targetPath = null
+    const findFile = (dir) => {
+      const items = fs.readdirSync(dir, { withFileTypes: true })
+      for (const item of items) {
+        const full = path.join(dir, item.name)
+        if (item.isDirectory()) { const found = findFile(full); if (found) return found }
+        else if (item.name === path.basename(entryPath)) return full // found it
+      }
+      return null
     }
-    if (!fs.existsSync(targetPath)) {
+    targetPath = findFile(extractDir)
+
+    if (!targetPath || !fs.existsSync(targetPath)) {
       fs.rmSync(tmpDir, { recursive: true, force: true })
       return { ok: false, error: 'File not found in archive' }
     }
@@ -1605,6 +1914,19 @@ ipcMain.handle('ftps:read-archive-entry', async (_, { name, dataB64, entryPath }
     return { ok: false, error: e.message }
   }
 })
+
+// <!-- FIX: Issue 7/9 --> Read file directly from disk path for preview
+ipcMain.handle('ftps:read-file-for-preview', async (_, { filePath }) => {
+  try {
+    if (!fs.existsSync(filePath)) return { ok: false, error: 'File not found' }
+    const st = fs.statSync(filePath)
+    if (st.size > 50 * 1024 * 1024) return { ok: false, error: 'File too large to preview (>50MB)' }
+    return { ok: true, dataB64: fs.readFileSync(filePath).toString('base64'), size: st.size }
+  } catch (e) { return { ok: false, error: e.message } }
+})
+
+// <!-- FIX: Issue 12 --> Export 7z availability check
+ipcMain.handle('ftps:find-7z', () => ({ ok: true, found: !!find7zBin() }))
 
 // Save a large file from a temp path (used for files >32MB that bypass IPC base64)
 ipcMain.handle('ftps:save-file-from-temp', async (_, { tmpPath, name }) => {

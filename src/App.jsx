@@ -146,6 +146,7 @@ button:active:not(:disabled){transform:scale(.97)}
 .glow-accent{box-shadow: 0 0 20px ${T.accent}15; border: 1px solid ${T.accent}30 !important;}
 
 @keyframes pulse{0%{opacity:.4}50%{opacity:.8}100%{opacity:.4}}
+@keyframes lockpulse{0%,100%{transform:scale(1);filter:drop-shadow(0 0 4px #d2992260)}50%{transform:scale(1.12);filter:drop-shadow(0 0 10px #d2992280)}}
 .pulse{animation:pulse 2s infinite ease-in-out}
 `
 
@@ -254,6 +255,7 @@ async function createZipBlob(files) {
 const fmt = s => `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor(s % 3600 / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 const fmtMin = s => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 const fmtSz = b => b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : b >= 1e3 ? (b / 1e3).toFixed(0) + ' KB' : b + ' B'
+const fmtTime = s => s > 3600 ? `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m` : s > 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`
 const now8 = () => new Date().toTimeString().slice(0, 8)
 const escH = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 const makeId = n => '#' + Math.abs([...n].reduce((a, c, i) => ((a << 5) - a + c.charCodeAt(0) * (i + 7)) | 0, 0)).toString(16).padStart(8, '0').toUpperCase()
@@ -697,7 +699,7 @@ function SandboxPanel({ sandbox, onClose }) {
         </div>
       </div>
       <div style={{ fontSize: 10, color: T.textDim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</div>
-      <div style={{ fontSize: 9, color: T.muted, marginTop: 2 }}>Isolated OS temp · Auto-cleaned · Never executed</div>
+      <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>Isolated OS temp · Auto-cleaned · Never executed</div>
     </div>
 
     {/* Breadcrumb */}
@@ -725,7 +727,7 @@ function SandboxPanel({ sandbox, onClose }) {
           {!isDir && <span style={{ fontSize: 8, fontWeight: 700, padding: '1px 3px', borderRadius: 3, border: `1px solid ${col}38`, color: col, flexShrink: 0 }}>{ext.toUpperCase()}</span>}
         </div>
       })}
-      {!entries.length && <div style={{ textAlign: 'center', padding: 20, color: T.muted, fontSize: 11 }}>Empty folder</div>}
+      {!entries.length && <div style={{ textAlign: 'center', padding: 20, color: T.textDim, fontSize: 11 }}>Empty folder</div>}
     </div>
 
     {/* Preview */}
@@ -743,7 +745,7 @@ function SandboxPanel({ sandbox, onClose }) {
     </div>}
 
     {/* AV tip */}
-    <div style={{ padding: '7px 10px', borderTop: `1px solid ${T.border}`, background: T.panel, flexShrink: 0, fontSize: 10, color: T.muted, lineHeight: 1.5 }}>
+    <div style={{ padding: '7px 10px', borderTop: `1px solid ${T.border}`, background: T.panel, flexShrink: 0, fontSize: 11, color: T.textDim, lineHeight: 1.5 }}>
       🛡 <strong style={{ color: T.textDim }}>Isolated location:</strong> Files extracted to a temporary folder isolated from your system. Nothing auto-runs. Click "Explorer" to open — your AV scans on access.
     </div>
   </div>
@@ -767,7 +769,19 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
         const r = new FileReader(); const b64 = await new Promise((res, rej) => { r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(msg.blob) })
         const result = await window.ftps?.listArchive(fname, b64)
         if (result?.passwordProtected) { setError('🔐 Password-protected archive — cannot preview contents without password'); setLoading(false); return }
-        if (result?.error) { setError(result.error); setLoading(false); return }
+        if (result?.error) {
+          // FIX: 7-Zip install hint for .7z files
+          if (/\.7z$/i.test(fname)) {
+            try {
+              const z7 = await window.ftps?.find7z()
+              if (!z7?.found) {
+                setError('7-Zip is required to browse .7z files.\n\n💡 Install 7-Zip from https://7-zip.org then restart the app.')
+                setLoading(false); return
+              }
+            } catch {}
+          }
+          setError(result.error); setLoading(false); return
+        }
         setTree(result?.tree || {}); setLoading(false)
       } catch (e) { setError(e.message || 'Failed to read archive'); setLoading(false) }
     })()
@@ -846,7 +860,7 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
                 {!isDir && <button onClick={e => { e.stopPropagation(); saveEntry(fullPath, name) }} className="btn btn-green btn-xs" style={{ flexShrink: 0, fontSize: 9, padding: '1px 5px' }}>⬇</button>}
               </div>
             })}
-            {!entries.length && !loading && <div style={{ textAlign: 'center', padding: 24, color: T.muted, fontSize: 11 }}>Empty folder</div>}
+            {!entries.length && !loading && <div style={{ textAlign: 'center', padding: 24, color: T.textDim, fontSize: 11 }}>Empty folder</div>}
           </>}
         </div>
         {/* Preview pane */}
@@ -926,7 +940,7 @@ function OSSandbox({ file, onClose }) {
           <div style={{ marginTop: 4, color: T.amber }}>Requires: firejail or bubblewrap installed (sudo apt install firejail)</div></>}
         {platform === 'darwin' && <><div style={{ color: T.textMid, fontWeight: 600, marginBottom: 4 }}>🍎 macOS</div>
           <div style={{ color: T.amber }}>macOS sandbox not yet implemented. Use the archive viewer to inspect contents safely without extraction.</div></>}
-        {!platform && <div style={{ color: T.muted }}>Detecting platform…</div>}
+        {!platform && <div style={{ color: T.textDim }}>Detecting platform…</div>}
       </div>
       {/* Security tools */}
       <div style={{ padding: '10px 16px', borderBottom: `1px solid ${T.border}` }}>
@@ -941,7 +955,7 @@ function OSSandbox({ file, onClose }) {
             { icon: '💾', name: 'Temp filesystem', desc: 'Cannot write to real disk' },
           ].map((t, i) => <div key={i} style={{ display: 'flex', gap: 6, alignItems: 'flex-start', padding: '4px 6px', background: T.bg, borderRadius: 5, fontSize: 10 }}>
             <span style={{ flexShrink: 0 }}>{t.icon}</span>
-            <div><div style={{ color: T.text, fontWeight: 600 }}>{t.name}</div><div style={{ color: T.muted }}>{t.desc}</div></div>
+            <div><div style={{ color: T.text, fontWeight: 600 }}>{t.name}</div><div style={{ color: T.textDim }}>{t.desc}</div></div>
           </div>)}
         </div>
       </div>
@@ -955,7 +969,7 @@ function OSSandbox({ file, onClose }) {
           {status === 'idle' ? '🚀 Launch Sandbox' : status === 'launching' ? '⟳ Launching…' : '✓ Running — close the sandbox window when done'}
         </button>}
       </div>
-      <div style={{ padding: '4px 16px 10px', fontSize: 10, color: T.muted, lineHeight: 1.5 }}>
+      <div style={{ padding: '4px 16px 10px', fontSize: 11, color: T.textDim, lineHeight: 1.5 }}>
         ⚠ Never enter passwords, banking details, or sensitive info inside the sandbox environment.
       </div>
     </div>
@@ -970,7 +984,7 @@ function FileMsg({ msg, onExtract, onPreview, onRevoke, onZipView, onOSSandbox, 
       <span style={{ fontSize: 15 }}>🚫</span>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontSize: 11, color: T.red, fontWeight: 600 }}>File Access Revoked</div>
-        <div style={{ fontSize: 10, color: T.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{msg.meta?.name || 'File'}</div>
+        <div style={{ fontSize: 11, color: T.textDim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{msg.meta?.name || 'File'}</div>
       </div>
       <span style={{ fontSize: 9, color: T.muted }}>{msg.revokedAt || msg.time}</span>
     </div>
@@ -1003,10 +1017,14 @@ function FileMsg({ msg, onExtract, onPreview, onRevoke, onZipView, onOSSandbox, 
     </div>
     {!done && <>
       <div className="prog" style={{ marginBottom: 3 }}><div className="prog-fill" style={{ width: `${pct * 100}%` }} /></div>
-      <div style={{ fontSize: 9, color: T.muted, marginBottom: 5, display: 'flex', justifyContent: 'space-between' }}>
+      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 5, display: 'flex', justifyContent: 'space-between' }}>
         <span>{fmtSz(Math.round((msg.meta?.size || 0) * pct))} / {fmtSz(msg.meta?.size || 0)}</span>
         <span>{Math.round(pct * 100)}%</span>
       </div>
+      {msg.calcSpeed > 0 && <div style={{ fontSize: 10, color: T.textDim, display: 'flex', justifyContent: 'space-between', marginTop: -3, marginBottom: 5 }}>
+        <span>{isMe ? '↑' : '↓'} {fmtSz(msg.calcSpeed)}/s</span>
+        <span>{msg.calcEta > 0 ? `~${fmtTime(msg.calcEta)} remaining` : ''}</span>
+      </div>}
     </>}
     {/* CHANGE 3: Cancel button during active send */}
     {isMe && !done && msg.pct !== undefined && msg.pct < 1 && (
@@ -1053,7 +1071,7 @@ function FolderMsg({ msg, onOpen, onRevoke }) {
 
 // ── FOLDER OFFER MSG (sender side — no progress, just "shared" card) ─────────
 function FolderOfferMsg({ msg }) {
-  const statusMap = { offered: { c: T.blue, t: '📤 Offered' }, sending: { c: T.amber, t: '⟳ Sending…' }, done: { c: T.green, t: '✓ Done' } }
+  const statusMap = { offered: { c: T.blue, t: '📤 Offered' }, sending: { c: T.amber, t: '⟳ Sending…' }, done: { c: T.green, t: '✓ Sent' } }
   const s = statusMap[msg.status || 'offered'] || statusMap.offered
   return <div style={{ padding: '9px 11px', background: T.blue + '0b', border: `1px solid ${T.blue}26`, borderRadius: 8, maxWidth: '68%', minWidth: 210 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -1065,6 +1083,10 @@ function FolderOfferMsg({ msg }) {
       <span className="stag" style={{ color: s.c, background: s.c + '12', border: `1px solid ${s.c}28`, flexShrink: 0 }}>{s.t}</span>
     </div>
     {msg.status === 'sending' && <div className="prog" style={{ marginTop: 6 }}><div className="prog-fill" style={{ width: '100%', background: T.amber, animation: 'pulse 1s infinite' }} /></div>}
+    {msg.status === 'sending' && msg.calcSpeed > 0 && <div style={{ fontSize: 10, color: T.textDim, display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+      <span>↑ {fmtSz(msg.calcSpeed)}/s</span>
+      <span>{msg.calcEta > 0 ? `~${fmtTime(msg.calcEta)} remaining` : ''}</span>
+    </div>}
     <div style={{ fontSize: 10, color: T.muted, marginTop: 6, textAlign: 'right' }}>{msg.time}</div>
   </div>
 }
@@ -1157,7 +1179,7 @@ function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
             {isDir && <span style={{ fontSize: 9, color: T.muted, flexShrink: 0 }}>▸</span>}
           </div>
         })}
-        {!entries.length && <div style={{ textAlign: 'center', padding: 20, color: T.muted, fontSize: 11 }}>Empty folder</div>}
+        {!entries.length && <div style={{ textAlign: 'center', padding: 20, color: T.textDim, fontSize: 11 }}>Empty folder</div>}
       </div>
     </div>}
     <div style={{ padding: '0 11px 7px', fontSize: 10, color: T.muted, textAlign: 'right' }}>{msg.time}</div>
@@ -1197,11 +1219,38 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
     {!done && <div style={{ padding: '0 11px 9px' }}>
       {/* BUG-17 fix: use actual received/total ratio instead of indeterminate 100% */}
       <div className="prog" style={{ marginBottom: 3 }}><div className="prog-fill" style={{ width: `${msg.totalFiles > 0 ? Math.round((msg.receivedCount || 0) / msg.totalFiles * 100) : 0}%`, background: T.green, transition: 'width .3s' }} /></div>
-      <div style={{ fontSize: 9, color: T.muted, marginTop: 1, display: 'flex', justifyContent: 'space-between' }}>
+      <div style={{ fontSize: 11, color: T.textDim, marginTop: 1, display: 'flex', justifyContent: 'space-between' }}>
         <span>↓ {msg.receivedCount || 0} of {msg.totalFiles} files received</span>
         <span>{msg.totalFiles > 0 ? Math.round((msg.receivedCount || 0) / msg.totalFiles * 100) : 0}%</span>
       </div>
-      <div style={{ fontSize: 9, color: T.amber, marginTop: 2 }}>⚠ Large folders may take time — files transfer one at a time over encrypted TCP</div>
+      
+      {/* Speed computation */}
+      {(() => {
+        const hist = msg.speedHistory || []
+        if (hist.length < 2) return null
+        const first = hist[0], last = hist[hist.length - 1]
+        const dt = (last.t - first.t) / 1000
+        if (dt <= 0) return null
+        const speed = (last.b - first.b) / dt
+        if (speed <= 0) return null
+        const remBytes = (msg.totalBytes || 0) - (msg.bytesSent || 0)
+        const eta = remBytes > 0 ? Math.round(remBytes / speed) : 0
+        return <div style={{ fontSize: 10, color: T.textDim, display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+          <span>↓ {fmtSz(speed)}/s</span>
+          <span>{eta > 0 ? `~${fmtTime(eta)} remaining` : ''}</span>
+        </div>
+      })()}
+      
+      {/* Stall Detection */}
+      {(() => {
+        if (!msg.lastGotT) return null
+        const stallMs = Date.now() - msg.lastGotT
+        if (stallMs > 30000) return <div style={{ fontSize: 10, color: T.red, marginTop: 5 }}>❌ Transfer failed or sender disconnected</div>
+        if (stallMs > 10000) return <div style={{ fontSize: 10, color: T.amber, marginTop: 5 }}>⚠ Transfer stalled ({Math.floor(stallMs/1000)}s)</div>
+        return null
+      })()}
+
+      <div style={{ fontSize: 9, color: T.amber, marginTop: 5 }}>⚠ Large folders may take time — files transfer one at a time over encrypted TCP</div>
     </div>}
     {done && expanded && <div style={{ borderTop: `1px solid ${T.green}20` }}>
       <div style={{ padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 5, background: T.surface }}>
@@ -1298,7 +1347,7 @@ function FolderViewer({ folder, onClose }) {
             {!isDir && <span style={{ fontSize: 8, fontWeight: 700, padding: '1px 3px', borderRadius: 3, border: `1px solid ${col}38`, color: col }}>{ext.toUpperCase()}</span>}
           </div>
         })}
-        {!entries.length && <div style={{ textAlign: 'center', padding: 24, color: T.muted, fontSize: 11 }}>Empty</div>}
+        {!entries.length && <div style={{ textAlign: 'center', padding: 24, color: T.textDim, fontSize: 11 }}>Empty</div>}
       </div>
     </div>
   </div>
@@ -1379,7 +1428,7 @@ function VerifyModal({ fingerprint, peerName, onClose, onVerified }) {
       <div style={{ fontSize: 14, color: T.accent, fontWeight: 700, textAlign: 'center', marginBottom: 4 }}>Session Verification Code</div>
       <div style={{ fontSize: 11, color: T.textDim, textAlign: 'center', lineHeight: 1.7, marginBottom: 14 }}>Read this code aloud to <strong style={{ color: T.text }}>{peerName || 'your peer'}</strong>.<br />If they see the exact same code, the connection is secure.</div>
       <div style={{ background: '#010409', border: `1px solid ${T.accent}30`, borderRadius: 8, padding: '14px 18px', textAlign: 'center', marginBottom: 14, fontFamily: 'monospace', fontSize: 18, fontWeight: 700, color: T.green, letterSpacing: 3 }}>{fingerprint}</div>
-      <div style={{ fontSize: 10, color: T.muted, textAlign: 'center', marginBottom: 14, lineHeight: 1.6 }}>This code is derived from both peers' ECDH public keys.<br />A Man-in-the-Middle attacker would produce a different code.</div>
+      <div style={{ fontSize: 11, color: T.textDim, textAlign: 'center', marginBottom: 14, lineHeight: 1.6 }}>This code is derived from both peers' ECDH public keys.<br />A Man-in-the-Middle attacker would produce a different code.</div>
       <div style={{ display: 'flex', gap: 8 }}>
         <button onClick={onClose} className="btn btn-ghost" style={{ flex: 1, padding: 9 }}>Close</button>
         <button onClick={() => { onVerified?.(); onClose() }} className="btn btn-green" style={{ flex: 1, padding: 9 }}>✓ Verified — Matches</button>
@@ -1624,6 +1673,7 @@ export default function App() {
   const [onionAddr, setOnionAddr] = useState('')
   const [onionInput, setOnionInput] = useState('')
   const [torError, setTorError] = useState('')  // specific Tor error message
+  const [torBootPct, setTorBootPct] = useState(0)  // Tor bootstrap progress 0-100
   // FIX: Separate connection state for Tor vs local — they must not block each other
   const [torConnState, setTorConnState] = useState('idle') // idle|connecting|done|error
   const [torConnErr, setTorConnErr] = useState('')
@@ -1746,10 +1796,11 @@ export default function App() {
     const us = [
       window.ftps?.on('ftps:tor-status', d => {
         setTorStatus(d.status);
+        if (d.progress !== undefined) setTorBootPct(d.progress);
         if (d.onionAddress) setOnionAddr(d.onionAddress + ':' + (d.port || 7000));
         if (d.error) setTorError(d.error);
-        if (d.status === 'running') setTorError('');
-        if (d.status === 'off') { setOnionAddr(''); setTorError('') }
+        if (d.status === 'running') { setTorError(''); setTorBootPct(100) }
+        if (d.status === 'off') { setOnionAddr(''); setTorError(''); setTorBootPct(0) }
       }),
       // FIX: KNOWN-02 — removed dead subscriptions: ftps:upnp-status, ftps:pairing-status, ftps:stun-result
       // None of these channels are emitted by main.js
@@ -1764,7 +1815,6 @@ export default function App() {
       window.ftps?.on('ftps:file-aborted', ({ peerId, fid }) => {
         setMsgs(p => ({ ...p, [peerId]: (p[peerId] || []).map(m => m.id === fid + '_in' ? { ...m, type: 'revoked', revokedAt: new Date().toLocaleTimeString(), pct: 0 } : m) }))
       }),
-      // FIX: Session restore signal from main process (sent after renderer reload)
       window.ftps?.on('app:session-active', sess => {
         if (screen === 'restoring' || screen === 'setup') {
           const saved = readSavedSession()
@@ -1775,6 +1825,21 @@ export default function App() {
           }
         }
       }),
+      // Reconnect UI Events
+      window.ftps?.on('ftps:peer-reconnecting', ({ peerId, attempt, maxAttempts }) => {
+        setPeers(ps => ps.map(p => p.id === peerId ? { ...p, reconnecting: true, reconnectAttempt: attempt, reconnectMax: maxAttempts } : p))
+      }),
+      window.ftps?.on('ftps:peer-connected', ({ peerId }) => {
+        setPeers(ps => {
+          const wasReconn = ps.find(p => p.id === peerId)?.reconnecting
+          if (wasReconn) {
+             // flash green connected UI
+             setTimeout(() => setPeers(ps2 => ps2.map(p2 => p2.id === peerId ? { ...p2, newlyConnected: false } : p2)), 3000)
+             return ps.map(p => p.id === peerId ? { ...p, reconnecting: false, newlyConnected: true } : p)
+          }
+          return ps.map(p => p.id === peerId ? { ...p, reconnecting: false } : p)
+        })
+      })
     ]
     return () => us.forEach(u => u?.())
   }, [screen])
@@ -1836,11 +1901,13 @@ export default function App() {
         if (fingerprint) setPeerFingerprints(fp => ({ ...fp, [pid]: fingerprint }))
         if (identityKey) setPeerIdentityKeys(ik => ({ ...ik, [pid]: identityKey }))
         if (tofu === 'changed') {
+          // Only show modal and warning if the key CHANGED
           setShowTofuWarn({ peerId: pid, peerName: pn, tofuDetail })
           pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `⚠️ WARNING: Peer key has changed! Verify identity before continuing.`, time: now8() })
         } else if (tofu === 'trusted') {
           pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `🔒 Connected · Trusted peer · ECDH P-256 · AES-256-GCM`, time: now8() })
         } else {
+          // 'new' TOFU state (first time LAN or tor connect): silent connect
           pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `🔒 Connected · New peer · ECDH P-256 · AES-256-GCM`, time: now8() })
         }
         if (fingerprint) pushMsg(pid, { id: Date.now() + 1, from: 'sys', type: 'sys', text: `🔑 Session fingerprint: ${fingerprint}`, time: now8() })
@@ -1972,7 +2039,18 @@ export default function App() {
         // If so, this file is part of a pull operation — suppress standalone card
         pushMsg(pid, { id: meta.fid + '_in', from: 'them', type: 'file_in', meta, pct: 0, time: now8() })
       },
-      onFileProg(pid, fid, pct) { setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === fid + '_in' ? { ...m, pct } : m) })) },
+      onFileProg(pid, fid, pct, bytes) { 
+        setMsgs(p => ({ 
+          ...p, 
+          [pid]: (p[pid] || []).map(m => m.id === fid + '_in' ? { 
+            ...m, 
+            pct, 
+            bytesSent: bytes,
+            // Track speed over last 2 seconds
+            speedHistory: [...(m.speedHistory || []).filter(h => Date.now() - h.t < 2000), { t: Date.now(), b: bytes }]
+          } : m) 
+        })) 
+      },
       async onFileDone(pid, meta, blob, tmpPath) {
         // B6 FIX: Don't create standalone FileMsg for folder files or folder-pull files
         if (meta.folderFid !== undefined) return
@@ -1980,6 +2058,16 @@ export default function App() {
           folderPullFidsRef.current.delete(meta.fid)
           return
         }
+        // Extract final byte count if we were tracking it
+        setMsgs(p => {
+          const peersMsgs = p[pid] || []
+          const inMsg = peersMsgs.find(m => m.id === meta.fid + '_in')
+          if (inMsg) {
+             inMsg.bytesSent = meta.size
+             inMsg.speedHistory = [] // clear history on done
+          }
+          return p
+        })
         let threats = []
         // A1/B10 FIX: use settRef.current instead of stale `sett` closure
         try { if (blob && settRef.current.scanFiles) threats = await detectThreats(blob, meta.name || '') } catch { }
@@ -2027,14 +2115,22 @@ export default function App() {
         // Update receivedCount in message (triggers re-render for progress bar)
         setMsgs(p => ({
           ...p, [pid]: (p[pid] || []).map(m =>
-            m.id === 'fr_' + folderFid ? { ...m, receivedCount: (m.receivedCount || 0) + 1 } : m
+            m.id === 'fr_' + folderFid 
+              ? { 
+                  ...m, 
+                  receivedCount: (m.receivedCount || 0) + 1,
+                  bytesSent: (m.bytesSent || 0) + (meta.size || 0),
+                  speedHistory: [...(m.speedHistory || []).filter(h => Date.now() - h.t < 2000), { t: Date.now(), b: (m.bytesSent || 0) + (meta.size || 0) }],
+                  lastGotT: Date.now() // For stall detection
+                } 
+              : m
           )
         }))
       },
       onFolderComplete(pid, fid, name, fileCount) {
         setMsgs(p => ({
           ...p, [pid]: (p[pid] || []).map(m =>
-            m.id === 'fr_' + fid ? { ...m, complete: true, receivedCount: fileCount } : m
+            m.id === 'fr_' + fid ? { ...m, complete: true, receivedCount: fileCount, speedHistory: [] } : m
           )
         }))
         addLog('OK', `Folder received: ${name}`, `${fileCount} files`)
@@ -2087,7 +2183,22 @@ export default function App() {
       } catch { fileToSend = file }
     }
     const ok = await bridgeRef.current?.sendFile(selPeer.id, fileToSend, pct => {
-      setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).map(m => m.id === fid + '_out' ? { ...m, pct } : m) }))
+      setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).map(m => {
+        if (m.id !== fid + '_out') return m
+        const now = Date.now()
+        const bytesSent = Math.round(pct * (m.meta?.size || 0))
+        const hist = [...(m.speedHistory || []).filter(h => now - h.t < 2000), { t: now, b: bytesSent }]
+        let calcSpeed = 0, calcEta = 0
+        if (hist.length >= 2) {
+          const dt = (hist[hist.length - 1].t - hist[0].t) / 1000
+          if (dt > 0) {
+            calcSpeed = (hist[hist.length - 1].b - hist[0].b) / dt
+            const rem = (m.meta?.size || 0) - bytesSent
+            if (calcSpeed > 0 && rem > 0) calcEta = Math.round(rem / calcSpeed)
+          }
+        }
+        return { ...m, pct, bytesSent, speedHistory: hist, calcSpeed, calcEta }
+      }) }))
     }, fid, true)  // pass fid + useStream=true so tcpbridge uses file.path when available
     if (!ok) {
       notify(`Send failed: ${file.name}`, 'err')
@@ -2424,7 +2535,7 @@ export default function App() {
         <div style={{ fontSize: 11, color: T.accent, marginBottom: 16 }}>Peer-Networking</div>
         <div className="spin" style={{ width: 24, height: 24, border: `2px solid ${T.border}`, borderTopColor: T.accent, borderRadius: '50%', margin: '0 auto 10px' }} />
         <div style={{ fontSize: 12, color: T.textDim }}>Restoring session…</div>
-        <div style={{ fontSize: 10, color: T.muted, marginTop: 4 }}>Peer connections are unaffected</div>
+        <div style={{ fontSize: 11, color: T.textDim, marginTop: 4 }}>Peer connections are unaffected</div>
       </div>
     </div>
   )
@@ -2435,8 +2546,7 @@ export default function App() {
       <style>{G}</style><Toast n={toast} />
       <div style={{ width: '100%', maxWidth: 390 }} className="fadeup">
         <div style={{ textAlign: 'center', marginBottom: 24 }}>
-          <div style={{ width: 54, height: 54, borderRadius: 14, background: `linear-gradient(135deg,${T.accent}22,${T.accentDim}18)`, border: `1.5px solid ${T.accent}35`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 26, margin: '0 auto 12px', boxShadow: `0 0 24px ${T.accent}18` }}>🔐</div>
-          <div style={{ fontSize: 26, color: T.text, fontWeight: 800, letterSpacing: 1 }}>P2N(Peer-Networking)</div>
+          <div style={{ fontSize: 26, color: T.text, fontWeight: 800, letterSpacing: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>P2N(Peer-Networking) <span style={{ fontSize: 28 }}>🔐</span></div>
           <div style={{ fontSize: 10, color: T.textDim, marginTop: 5, display: 'flex', gap: 5, justifyContent: 'center', flexWrap: 'wrap' }}>
             {['Direct TCP', 'ECDH P-256', 'Ed25519', 'AES-256-GCM', 'Tor', 'TOFU'].map(b => (
               <span key={b} style={{ background: T.panel, border: `1px solid ${T.accent}22`, borderRadius: 4, padding: '2px 7px', color: T.textDim }}>{b}</span>
@@ -2479,9 +2589,8 @@ export default function App() {
       <div style={{ width: '100%', maxWidth: 330 }} className="fadeup">
         <div style={{ textAlign: 'center', marginBottom: 22 }}>
           <div style={{ fontSize: 20, fontWeight: 800, color: T.text, letterSpacing: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
-            <span style={{ fontSize: 22 }}>🔒</span>
             <span>Session Locked</span>
-            <span style={{ fontSize: 22 }}>🔒</span>
+            <span style={{ fontSize: 26, animation: 'lockpulse 2s ease-in-out infinite', display: 'inline-block' }}>🔒</span>
           </div>
           {lockTries > 0 && <div style={{ fontSize: 13, color: lockTries >= 3 ? T.red : T.amber, marginTop: 8, fontWeight: 600 }}>{lockTries} failed · {sett.maxTries - lockTries} left</div>}
         </div>
@@ -2719,7 +2828,7 @@ export default function App() {
                       <div style={{ fontSize: 9, color: T.green, fontWeight: 700, marginBottom: 7, letterSpacing: 1 }}>● LISTENING</div>
                       {listenInfo.localIPs.map(({ name, address }) => (
                         <div key={address} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
-                          <div><div style={{ fontSize: 12, color: T.text, fontWeight: 600 }}>{address}:{listenInfo.port}</div><div style={{ fontSize: 10, color: T.muted }}>{name}</div></div>
+                          <div><div style={{ fontSize: 12, color: T.text, fontWeight: 600 }}>{address}:{listenInfo.port}</div><div style={{ fontSize: 11, color: T.textDim }}>{name}</div></div>
                           <button onClick={() => { navigator.clipboard?.writeText(`${address}:${listenInfo.port}`); notify('Copied!', 'ok') }} className="btn btn-ghost btn-xs">⎘</button>
                         </div>
                       ))}
@@ -2761,9 +2870,15 @@ export default function App() {
                         : <button onClick={doStopTor} className="btn btn-danger" style={{ width: '100%', padding: 9 }}>■ Stop Tor</button>
                       }
                       {torStatus === 'starting' && (
-                        <div style={{ marginTop: 7, padding: '8px 11px', background: T.amber + '10', border: `1px solid ${T.amber}30`, borderRadius: 5, display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: T.amber }}>
-                          <div className="spin" style={{ width: 12, height: 12, border: `2px solid ${T.amber}40`, borderTopColor: T.amber, borderRadius: '50%', flexShrink: 0 }} />
-                          Tor is initializing… Please wait before generating or sharing your link.
+                        <div style={{ marginTop: 7, padding: '8px 11px', background: T.amber + '10', border: `1px solid ${T.amber}30`, borderRadius: 5 }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: T.amber, marginBottom: 4, fontWeight: 600 }}>
+                            <span>⟳ Bootstrapping Tor…</span>
+                            <span>{torBootPct}%</span>
+                          </div>
+                          <div className="prog"><div className="prog-fill" style={{ width: `${torBootPct}%`, background: T.amber, transition: 'width .3s' }} /></div>
+                          <div style={{ fontSize: 10, color: T.textDim, marginTop: 4 }}>
+                            {torBootPct < 25 ? 'Connecting to the Tor network…' : torBootPct < 80 ? 'Building circuits…' : torBootPct < 100 ? 'Almost ready…' : 'Generating onion address…'}
+                          </div>
                         </div>
                       )}
                       {!listenActive && torStatus === 'off' && <div style={{ fontSize: 10, color: T.textDim, marginTop: 5 }}>Listening will start automatically</div>}
@@ -2773,7 +2888,7 @@ export default function App() {
                           <input readOnly value={onionAddr} className="inp" style={{ flex: 1, fontSize: 10, padding: '3px 7px', fontFamily: 'monospace' }} />
                           <button onClick={() => { navigator.clipboard?.writeText(onionAddr); notify('Onion address copied!', 'ok') }} className="btn btn-ghost btn-xs">⎘</button>
                         </div>
-                        <div style={{ fontSize: 10, color: T.muted, marginTop: 4 }}>Share this with your peer</div>
+                        <div style={{ fontSize: 11, color: T.textDim, marginTop: 4 }}>Share this with your peer</div>
                       </div>}
                     </div>
                     <div>
@@ -2790,7 +2905,7 @@ export default function App() {
                   {torStatus === 'error' && <div style={{ padding: '8px 11px', background: T.red + '09', border: `1px solid ${T.red}22`, borderRadius: 5, fontSize: 11, color: T.red, marginTop: 6, lineHeight: 1.6 }}>
                     <div style={{ fontWeight: 700, marginBottom: 3 }}>✕ Tor Daemon Failed</div>
                     <div style={{ fontSize: 10, wordBreak: 'break-word' }}>{torError || 'Unknown error. Check Logs for details.'}</div>
-                    <div style={{ fontSize: 10, color: T.muted, marginTop: 4 }}>Run <code style={{ background: T.panel, padding: '1px 4px', borderRadius: 3, fontFamily: 'monospace' }}>python GetTorDaemon.py</code> to install/verify the Tor daemon.</div>
+                    <div style={{ fontSize: 11, color: T.textDim, marginTop: 4 }}>Run <code style={{ background: T.panel, padding: '1px 4px', borderRadius: 3, fontFamily: 'monospace' }}>python GetTorDaemon.py</code> to install/verify the Tor daemon.</div>
                   </div>}
                 </div>
 
@@ -2892,7 +3007,7 @@ export default function App() {
                     </div>
                     {/* Quick send */}
                     {selPeer.online && <div style={{ padding: '4px 11px', borderTop: `1px solid ${T.border}`, background: T.surface, display: 'flex', gap: 5, alignItems: 'center', flexShrink: 0 }}>
-                      <span style={{ fontSize: 10, color: T.muted, marginRight: 3 }}>Quick:</span>
+                      <span style={{ fontSize: 11, color: T.textDim, marginRight: 3 }}>Quick:</span>
                       <button onClick={() => fileInp.current?.click()} className="btn btn-ghost btn-xs">📄 File</button>
                       <button onClick={() => folderInp.current?.click()} className="btn btn-ghost btn-xs">📂 Folder</button>
                       <button onClick={() => setShowCode(true)} className="btn btn-ghost btn-xs">{'</>'} Code</button>
@@ -3014,7 +3129,7 @@ export default function App() {
                   <div className="card" style={{ padding: 14 }}>
                     <div className="sh">Protocol Info</div>
                     {[
-                      { l: 'Transport', v: 'TCP + FTPS' },
+                      { l: 'Transport', v: 'Direct TCP' },
                       { l: 'Encryption', v: 'AES-256-GCM' },
                       { l: 'Key Exchange', v: 'ECDH P-256' },
                       { l: 'Identity', v: 'TOFU Hash Verified', c: T.green }
@@ -3095,7 +3210,7 @@ export default function App() {
                           <div key={req.peerId} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 0', borderBottom: `1px solid ${T.border}30` }}>
                             <div>
                               <div style={{ fontSize: 11, color: T.text }}>{req.fromName || req.peerName || req.peerId}</div>
-                              <div style={{ fontSize: 9, color: remaining < 10 ? T.red : T.muted }}>{remaining}s remaining</div>
+                              <div style={{ fontSize: 11, color: remaining < 10 ? T.red : T.textDim }}>{remaining}s remaining</div>
                             </div>
                             <div style={{ display: 'flex', gap: 5 }}>
                               <button onClick={() => {
@@ -3117,7 +3232,7 @@ export default function App() {
                         })}
                       </div>
                     )}
-                    <div style={{ fontSize: 10, color: T.muted, marginTop: 8 }}>📡 Peers auto-discovered via mDNS on your local network</div>
+                    <div style={{ fontSize: 11, color: T.textDim, marginTop: 6 }}>📡 Peers auto-discovered via mDNS on your local network</div>
                   </div>
                 )}
                 {discoveredPeers.length === 0 && listenActive && (
@@ -3133,7 +3248,7 @@ export default function App() {
                   </div>
                 )}
                 {discoveredPeers.length === 0 && !listenActive && (
-                  <div style={{ padding: '10px 12px', background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, fontSize: 11, color: T.muted, marginBottom: 10 }}>
+                  <div style={{ padding: '10px 12px', background: T.panel, border: `1px solid ${T.border}`, borderRadius: 6, fontSize: 11, color: T.textDim, marginBottom: 10 }}>
                     📡 mDNS discovery starts automatically when you click "Start Listening" in the Connect tab.
                   </div>
                 )}
@@ -3145,7 +3260,7 @@ export default function App() {
               <div style={{ flex: 1, overflowY: 'auto', padding: 16 }} className="fadein">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
                   <div style={{ fontSize: 10, color: T.accent, fontWeight: 700, letterSpacing: 2 }}>▲ TECHNICAL DASHBOARD</div>
-                  <div style={{ fontSize: 9, color: T.muted }}>Real-time frequency: 1,500ms</div>
+                  <div style={{ fontSize: 11, color: T.textDim }}>Real-time frequency: 1,500ms</div>
                 </div>
 
                 <div className="card glass glow-blue" style={{ background: `linear-gradient(180deg, ${T.panel}, ${T.bg})`, padding: 16, marginBottom: 16 }}>
@@ -3163,7 +3278,7 @@ export default function App() {
                     <ResourceBar label="CPU Load Avg" val={(sysStats?.loadAvg || 0) * 100} max={100} col={T.blue} />
                     <ResourceBar label="Heap Used" val={sysStats?.heapUsed || 0} max={sysStats?.heapTotal || 1} col={T.accent} />
                     <div style={{ marginTop: 10, background: T.bg, padding: 8, borderRadius: 6, border: `1px solid ${T.border}` }}>
-                      <div style={{ fontSize: 9, color: T.muted, textTransform: 'uppercase', marginBottom: 4 }}>Internal Node Engine</div>
+                      <div style={{ fontSize: 10, color: T.textDim, textTransform: 'uppercase', marginBottom: 4 }}>Internal Node Engine</div>
                       <div style={{ fontSize: 11, color: T.textMid, fontFamily: 'monospace' }}>{sysStats?.nodeVer || '…'}</div>
                     </div>
                   </div>
@@ -3228,7 +3343,7 @@ export default function App() {
                   <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${T.border}` }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: T.text }}>Max unlock attempts</div>
-                      <div style={{ fontSize: 10, color: T.muted }}>Session wipes after this many wrong tries</div>
+                      <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>Session wipes after this many wrong tries</div>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <button onClick={() => { const v = Math.max(3, sett.maxTries - 1); setSett2(p => ({ ...p, maxTries: v })); window.ftps?.setMaxRetries(v) }} className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: 14 }}>−</button>
@@ -3242,8 +3357,8 @@ export default function App() {
                   <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${T.border}` }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: T.text }}>Listen Port</div>
-                      <div style={{ fontSize: 10, color: T.muted, marginTop: 1 }}>
-                        {listenActive ? '⚠ Stop listening first to change port' : 'Enter port → press Save. This is the only place to change port.'}
+                      <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>
+                        {listenActive ? '⚠ Stop listening first to change port' : 'Enter port → Save. Takes effect on next session start.'}
                       </div>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -3271,7 +3386,7 @@ export default function App() {
                   <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0' }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: T.text }}>Tor Daemon</div>
-                      <div style={{ fontSize: 10, color: T.muted }}>{torStatus === 'running' ? '● Running' : torStatus === 'starting' ? '⟳ Starting — please wait…' : '○ Off'}</div>
+                      <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>{torStatus === 'running' ? '● Running' : torStatus === 'starting' ? '⟳ Starting — please wait…' : '○ Off'}</div>
                     </div>
                     <button onClick={async () => {
                       if (torStatus === 'starting') { notify('Please wait — Tor is still initializing', 'info'); return }
@@ -3331,7 +3446,7 @@ export default function App() {
                   <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0' }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: T.text }}>Strip metadata on receive</div>
-                      <div style={{ fontSize: 10, color: T.muted }}>Auto-strips EXIF/XMP from received images & PDFs before displaying</div>
+                      <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>Auto-strips EXIF/XMP from received images &amp; PDFs before saving</div>
                     </div>
                     <button onClick={() => setSett2(p => ({ ...p, exifStripRecv: !p.exifStripRecv }))} className="btn btn-xs" style={{ background: sett.exifStripRecv ? T.green + '16' : T.panel, border: `1px solid ${sett.exifStripRecv ? T.green : T.border}`, color: sett.exifStripRecv ? T.green : T.textDim, minWidth: 36 }}>
                       {sett.exifStripRecv ? 'ON' : 'OFF'}
@@ -3342,12 +3457,12 @@ export default function App() {
                 <div className="card" style={{ padding: 14, marginBottom: 11 }}>
                   <div className="sh">Blocked Peers</div>
                   {blockedPeers.length === 0 ? (
-                    <div style={{ fontSize: 11, color: T.muted, padding: '8px 0' }}>No blocked peers</div>
+                    <div style={{ fontSize: 11, color: T.textDim, padding: '8px 0' }}>No blocked peers</div>
                   ) : blockedPeers.map(bp => (
                     <div key={bp.id} style={{ display: 'flex', alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${T.border}30`, gap: 8 }}>
                       <div style={{ flex: 1 }}>
                         <div style={{ fontSize: 11, color: T.text, fontWeight: 600 }}>{bp.name || bp.id}</div>
-                        <div style={{ fontSize: 9, color: T.muted }}>{bp.id} · Blocked {bp.blockedAt?.slice(0, 10) || ''}</div>
+                        <div style={{ fontSize: 10, color: T.textDim }}>{bp.id} · Blocked {bp.blockedAt?.slice(0, 10) || ''}</div>
                       </div>
                       <button onClick={async () => {
                         await window.ftps?.unblockPeer(bp.id)
@@ -3364,7 +3479,7 @@ export default function App() {
                   <div style={{ fontSize: 12, color: T.text, marginBottom: 8, fontWeight: 600 }}>🔒 Ephemeral by design — nothing stored between sessions</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                     {[
-                      ['🔑', 'Identity keypair', 'Fresh Ed25519 keys generated every launch — in memory only'],
+                      ['🔑', 'Identity keypair', 'Fresh ED25519 keys generated every launch — in memory only'],
                       ['🤝', 'TOFU peer trust', 'Verified this session only — resets on close'],
                       ['🚫', 'Blocked peers', 'Session-only — cleared on close'],
                       ['💬', 'Messages & files', 'Never written to disk by P2N'],
@@ -3374,12 +3489,12 @@ export default function App() {
                         <span style={{ fontSize: 13, marginTop: 1 }}>{icon}</span>
                         <div>
                           <span style={{ fontSize: 11, color: T.text, fontWeight: 600 }}>{label}: </span>
-                          <span style={{ fontSize: 11, color: T.muted }}>{desc}</span>
+                          <span style={{ fontSize: 11, color: T.textDim }}>{desc}</span>
                         </div>
                       </div>
                     ))}
                   </div>
-                  <div style={{ marginTop: 10, padding: '7px 10px', background: T.accent + '0a', border: `1px solid ${T.accent}18`, borderRadius: 6, fontSize: 10, color: T.textDim, lineHeight: 1.6 }}>
+                  <div style={{ marginTop: 10, padding: '7px 10px', background: T.accent + '0a', border: `1px solid ${T.accent}18`, borderRadius: 6, fontSize: 11, color: T.textDim, lineHeight: 1.6 }}>
                     💡 <strong style={{ color: T.text }}>Workflow:</strong> Start app → Tor generates onion address → share it via Discord / Signal → peer pastes and connects → encrypted session begins. Every session is fresh.
                   </div>
                 </div>
@@ -3387,7 +3502,7 @@ export default function App() {
                 <div className="card" style={{ padding: 14, marginBottom: 11 }}>
                   <div className="sh">Session</div>
                   <button onClick={doTerminate} className="btn btn-danger" style={{ width: '100%', padding: 11, fontSize: 13, marginTop: 6 }}>🚪 End Session</button>
-                  <div style={{ fontSize: 10, color: T.muted, marginTop: 6, textAlign: 'center' }}>This will disconnect all peers and clear all session data</div>
+                  <div style={{ fontSize: 11, color: T.textDim, marginTop: 6, textAlign: 'center' }}>Disconnects all peers and wipes all session data</div>
                 </div>
                 <div style={{ padding: '10px 14px', background: T.panel, borderRadius: 8, fontSize: 12, color: T.textDim, lineHeight: 1.7 }}>
                   <div>🔒 Zero persistence — identity, peers, messages never written to disk</div>

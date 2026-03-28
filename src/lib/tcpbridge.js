@@ -62,6 +62,12 @@ export class TCPBridge {
       window.ftps.on('ftps:folder-complete', ({ peerId, fid, name, fileCount }) => {
         this.h.onFolderComplete?.(peerId, fid, name, fileCount)
       }),
+
+      // <!-- FIX: Issue 14 --> Handle canceled transfers
+      window.ftps.on('ftps:file-aborted', ({ peerId, fid }) => {
+        this._folderFileCache.delete(fid)
+        this.h.onFileAborted?.(peerId, fid)
+      }),
     ]
   }
   async sendMsg(peerId, payload) {

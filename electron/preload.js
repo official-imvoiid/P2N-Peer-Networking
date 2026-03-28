@@ -65,12 +65,20 @@ contextBridge.exposeInMainWorld('ftps', {
   blockPeer: (peerId, peerName, reason) => ipcRenderer.invoke('ftps:block-peer', { peerId, peerName, reason }),
   unblockPeer: (peerId) => ipcRenderer.invoke('ftps:unblock-peer', { peerId }),
   getBlocked: () => ipcRenderer.invoke('ftps:get-blocked'),
+  // <!-- FIX: Issue 9 --> Block IP
+  blockIp: (ip, reason) => ipcRenderer.invoke('ftps:block-ip', { ip, reason }),
 
   // FIX #2/#5: Streaming file send (path-based, no RAM limit)
   sendFileStream: (peerId, fid, name, size, mime, filePath, extraMeta) =>
     ipcRenderer.invoke('ftps:send-file-stream', { peerId, fid, name, size, mime, filePath, extraMeta }),
   sendFileInFolderStream: (peerId, fid, name, size, mime, filePath, folderFid, relPath, idx) =>
     ipcRenderer.invoke('ftps:send-file-in-folder', { peerId, fid, name, size, mime, filePath, folderFid, folderRelPath: relPath, fileIndex: idx }),
+  
+  // <!-- FIX: Issue 9 & 12 --> New archive and file capabilities
+  extractArchiveFromPath: (name, archPath) => ipcRenderer.invoke('ftps:extract-archive-from-path', { name, archPath }),
+  readFileForPreview: (filePath) => ipcRenderer.invoke('ftps:read-file-for-preview', { filePath }),
+  find7z: () => ipcRenderer.invoke('ftps:find-7z'),
+
   // FIX #3: Rename info
   getRenameInfo: () => ipcRenderer.invoke('ftps:get-rename-info'),
   on: (channel, cb) => {
@@ -78,7 +86,7 @@ contextBridge.exposeInMainWorld('ftps', {
       'ftps:peer-connected', 'ftps:peer-disconnected', 'ftps:message',
       'ftps:file-start', 'ftps:file-progress', 'ftps:file-done', 'ftps:send-progress',
       'ftps:server-error', 'ftps:peer-reconnecting',
-      'ftps:peers-discovered', 'ftps:tor-status', 'p2n:log', 'app:request-close', 'app:session-active',
+      'ftps:peers-discovered', 'ftps:tor-status', 'ftps:tor-progress', 'p2n:log', 'app:request-close', 'app:session-active',
       'ftps:listen-auto',
       'ftps:file-aborted',
       'ftps:folder-manifest', 'ftps:folder-file-done', 'ftps:folder-complete',
