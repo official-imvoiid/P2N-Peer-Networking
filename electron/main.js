@@ -17,10 +17,10 @@ const dns = require('dns')
 const { exec, execFile } = require('child_process')
 // Note: http and https modules removed — were imported but never used
 
-// B9 FIX: 512KB chunks (was 64KB) for faster transfers
+// 512KB chunks for non-streaming (legacy base64)
 const CHUNK = 524288
-// <!-- FIX: Issue 2 --> 2MB chunks for streaming path (path-based sends)
-const STREAM_CHUNK = 2097152
+// 4MB chunks for streaming path — bigger chunks = fewer frames = faster throughput
+const STREAM_CHUNK = 4194304
 const FRAME_HDR = 4
 
 // ── MUTABLE STATE ─────────────────────────────────────────────────────────────
@@ -769,29 +769,42 @@ function connectViaTor(onionHost, port) {
   })
 }
 
-// <!-- FIX: Issue 5 --> Network online polling — detect internet recovery and trigger reconnects
+// FIX Issue 5: Network online polling — detect internet recovery and trigger reconnects
 let _networkPollTimer = null
 function startNetworkPolling() {
   if (_networkPollTimer) return
   _networkPollTimer = setInterval(() => {
     const ips = getLocalIPs()
-    if (ips.length > 0 && wasOffline) {
+    const isOnline = ips.length > 0
+
+    if (isOnline && wasOffline) {
       wasOffline = false
       secEntry('INFO', 'Network back online — attempting reconnects')
+      emit('ftps:network-status', { online: true })
+      // Attempt immediate reconnects for all pending peers
       pendingReconnects.forEach((info, peerId) => {
         if (info.timer) clearTimeout(info.timer)
-        // Trigger immediate reconnect attempt
         const sock = net.createConnection({ host: info.host, port: info.port }, () => {
           const nc = new PeerConn(sock, { host: info.host, port: info.port })
-          if (peerId) { peers.delete(peerId); peers.set(peerId, nc) }
+          peers.delete(peerId)
+          peers.set(peerId, nc)
           pendingReconnects.delete(peerId)
         })
         sock.on('error', () => {})
         sock.setTimeout(8000, () => { sock.destroy() })
       })
-    } else if (ips.length === 0 && !wasOffline) {
+      // Also attempt to restart Tor if it was running before
+      if (torEnabled && !torProcess && tcpServer) {
+        const listenPort = tcpServer.address()?.port
+        if (listenPort) {
+          secEntry('INFO', 'Restarting Tor after network recovery')
+          startTorHiddenService(listenPort).catch(e => secEntry('WARN', 'Tor restart after network recovery failed', e.message))
+        }
+      }
+    } else if (!isOnline && !wasOffline) {
       wasOffline = true
       secEntry('WARN', 'Network appears offline')
+      emit('ftps:network-status', { online: false })
     }
   }, 5000)
 }
@@ -835,27 +848,38 @@ function find7zBin() {
 }
 
 // <!-- FIX: Issue 3 & 12 --> Fast archive listing without extraction
-async function listArchive(src) {
+async function listArchive(src, password) {
   return new Promise((resolve, reject) => {
     const e = src.toLowerCase(), files = []
     const _7z = find7zBin()
+    const pwArgs = (password && password.length > 0) ? ['-p' + password] : []
 
-    if (_7z && /\.(7z|zip|rar|tar(\.gz|\.bz2|\.xz)?|tgz|tbz2)$/i.test(e)) {
-      // Use 7z if available — it supports everything and has a standard list format `-slt`
-      execFile(_7z, ['l', '-slt', src], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
-        if (err) return reject(new Error('7-Zip list failed'))
-        let current = {}, blocks = stdout.split('\n\n')
+    if (_7z && /\.(zip|tar(\.gz|\.bz2|\.xz)?|tgz|tbz2)$/i.test(e)) {
+      // FIX 11: RAR/7z hard-rejected — only ZIP and TAR variants supported
+      if (/\.(rar|7z)$/i.test(e)) return reject(new Error('RAR and 7z formats are no longer supported. Please use ZIP or TAR.'))
+      execFile(_7z, ['l', '-slt', ...pwArgs, src], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          const combined = ((stdout || '') + (stderr || '')).toLowerCase()
+          if (combined.includes('wrong password') || combined.includes('cannot open encrypted') || combined.includes('data error')) {
+            return reject(Object.assign(new Error('Wrong password'), { isWrongPassword: true }))
+          }
+          return reject(new Error('7-Zip list failed: ' + err.message))
+        }
+        const blocks = stdout.split('\n\n')
+        let anyEncrypted = false
         for (const block of blocks) {
           const dict = {}
           for (const line of block.split('\n')) {
             const m = line.match(/^([^=]+)\s+=\s+(.*)$/)
             if (m) dict[m[1].trim()] = m[2].trim()
           }
+          if (dict.Encrypted === '+') anyEncrypted = true
           if (dict.Path && dict.Path !== src && dict.Attributes !== 'D') {
             const size = parseInt(dict.Size || '0', 10)
-            files.push({ path: dict.Path.replace(/\\/g, '/'), size: isNaN(size) ? 0 : size })
+            files.push({ path: dict.Path.replace(/\\/g, '/'), size: isNaN(size) ? 0 : size, encrypted: dict.Encrypted === '+' })
           }
         }
+        if (!password && anyEncrypted) return reject(Object.assign(new Error('Archive is password-protected'), { isEncrypted: true }))
         resolve(files)
       })
     } else if (process.platform === 'win32' && e.endsWith('.zip')) {
@@ -923,7 +947,40 @@ function cleanupAllSandboxes() {
   for (const [, dir] of sandboxes) try { fs.rmSync(path.dirname(dir), { recursive: true, force: true }) } catch { }
   sandboxes.clear()
 }
-// A7 FIX: Removed duplicate cleanupAllSandboxes — already handled in before-quit above
+
+// FIX Issue 9/12: Missing extractArchive function — was called in ftps:extract-archive but never defined
+// Supports zip, tar, 7z, rar (with 7-Zip), tgz, bz2
+function extractArchive(src, destDir) {
+  return new Promise((resolve, reject) => {
+    const e = src.toLowerCase()
+    const _7z = find7zBin()
+
+    // FIX 11: Hard-reject RAR and 7z formats
+    if (/\.(rar|7z)$/i.test(e)) {
+      return reject(new Error('RAR and 7z formats are no longer supported. Please use ZIP or TAR.'))
+    }
+
+    if (_7z) {
+      // 7-Zip handles everything: zip, rar, 7z, tar, gz, bz2, xz, tgz
+      execFile(_7z, ['x', src, `-o${destDir}`, '-y', '-r'], { timeout: 300000, maxBuffer: 8 * 1024 * 1024 }, err => {
+        if (err) reject(new Error('7-Zip extraction failed: ' + err.message))
+        else resolve()
+      })
+    } else if (process.platform !== 'win32' && e.endsWith('.zip')) {
+      execFile('unzip', ['-o', src, '-d', destDir], { timeout: 300000 }, err => err ? reject(err) : resolve())
+    } else if (process.platform === 'win32' && e.endsWith('.zip')) {
+      execFile('tar', ['-xf', src, '-C', destDir], { timeout: 300000 }, err => err ? reject(err) : resolve())
+    } else if (/\.(tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz)$/i.test(e)) {
+      execFile('tar', ['-xf', src, '-C', destDir], { timeout: 300000 }, err => err ? reject(err) : resolve())
+    } else if (e.endsWith('.gz') && !e.endsWith('.tar.gz')) {
+      // Single .gz file
+      const outFile = path.join(destDir, path.basename(src, '.gz'))
+      exec(`gzip -cd "${src}" > "${outFile}"`, { timeout: 300000 }, err => err ? reject(err) : resolve())
+    } else {
+      reject(new Error('Unsupported archive format. Install 7-Zip for full support (zip, rar, 7z, tar, etc.)'))
+    }
+  })
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // PEER CONN — Full E2E Encryption Stack (v5)
@@ -1174,9 +1231,11 @@ class PeerConn {
   }
 
   send(obj) {
+    // FIX 8F: Guard against write-after-destroy during reconnect window
+    if (this._closed || this.socket?.destroyed) return false
     if (!this.ready || !this._txKey) {
-      if (this._reconnecting) { this._sendQueue.push(obj); return }
-      return
+      if (this._reconnecting) { this._sendQueue.push(obj); return true }
+      return false
     }
     try {
       // Prepend 8-byte monotonic seq counter before JSON payload
@@ -1192,42 +1251,92 @@ class PeerConn {
       hdr.writeUInt32BE(frame.length, 0)
       this.socket.write(Buffer.concat([hdr, frame]))
       totalBytesSent += 4 + frame.length
-    } catch (e) { secEntry('ERR', 'Send failed', e.message) }
+      return true
+    } catch (e) { secEntry('ERR', 'Send failed', e.message); return false }
   }
   async _dispatch(msg) {
+    // FIX 9: Security — check block list on EVERY incoming message, not just HELLO.
+    // If a peer was blocked after connecting, their messages are silently dropped.
+    // BUG 5A FIX: Immediately destroy the socket to prevent more buffered messages
+    // from being dispatched between the isBlocked check and _close() completion.
+    if (this.id && isBlocked(this.id)) {
+      secEntry('WARN', `Blocked peer ${this.name || this.id} sent message after block — dropping and disconnecting`)
+      try { this.socket.destroy() } catch { }
+      this._close()
+      return
+    }
     switch (msg.type) {
       case 'chat': emit('ftps:message', { peerId: this.id, msg }); break
       case 'file_start': {
         const largeTmpPath = path.join(os.tmpdir(), 'p2n-recv-' + msg.fid + '-' + crypto.randomBytes(4).toString('hex'))
-        this._filebufs.set(msg.fid, { meta: msg, chunks: new Map(), tmpPath: largeTmpPath, written: 0 })
+        // FIX 8A: Open a WriteStream immediately for large files — chunks write directly to disk
+        // instead of accumulating in RAM. For small files (<1MB) we still use in-memory buffer.
+        const STREAM_THRESHOLD = 1 * 1024 * 1024
+        let ws = null
+        if (msg.size > STREAM_THRESHOLD) {
+          try { ws = fs.createWriteStream(largeTmpPath) } catch { }
+        }
+        this._filebufs.set(msg.fid, {
+          meta: msg, chunks: ws ? null : new Map(),
+          tmpPath: largeTmpPath, written: 0, nextExpected: 0,
+          ws, reorderBuf: ws ? new Map() : null, lastProgressEmit: 0
+        })
         emit('ftps:file-start', { peerId: this.id, meta: msg })
         break
       }
       case 'file_chunk': {
         const fb = this._filebufs.get(msg.fid)
         if (fb) {
-          fb.chunks.set(msg.i, Buffer.from(msg.d, 'base64'))
-          emit('ftps:file-progress', { peerId: this.id, fid: msg.fid, pct: fb.chunks.size / fb.meta.total })
+          const chunk = Buffer.from(msg.d, 'base64')
+          if (fb.ws) {
+            // FIX 8A: Incremental write — stream chunks to disk immediately
+            if (msg.i === fb.nextExpected) {
+              fb.ws.write(chunk)
+              fb.written++
+              fb.nextExpected++
+              // Flush any buffered out-of-order chunks
+              while (fb.reorderBuf.has(fb.nextExpected)) {
+                fb.ws.write(fb.reorderBuf.get(fb.nextExpected))
+                fb.reorderBuf.delete(fb.nextExpected)
+                fb.written++
+                fb.nextExpected++
+              }
+            } else {
+              // Out-of-order chunk (rare over TCP, but safe)
+              fb.reorderBuf.set(msg.i, chunk)
+            }
+          } else {
+            // Small file: in-memory
+            fb.chunks.set(msg.i, chunk)
+            fb.written = fb.chunks.size
+          }
+          // FIX 8C: Throttle progress to max 10/sec per fid
+          const now = Date.now()
+          if (now - fb.lastProgressEmit > 100) {
+            fb.lastProgressEmit = now
+            emit('ftps:file-progress', { peerId: this.id, fid: msg.fid, pct: fb.written / fb.meta.total })
+          }
         }
         break
       }
       case 'file_end': {
         const fb = this._filebufs.get(msg.fid)
         if (fb) {
-          const sorted = [...fb.chunks.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1])
-          const LARGE_THRESHOLD = 32 * 1024 * 1024
-          if (fb.meta.size > LARGE_THRESHOLD) {
+          // Emit final 100% progress
+          emit('ftps:file-progress', { peerId: this.id, fid: msg.fid, pct: 1 })
+          if (fb.ws) {
+            // FIX 8A: Close the write stream — file is already on disk
             try {
-              const tmpPath = fb.tmpPath
-              const ws = fs.createWriteStream(tmpPath)
-              await new Promise((res, rej) => { ws.on('finish', res); ws.on('error', rej); sorted.forEach(c => ws.write(c)); ws.end() })
-              emit('ftps:file-done', { peerId: this.id, meta: fb.meta, dataB64: null, tmpPath })
-              secEntry('OK', `Large file received: ${fb.meta.name}`, `${fb.meta.size}B → ${tmpPath}`)
+              await new Promise((res, rej) => { fb.ws.on('finish', res); fb.ws.on('error', rej); fb.ws.end() })
+              emit('ftps:file-done', { peerId: this.id, meta: fb.meta, dataB64: null, tmpPath: fb.tmpPath })
+              secEntry('OK', `File received (streamed): ${fb.meta.name}`, `${fb.meta.size}B → ${fb.tmpPath}`)
             } catch (e) {
-              secEntry('ERR', `Large file write failed: ${fb.meta.name}`, e.message)
+              secEntry('ERR', `File stream close failed: ${fb.meta.name}`, e.message)
               emit('ftps:file-done', { peerId: this.id, meta: fb.meta, dataB64: null, tmpPath: null })
             }
           } else {
+            // Small file: concat in memory, send as base64
+            const sorted = [...fb.chunks.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1])
             const data = Buffer.concat(sorted)
             emit('ftps:file-done', { peerId: this.id, meta: fb.meta, dataB64: data.toString('base64'), tmpPath: null })
             secEntry('OK', `File received: ${fb.meta.name}`, `${fb.meta.size}B`)
@@ -1272,6 +1381,23 @@ class PeerConn {
     this.send({ type: 'file_start', fid, name, size, total, mime, ...extraMeta })
     secEntry('OK', `Sending: ${name}`, `${size}B${filePath ? ' (stream)' : ''}`)
 
+    // FIX 8C: Throttle send-progress to max 10/sec
+    let lastSendProgressEmit = 0
+    const emitSendProgress = (i) => {
+      const now = Date.now()
+      if (now - lastSendProgressEmit > 100 || i === total - 1) {
+        lastSendProgressEmit = now
+        emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total, bytesSent: Math.min((i + 1) * chunkSize, size) })
+      }
+    }
+    // FIX 8B: Backpressure helper — wait for drain if socket buffer is full
+    const waitForDrain = () => {
+      if (this.socket && !this.socket.destroyed && this.socket.writableLength > 8 * 1024 * 1024) {
+        return new Promise(r => this.socket.once('drain', r))
+      }
+      return null
+    }
+
     if (filePath) {
       // ── STREAMING PATH: read directly from disk, never fully in memory ──
       let fd
@@ -1279,18 +1405,29 @@ class PeerConn {
         fd = fs.openSync(filePath, 'r')
         const buf = Buffer.allocUnsafe(chunkSize)
         for (let i = 0; i < total; i++) {
-          if (abort.cancelled) {
-            this.send({ type: 'file_abort', fid })
+          // BUG 2 FIX: Check socket health BEFORE each chunk send.
+          // If socket died mid-transfer, abort immediately and notify receiver.
+          if (abort.cancelled || this._closed || this.socket?.destroyed) {
+            try { this.send({ type: 'file_abort', fid }) } catch { }
             this._activeSends.delete(fid)
-            secEntry('INFO', `Send cancelled: ${name}`)
+            secEntry('INFO', `Send cancelled/disconnected: ${name}`)
+            emit('ftps:send-progress', { peerId: this.id, fid, pct: -1, error: 'cancelled' })
             return
           }
           const bytesRead = fs.readSync(fd, buf, 0, chunkSize, i * chunkSize)
-          this.send({ type: 'file_chunk', fid, i, d: buf.slice(0, bytesRead).toString('base64') })
-          // <!-- FIX: Issue 2 --> Yield less often (16) to increase streaming throughput
-          if (i % 16 === 0) await new Promise(r => setImmediate(r))
-          // <!-- FIX: Issue 2 --> Add bytesSent for UI speed computation
-          emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total, bytesSent: Math.min((i + 1) * chunkSize, size) })
+          const sent = this.send({ type: 'file_chunk', fid, i, d: buf.slice(0, bytesRead).toString('base64') })
+          // BUG 2 FIX: If send() returned false, socket is dead — abort the loop
+          if (sent === false) {
+            this._activeSends.delete(fid)
+            secEntry('WARN', `Send failed mid-transfer: ${name} (socket dead at chunk ${i}/${total})`)
+            emit('ftps:send-progress', { peerId: this.id, fid, pct: -1, error: 'disconnected' })
+            return
+          }
+          // FIX 8B: Respect TCP backpressure instead of blind setImmediate yield
+          const drain = waitForDrain()
+          if (drain) await drain
+          else if (i % 16 === 0) await new Promise(r => setImmediate(r))
+          emitSendProgress(i)
         }
       } finally {
         if (fd !== undefined) try { fs.closeSync(fd) } catch { }
@@ -1299,16 +1436,25 @@ class PeerConn {
       // ── LEGACY BASE64 PATH: kept for backward compat / non-path files ──
       const raw = Buffer.from(dataB64, 'base64')
       for (let i = 0; i < total; i++) {
-        if (abort.cancelled) {
-          this.send({ type: 'file_abort', fid })
+        if (abort.cancelled || this._closed || this.socket?.destroyed) {
+          try { this.send({ type: 'file_abort', fid }) } catch { }
           this._activeSends.delete(fid)
-          secEntry('INFO', `Send cancelled: ${name}`)
+          secEntry('INFO', `Send cancelled/disconnected: ${name}`)
+          emit('ftps:send-progress', { peerId: this.id, fid, pct: -1, error: 'cancelled' })
           return
         }
-        this.send({ type: 'file_chunk', fid, i, d: raw.slice(i * chunkSize, (i + 1) * chunkSize).toString('base64') })
-        if (i % 4 === 0) await new Promise(r => setImmediate(r))
-        // <!-- FIX: Issue 2 --> Add bytesSent
-        emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total, bytesSent: Math.min((i + 1) * chunkSize, size) })
+        const sent = this.send({ type: 'file_chunk', fid, i, d: raw.slice(i * chunkSize, (i + 1) * chunkSize).toString('base64') })
+        if (sent === false) {
+          this._activeSends.delete(fid)
+          secEntry('WARN', `Send failed mid-transfer: ${name} (socket dead at chunk ${i}/${total})`)
+          emit('ftps:send-progress', { peerId: this.id, fid, pct: -1, error: 'disconnected' })
+          return
+        }
+        // FIX 8B: Backpressure
+        const drain = waitForDrain()
+        if (drain) await drain
+        else if (i % 4 === 0) await new Promise(r => setImmediate(r))
+        emitSendProgress(i)
       }
     }
     this._activeSends.delete(fid)
@@ -1366,6 +1512,12 @@ class PeerConn {
   }
   _close() {
     if (this._closed) return; this._closed = true; this._reconnecting = false
+    // FIX 8D: Clean up all in-progress file receive buffers and temp files
+    for (const [, fb] of this._filebufs) {
+      if (fb.ws) try { fb.ws.destroy() } catch { }
+      if (fb.tmpPath) try { fs.unlinkSync(fb.tmpPath) } catch { }
+    }
+    this._filebufs.clear()
     const id = this.id; this.id = null
     if (id) { peers.delete(id); const rc = pendingReconnects.get(id); if (rc) { clearTimeout(rc.timer); pendingReconnects.delete(id) }; secEntry('INFO', `Peer disconnected: ${this.name || id}`); emit('ftps:peer-disconnected', { peerId: id }) }
     try { this.socket.destroy() } catch { }
@@ -1445,13 +1597,16 @@ function disconnectPeer(id) { const c = peers.get(id); if (c) c.disconnect() }
 // ── IPC ───────────────────────────────────────────────────────────────────────
 ipcMain.handle('ftps:set-identity', async (_, { name, nodeId }) => {
   const suffix = myIdentityPubB64.slice(0, 6)
-  myNodeId = nodeId + '-' + suffix
+  // FIX Issue 1: Prevent double-suffix on session restore (renderer reload sends already-suffixed nodeId)
+  myNodeId = nodeId.endsWith('-' + suffix) ? nodeId : nodeId + '-' + suffix
   myName = name
   activeSession = { name, nodeId: myNodeId, startedAt: new Date().toISOString() }
   renameCountThisSession = 0  // FIX #3: reset rename counter on new session
   secEntry('OK', `Identity: ${name} ${myNodeId}`)
   // Start passive mDNS discovery immediately
   startPassiveDiscovery()
+  // FIX Issue 5: Start network online/offline polling for auto-reconnect after internet drops
+  startNetworkPolling()
 
   // FIX: Auto-start TCP server + Tor when a session begins using the user's SAVED port.
   // savedPort defaults to 7900 but is updated when user saves a different port in Settings.
@@ -1462,7 +1617,16 @@ ipcMain.handle('ftps:set-identity', async (_, { name, nodeId }) => {
       emit('ftps:listen-auto', { ok: true, port: r.port, localIPs: r.localIPs })
       secEntry('OK', `TCP server auto-started on port ${r.port}`)
       if (torEnabled) {
-        startTorHiddenService(r.port).catch(e => secEntry('WARN', 'Tor auto-start failed', e.message || ''))
+        if (torProcess && onionAddress) {
+          // Tor already running — check if it's on the right port
+          // If port matches, just re-emit status so renderer gets the address
+          secEntry('INFO', `Tor already running on port ${r.port}, re-emitting status`)
+          emit('ftps:tor-status', { status: 'running', onionAddress, port: r.port })
+        } else if (torProcess && !onionAddress) {
+          emit('ftps:tor-status', { status: 'starting' })
+        } else {
+          startTorHiddenService(r.port).catch(e => secEntry('WARN', 'Tor auto-start failed', e.message || ''))
+        }
       }
     } catch (e) {
       secEntry('WARN', 'TCP server auto-start failed', e.message)
@@ -1471,6 +1635,10 @@ ipcMain.handle('ftps:set-identity', async (_, { name, nodeId }) => {
     // Server already up (session restore) — just ensure Tor is running
     const port = tcpServer.address()?.port
     if (port) startTorHiddenService(port).catch(e => secEntry('WARN', 'Tor auto-start failed', e.message || ''))
+  } else if (torProcess && onionAddress) {
+    // Server + Tor both already running (e.g. lock/wipe then re-setup)
+    const port = tcpServer.address()?.port || savedPort
+    emit('ftps:tor-status', { status: 'running', onionAddress, port })
   }
 
   return { ok: true, nodeId: myNodeId, identityKey: myIdentityPubB64 }
@@ -1618,6 +1786,8 @@ ipcMain.handle('ftps:block-peer', (_, { peerId, peerName, reason }) => {
 ipcMain.handle('ftps:unblock-peer', (_, { peerId }) => {
   blockedPeers.delete(peerId)
   secEntry('OK', `Unblocked peer: ${peerId}`)
+  // FIX 10: Emit event so renderer can auto-reconnect
+  emit('ftps:peer-unblocked', { peerId })
   return { ok: true }
 })
 ipcMain.handle('ftps:get-blocked', () => {
@@ -1697,6 +1867,10 @@ ipcMain.handle('ftps:connect-onion', async (_, { address, port }) => {
     if (!torProcess) {
       return { ok: false, error: 'Tor daemon is not running. Enable Tor in Settings first.' }
     }
+    // FIX Issue 11: SOCKS port 0 means Tor hasn't assigned a port yet — don't ECONNREFUSED the user
+    if (!torSocksPort || torSocksPort === 0) {
+      return { ok: false, error: 'Tor is still starting up. Please wait a moment and try again.' }
+    }
     const sock = await connectViaTor(address, port)
     // Hand off the SOCKS5-tunneled socket to PeerConn just like a normal TCP connection.
     // PeerConn._setup() already handles the HELLO handshake and emits events via the
@@ -1712,8 +1886,21 @@ ipcMain.handle('ftps:connect-onion', async (_, { address, port }) => {
 
 ipcMain.handle('ftps:get-sys-stats', async () => {
   const mem = process.memoryUsage()
-  // cpus removed — os.cpus() was called but result was never used
-  const load = os.loadavg() // [1m, 5m, 15m]
+  // FIX: os.loadavg() returns [0,0,0] on Windows. Compute real CPU % via os.cpus() delta.
+  let cpuPercent = 0
+  try {
+    const cpus = os.cpus()
+    const totalIdle = cpus.reduce((a, c) => a + c.times.idle, 0)
+    const totalTick = cpus.reduce((a, c) => a + c.times.user + c.times.nice + c.times.sys + c.times.idle + c.times.irq, 0)
+    if (global._prevCpuIdle !== undefined) {
+      const idleDelta = totalIdle - global._prevCpuIdle
+      const tickDelta = totalTick - global._prevCpuTick
+      cpuPercent = tickDelta > 0 ? Math.round(((tickDelta - idleDelta) / tickDelta) * 100) : 0
+    }
+    global._prevCpuIdle = totalIdle
+    global._prevCpuTick = totalTick
+  } catch {}
+  const load = os.loadavg()
   return {
     bytesSent: totalBytesSent,
     bytesReceived: totalBytesReceived,
@@ -1724,7 +1911,8 @@ ipcMain.handle('ftps:get-sys-stats', async () => {
     freeMem: os.freemem(),
     uptime: process.uptime(),
     osUptime: os.uptime(),
-    loadAvg: load[0], // 1 minute avg
+    loadAvg: load[0], // 1 minute avg (0 on Windows)
+    cpuPercent, // FIX: real CPU % from delta calculation
     platform: process.platform,
     arch: process.arch,
     nodeVer: process.version,
@@ -1784,51 +1972,42 @@ ipcMain.handle('ftps:open-sandbox-folder', async (_, { sandboxDir }) => { secEnt
 ipcMain.handle('ftps:get-platform', () => process.platform)
 
 // FIX #5: List archive contents using fast listing commands (no full extraction)
-ipcMain.handle('ftps:list-archive', async (_, { name, dataB64 }) => {
+ipcMain.handle('ftps:list-archive', async (_, { name, dataB64, password }) => {
+  const tmpDir = path.join(os.tmpdir(), 'p2n-archlist-' + crypto.randomBytes(6).toString('hex'))
   try {
-    const sid = crypto.randomBytes(6).toString('hex')
-    const tmpDir = path.join(os.tmpdir(), 'p2n-archlist-' + sid)
     fs.mkdirSync(tmpDir, { recursive: true })
     const archPath = path.join(tmpDir, name)
     fs.writeFileSync(archPath, Buffer.from(dataB64, 'base64'))
 
-    // Check for password protection on zip (magic bytes check)
-    if (/\.zip$/i.test(name)) {
+    // Quick ZIP password-bit check (without 7z) only when no password supplied
+    if (!password && /\.zip$/i.test(name)) {
       const buf = fs.readFileSync(archPath)
-      const str = buf.toString('binary')
-      if (str.includes('\x09\x08\x06\x00') || (buf[6] & 0x01)) {
+      if ((buf[6] & 0x01) || buf.toString('binary').includes('\x09\x08\x06\x00')) {
         fs.rmSync(tmpDir, { recursive: true, force: true })
         return { passwordProtected: true }
       }
     }
 
-    // <!-- FIX: Issue 3 & 12 --> Use fast listing commands instead of full extraction
-    const files = await listArchive(archPath)
-    
-    // Build tree from flat list
+    const files = await listArchive(archPath, password || null)
+
     const tree = {}
     for (const f of files) {
       if (!f.path) continue
       const parts = f.path.split('/')
       let current = tree
       for (let i = 0; i < parts.length; i++) {
-        const p = parts[i]
-        if (!p) continue
-        if (i === parts.length - 1) {
-          current[p] = { type: 'file', size: f.size }
-        } else {
-          current[p] = current[p] || { type: 'dir', children: {} }
-          current = current[p].children
-        }
+        const p = parts[i]; if (!p) continue
+        if (i === parts.length - 1) current[p] = { type: 'file', size: f.size }
+        else { current[p] = current[p] || { type: 'dir', children: {} }; current = current[p].children }
       }
     }
-
     fs.rmSync(tmpDir, { recursive: true, force: true })
     return { ok: true, tree }
   } catch (e) {
-    if (e.message?.toLowerCase().includes('password') || e.message?.toLowerCase().includes('encrypted')) {
-      return { passwordProtected: true }
-    }
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch { }
+    if (e.isEncrypted) return { passwordProtected: true }
+    if (e.isWrongPassword) return { wrongPassword: true }
+    if (e.message?.toLowerCase().includes('password') || e.message?.toLowerCase().includes('encrypt')) return { passwordProtected: true }
     return { error: e.message }
   }
 })

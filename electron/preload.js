@@ -44,7 +44,7 @@ contextBridge.exposeInMainWorld('ftps', {
 
   // BUG-02 FIX: 6 missing IPC bridges
   getPlatform: () => ipcRenderer.invoke('ftps:get-platform'),
-  listArchive: (name, b64) => ipcRenderer.invoke('ftps:list-archive', { name, dataB64: b64 }),
+  listArchive: (name, b64, password) => ipcRenderer.invoke('ftps:list-archive', { name, dataB64: b64, password: password || null }),
   readArchiveEntry: (name, b64, entryPath) => ipcRenderer.invoke('ftps:read-archive-entry', { name, dataB64: b64, entryPath }),
   saveFileFromTemp: (tmpPath, name) => ipcRenderer.invoke('ftps:save-file-from-temp', { tmpPath, name }),
   saveToDir: (files, folderName) => ipcRenderer.invoke('ftps:save-to-dir', { files, folderName }),
@@ -91,6 +91,8 @@ contextBridge.exposeInMainWorld('ftps', {
       'ftps:file-aborted',
       'ftps:folder-manifest', 'ftps:folder-file-done', 'ftps:folder-complete',
       'ftps:peer-blocked',
+      'ftps:peer-unblocked',
+      'ftps:network-status',
     ]
     if (!allowed.includes(channel)) return () => { }
     const h = (_, d) => cb(d)

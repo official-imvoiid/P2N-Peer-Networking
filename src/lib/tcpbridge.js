@@ -131,19 +131,32 @@ export class TCPBridge {
     }
   }
   async sendFolder(peerId, files, onEvent) {
-    // Send all files in the folder sequentially
+    // v4.1: Parallel file sending — send up to 3 files concurrently for faster throughput
+    const CONCURRENCY = 3
     const total = files.length
-    for (let i = 0; i < total; i++) {
-      const file = files[i]
-      try {
-        await this.sendFile(peerId, file, (pct) => {
-          onEvent?.({ type: 'progress', index: i, total, pct })
-        })
-        onEvent?.({ type: 'file_done', index: i, total })
-      } catch (e) {
-        onEvent?.({ type: 'error', index: i, total, error: e.message })
+    let completed = 0
+    const queue = [...files.entries()]
+
+    const worker = async () => {
+      while (queue.length > 0) {
+        const [i, file] = queue.shift()
+        try {
+          await this.sendFile(peerId, file, (pct) => {
+            onEvent?.({ type: 'progress', index: i, total, pct })
+          })
+          completed++
+          onEvent?.({ type: 'file_done', index: i, total })
+        } catch (e) {
+          completed++
+          onEvent?.({ type: 'error', index: i, total, error: e.message })
+        }
       }
     }
+
+    // Launch workers — min of CONCURRENCY and total files
+    await Promise.allSettled(
+      Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker())
+    )
     onEvent?.({ type: 'done', total })
   }
   disconnect(peerId) { window.ftps.disconnect(peerId) }

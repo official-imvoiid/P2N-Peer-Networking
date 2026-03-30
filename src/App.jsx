@@ -38,8 +38,8 @@ const T = {
   bg: '#0b0e14', surface: '#161b22', panel: '#1c2330cc', border: '#30363d',
   accent: '#58a6ff', accentDim: '#1f6feb', accentFaint: '#58a6ff10',
   blue: '#58a6ff', amber: '#d29922', red: '#f85149', green: '#3fb950', purple: '#bc8cff',
-  orange: '#f97316', // FIX: KNOWN-01 — T.orange was undefined, used by ZipViewer/OSSandbox/FolderBrowseMsg
-  text: '#e6edf3', textDim: '#8b949e', textMid: '#b1bac4', muted: '#30363d',
+  orange: '#f97316',
+  text: '#e6edf3', textDim: '#9ba8b5', textMid: '#c9d1d9', muted: '#6e7e8f',
   glass: 'backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);',
 }
 
@@ -147,6 +147,7 @@ button:active:not(:disabled){transform:scale(.97)}
 
 @keyframes pulse{0%{opacity:.4}50%{opacity:.8}100%{opacity:.4}}
 @keyframes lockpulse{0%,100%{transform:scale(1);filter:drop-shadow(0 0 4px #d2992260)}50%{transform:scale(1.12);filter:drop-shadow(0 0 10px #d2992280)}}
+@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(200%)}}
 .pulse{animation:pulse 2s infinite ease-in-out}
 `
 
@@ -261,10 +262,12 @@ const escH = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '
 const makeId = n => '#' + Math.abs([...n].reduce((a, c, i) => ((a << 5) - a + c.charCodeAt(0) * (i + 7)) | 0, 0)).toString(16).padStart(8, '0').toUpperCase()
 const WORDS = ['apple', 'bridge', 'cedar', 'delta', 'ember', 'flint', 'grove', 'harbor', 'iris', 'jade', 'kite', 'lemon', 'maple', 'noble', 'orbit', 'quartz', 'river', 'stone', 'tiger', 'vault', 'walnut', 'xenon', 'zinc']
 const phrase = () => { const w = () => WORDS[Math.floor(Math.random() * WORDS.length)]; return `${w()}-${w()}-${w()}-${w()}` }
-const IS_ARCH = /\.(zip|gz|tar|rar|7z|bz2|xz|tgz)$/i
+const IS_ARCH = /\.(zip|tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz)$/i
 const IS_ZIP = /\.zip$/i
-const IS_RAR = /\.rar$/i
-const IS_ARCH_VIEWABLE = /\.(zip|rar)$/i  // archives we can browse without extracting
+const IS_ARCH_VIEWABLE = /\.(zip|tar|tgz|tar\.gz|tar\.bz2|tar\.xz)$/i  // archives we can list/browse
+const IS_UNSUPPORTED_ARCH = /\.(rar|7z)$/i  // v4: RAR/7z removed — show warning instead
+// BUG 7 FIX: Bare compressed files (.bz2, .gz, .xz without .tar prefix) are NOT valid archives
+const IS_BARE_COMPRESSED = /(?<!\.tar)\.(bz2|gz|xz)$/i
 // all git-tracked text / code types
 const IS_TEXT = /\.(txt|md|markdown|rst|log|json|jsonc|json5|xml|csv|tsv|html|htm|css|scss|less|sass|js|mjs|cjs|jsx|ts|tsx|vue|svelte|py|pyw|java|c|cpp|cc|cxx|h|hpp|sh|bash|zsh|fish|yaml|yml|toml|ini|cfg|conf|env|envrc|sql|rs|go|rb|rake|php|bat|ps1|psm1|psd1|lua|r|m|jl|hs|elm|ex|exs|erl|clj|cljs|cljc|zig|v|tf|tfvars|proto|graphql|gql|prisma|gradle|mk|makefile|cmake|dockerfile|containerfile|gitignore|gitattributes|npmrc|eslintrc|prettierrc|babelrc|editorconfig|lock|mod|sum|gradle|properties|plist|inf)$/i
 const IS_IMG = /\.(png|jpg|jpeg|gif|bmp|webp|svg|ico|tiff|avif)$/i
@@ -280,90 +283,37 @@ async function detectThreats(blob, filename) {
   if (!blob) return []
   try {
     const threats = []
-    // Read first 128KB for deeper inspection (was 64KB)
-    const slice = blob.slice(0, 131072)
+    const slice = blob.slice(0, 65536)
     const buf = await slice.arrayBuffer()
     const bytes = new Uint8Array(buf)
     const text = new TextDecoder('latin1').decode(bytes)
-
-    // ── Magic byte check (file type spoofing) ────────────────────────────────
     const ext = filename.toLowerCase().replace(/.*\./, '')
     const magic4 = Array.from(bytes.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('')
-    const MAGIC = {
-      png: ['89504e47'],
-      jpg: ['ffd8ffe0', 'ffd8ffe1', 'ffd8ffdb', 'ffd8ffee'],
-      gif: ['47494638'],
-      pdf: ['25504446'],
-      zip: ['504b0304', '504b0506'],
-      rar: ['52617221'],
-      '7z': ['377abcaf'],
-      exe: ['4d5a9000', '4d5a5000'],
-    }
-    const expectedMagic = MAGIC[ext]
-    if (expectedMagic && !expectedMagic.some(m => magic4.startsWith(m.slice(0, magic4.length)))) {
-      // EXE magic inside non-exe = almost certainly malicious
-      if (magic4.startsWith('4d5a')) threats.push(`MZ/PE executable disguised as .${ext}`)
-      else threats.push(`File header mismatch — may be disguised as .${ext}`)
+
+    // Only flag EXE header inside a clearly non-executable extension (strong signal of spoofing)
+    const SAFE_EXTS_WITH_EXE_MAGIC = new Set(['exe','dll','msi','com','scr','pif','sys','drv'])
+    if (!SAFE_EXTS_WITH_EXE_MAGIC.has(ext) && magic4.startsWith('4d5a')) {
+      threats.push(`Executable (EXE/DLL) header in .${ext} file — possible disguised executable`)
     }
 
-    // ── ZIP bomb detection ────────────────────────────────────────────────────
-    if (/\.(zip|gz|tgz|tar|rar|7z)$/i.test(filename)) {
-      // Tiny compressed file that is suspiciously large (>1000x ratio possible)
-      if (blob.size < 1024 * 10 && blob.size > 0) threats.push('Possible ZIP bomb — very small archive')
-    }
-
-    // ── PDF attacks ───────────────────────────────────────────────────────────
+    // PDF: only flag truly dangerous active content — not passive metadata like /AcroForm
     if (IS_PDF.test(filename)) {
-      if (/\/JavaScript\b/.test(text)) threats.push('JavaScript in PDF')
-      if (/\/JS\s/.test(text)) threats.push('JS action in PDF')
-      if (/\/OpenAction/.test(text)) threats.push('Auto-open action')
-      if (/\/Launch\b/.test(text)) threats.push('Launch action (can run executables)')
-      if (/\/EmbeddedFile/.test(text)) threats.push('Embedded file attachment')
-      if (/\/RichMedia/.test(text)) threats.push('Rich media embed')
-      if (/\/AcroForm/.test(text)) threats.push('PDF form (can auto-submit data)')
-      if (/\/URI\s/.test(text)) threats.push('Embedded URI action')
-      if (/\/SubmitForm/.test(text)) threats.push('Form submission action')
-      if (/\/GoToR\b/.test(text)) threats.push('Remote file reference')
-      if (/\/ImportData/.test(text)) threats.push('Data import action')
-      if (/\/Sound\b/.test(text)) threats.push('Embedded sound')
-      if (/\/Movie\b/.test(text)) threats.push('Embedded movie')
-      if ((text.match(/obj\b/g) || []).length > 5000) threats.push('Abnormally high PDF object count')
+      if ((/\/JavaScript\b/.test(text) || /\/JS\s/.test(text)) && /\/Action\b/.test(text))
+        threats.push('JavaScript execution action in PDF')
+      if (/\/Launch\b/.test(text) && /\/Action\b/.test(text))
+        threats.push('Program launch action in PDF')
     }
 
-    // ── Image attacks ─────────────────────────────────────────────────────────
+    // Images: only actual code injection — not SVG styles or data attributes
     if (IS_IMG.test(filename)) {
-      if (/<\?php/i.test(text)) threats.push('PHP code in image')
-      if (/<script[\s>]/i.test(text)) threats.push('Script tag in image')
-      if (/eval\s*\(/.test(text)) threats.push('eval() in EXIF data')
-      if (/document\.cookie/i.test(text)) threats.push('Cookie access code in image')
-      if (/fetch\s*\(|XMLHttpRequest/i.test(text)) threats.push('Network request code in image')
-      // SVG-specific: SVG can contain full HTML/JS
-      if (/\.svg$/i.test(filename)) {
-        if (/<script/i.test(text)) threats.push('JavaScript in SVG')
-        if (/on\w+\s*=/i.test(text)) threats.push('Event handler in SVG (XSS vector)')
-        if (/<foreignObject/i.test(text)) threats.push('foreignObject in SVG (HTML injection)')
-        if (/xlink:href/i.test(text)) threats.push('XLink in SVG (SSRF/data exfil vector)')
-      }
+      if (/<\?php\s/i.test(text)) threats.push('PHP code embedded in image file')
+      if (/\.svg$/i.test(filename) && /<script[\s>]/i.test(text))
+        threats.push('Executable script in SVG file')
     }
 
-    // ── Polyglot detection (file valid as 2+ formats) ─────────────────────────
-    const hasPngSig = magic4 === '89504e47'
-    const hasGifSig = text.startsWith('GIF8')
-    const hasJpegSig = bytes[0] === 0xff && bytes[1] === 0xd8
-    const hasScript = /<script/i.test(text)
-    const hasEval = /eval\(/.test(text)
-    const hasPkZip = magic4.startsWith('504b')
-    if ((hasPngSig || hasGifSig || hasJpegSig) && (hasScript || hasEval))
-      threats.push('Polyglot file — valid image AND executable script')
-    if (hasPkZip && /\.jpg|\.png|\.gif|\.pdf/i.test(filename))
-      threats.push('ZIP archive disguised as image/PDF')
-
-    // ── HTML/text files with suspicious content ───────────────────────────────
-    if (/\.(html|htm|svg|xml)$/i.test(filename)) {
-      if (/javascript:/i.test(text)) threats.push('javascript: URI scheme')
-      if (/data:text\/html/i.test(text)) threats.push('data: URI HTML embedding')
-      if (/vbscript:/i.test(text)) threats.push('VBScript URI (IE attack)')
-    }
+    // ZIP bomb: only flag very tiny archives (< 256 bytes is physically impossible without trickery)
+    if (/\.(zip|gz|7z|rar)$/i.test(filename) && blob.size > 0 && blob.size < 256)
+      threats.push('Extremely small archive — possible decompression bomb')
 
     return threats
   } catch { return [] }
@@ -756,46 +706,65 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
   const [tree, setTree] = useState(null), [loading, setLoading] = useState(true)
   const [preview, setPreview] = useState(null), [previewLoading, setPreviewLoading] = useState(false)
   const [crumbs, setCrumbs] = useState([]), [error, setError] = useState(null)
-  const previewUrlRef = useRef(null) // FIX: KNOWN-04 — track ObjectURL for revocation
-  // FIX: KNOWN-04 — revoke ObjectURL on unmount
+  const [needsPassword, setNeedsPassword] = useState(false)
+  const [password, setPassword] = useState(''), [pwError, setPwError] = useState('')
+  const [pwLoading, setPwLoading] = useState(false)
+  const previewUrlRef = useRef(null)
   useEffect(() => () => { if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current) }, [])
   const fname = msg.meta?.name || ''
-  const isRar = IS_RAR.test(fname)
+  const isUnsupportedArch = IS_UNSUPPORTED_ARCH.test(fname)
+  const b64Ref = useRef(null) // cache base64 for re-use
 
-  useEffect(() => {
-    if (!msg.blob) { setError('File not in memory — save first then re-open'); setLoading(false); return }
-    ; (async () => {
-      try {
-        const r = new FileReader(); const b64 = await new Promise((res, rej) => { r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(msg.blob) })
-        const result = await window.ftps?.listArchive(fname, b64)
-        if (result?.passwordProtected) { setError('🔐 Password-protected archive — cannot preview contents without password'); setLoading(false); return }
-        if (result?.error) {
-          // FIX: 7-Zip install hint for .7z files
-          if (/\.7z$/i.test(fname)) {
-            try {
-              const z7 = await window.ftps?.find7z()
-              if (!z7?.found) {
-                setError('7-Zip is required to browse .7z files.\n\n💡 Install 7-Zip from https://7-zip.org then restart the app.')
-                setLoading(false); return
-              }
-            } catch {}
-          }
-          setError(result.error); setLoading(false); return
-        }
-        setTree(result?.tree || {}); setLoading(false)
-      } catch (e) { setError(e.message || 'Failed to read archive'); setLoading(false) }
-    })()
-  }, [])
+  const getB64 = async () => {
+    if (b64Ref.current) return b64Ref.current
+    const r = new FileReader()
+    const b64 = await new Promise((res, rej) => { r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(msg.blob) })
+    b64Ref.current = b64
+    return b64
+  }
+
+  const loadTree = async (pw) => {
+    try {
+      if (msg.archiveTree) { setTree(msg.archiveTree); setLoading(false); return }
+      if (!msg.blob) { setError('File not in memory — save first then re-open'); setLoading(false); return }
+      const b64 = await getB64()
+      const result = await window.ftps?.listArchive(fname, b64, pw || null)
+      if (result?.passwordProtected || result?.wrongPassword) {
+        setNeedsPassword(true)
+        if (pw) setPwError('Wrong password — try again')
+        setLoading(false)
+        setPwLoading(false)
+        return
+      }
+      if (result?.error) {
+        const hint = (result.error.includes('7-Zip') || result.error.includes('Unsupported') || result.error.includes('no longer supported'))
+          ? '\n\n💡 Only ZIP and TAR archives are supported in P2N v4.' : ''
+        setError(result.error + hint)
+        setLoading(false)
+        setPwLoading(false)
+        return
+      }
+      setNeedsPassword(false); setPwError(''); setPassword('')
+      setTree(result?.tree || {}); setLoading(false); setPwLoading(false)
+    } catch (e) { setError(e.message || 'Failed to read archive'); setLoading(false); setPwLoading(false) }
+  }
+
+  useEffect(() => { loadTree(null) }, [])
+
+  const submitPassword = async () => {
+    if (!password.trim()) { setPwError('Enter a password'); return }
+    setPwLoading(true); setPwError('')
+    await loadTree(password.trim())
+  }
 
   const cur = crumbs.reduce((n, s) => n?.children?.[s], { children: tree || {} })
   const entries = Object.entries(cur?.children || {})
-  const extCol = { pdf: '#ff6b6b', md: T.blue, py: T.amber, js: '#fbbf24', ts: '#4db8ff', jpg: T.purple, png: T.purple, json: T.amber, sh: T.red, txt: T.textMid, zip: T.amber, rar: T.amber, rs: T.orange, go: T.green, rb: T.red }
+  const extCol = { pdf: '#ff6b6b', md: T.blue, py: T.amber, js: '#fbbf24', ts: '#4db8ff', jpg: T.purple, png: T.purple, json: T.amber, sh: T.red, txt: T.textMid, zip: T.amber, tar: T.amber, rs: T.orange, go: T.green, rb: T.red }
 
   const openEntry = async (entryPath, entryName) => {
     if (!msg.blob) return; setPreviewLoading(true)
-    // FIX: KNOWN-04 — revoke previous ObjectURL before creating new one
     if (previewUrlRef.current) { URL.revokeObjectURL(previewUrlRef.current); previewUrlRef.current = null }
-    const r = new FileReader(); const b64 = await new Promise((res, rej) => { r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(msg.blob) })
+    const b64 = await getB64()
     const result = await window.ftps?.readArchiveEntry(fname, b64, entryPath)
     setPreviewLoading(false)
     if (!result?.ok) { setPreview({ name: entryName, type: 'err', msg: result?.error || 'Cannot read file' }); return }
@@ -808,7 +777,7 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
 
   const saveEntry = async (entryPath, entryName) => {
     if (!msg.blob) return
-    const r = new FileReader(); const b64 = await new Promise((res, rej) => { r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(msg.blob) })
+    const b64 = await getB64()
     const result = await window.ftps?.readArchiveEntry(fname, b64, entryPath)
     if (result?.ok) await window.ftps?.saveFile(entryName, result.dataB64)
   }
@@ -817,7 +786,7 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
     <div className="card fadeup" style={{ width: 'min(820px,97vw)', height: 'min(84vh,700px)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {/* Header */}
       <div style={{ padding: '10px 14px', borderBottom: `1px solid ${T.border}`, background: T.panel, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-        <span style={{ fontSize: 16 }}>{isRar ? '🗃' : '📦'}</span>
+        <span style={{ fontSize: 16 }}>{isUnsupportedArch ? '🗃' : '📦'}</span>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fname}</div>
           <div style={{ fontSize: 10, color: T.textDim }}>Archive viewer — read-only · nothing extracted to disk</div>
@@ -825,39 +794,63 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
         <button onClick={() => onOSSandbox?.(msg)} className="btn btn-amber btn-sm" title="Open in OS isolated sandbox (Windows/Linux)">🛡 Sandbox</button>
         <button onClick={onClose} className="btn btn-ghost btn-sm">✕</button>
       </div>
-      {/* Breadcrumb */}
-      <div style={{ padding: '4px 10px', background: T.panel, borderBottom: `1px solid ${T.border}`, display: 'flex', gap: 3, alignItems: 'center', flexWrap: 'wrap', flexShrink: 0 }}>
+      {/* Password prompt */}
+      {needsPassword && <div style={{ padding: '18px 20px', borderBottom: `1px solid ${T.border}`, background: T.surface }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <span style={{ fontSize: 20 }}>🔐</span>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: T.text }}>Password Required</div>
+            <div style={{ fontSize: 11, color: T.textDim }}>This archive is encrypted. Enter the password to browse its contents.</div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+          <div style={{ flex: 1 }}>
+            <input type="password" value={password} onChange={e => { setPassword(e.target.value); setPwError('') }}
+              onKeyDown={e => e.key === 'Enter' && submitPassword()}
+              placeholder="Archive password…" className="inp" autoFocus style={{ marginBottom: pwError ? 4 : 0 }} />
+            {pwError && <div style={{ fontSize: 11, color: T.red, marginTop: 3 }}>{pwError}</div>}
+          </div>
+          <button onClick={submitPassword} disabled={pwLoading} className="btn btn-primary" style={{ flexShrink: 0 }}>
+            {pwLoading ? '⟳' : '🔓 Unlock'}
+          </button>
+        </div>
+        <div style={{ marginTop: 10, fontSize: 11, color: T.textDim }}>💡 Requires 7-Zip installed for encrypted RAR/7z. ZIP password is native.</div>
+      </div>}
+      {/* Breadcrumb (hide while locked) */}
+      {!needsPassword && <div style={{ padding: '4px 10px', background: T.panel, borderBottom: `1px solid ${T.border}`, display: 'flex', gap: 3, alignItems: 'center', flexWrap: 'wrap', flexShrink: 0 }}>
         <button onClick={() => { setCrumbs([]); setPreview(null) }} style={{ background: 'none', border: 'none', color: T.blue, fontSize: 11, cursor: 'pointer', padding: '1px 4px' }}>📦 root</button>
         {crumbs.map((s, i) => <span key={i} style={{ display: 'flex', gap: 3, alignItems: 'center' }}>
           <span style={{ color: T.muted, fontSize: 10 }}>›</span>
           <button onClick={() => { setCrumbs(crumbs.slice(0, i + 1)); setPreview(null) }} style={{ background: 'none', border: 'none', color: i === crumbs.length - 1 ? T.accent : T.blue, fontSize: 11, cursor: 'pointer', padding: '1px 4px' }}>{s}</button>
         </span>)}
-      </div>
+      </div>}
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         {/* File tree */}
         <div style={{ width: preview ? '38%' : '100%', overflowY: 'auto', borderRight: preview ? `1px solid ${T.border}` : 'none', transition: 'width .15s' }}>
-          {loading && <div style={{ padding: 40, textAlign: 'center', color: T.textDim, fontSize: 12 }}>
+          {loading && !needsPassword && <div style={{ padding: 40, textAlign: 'center', color: T.textDim, fontSize: 12 }}>
             <div className="spin" style={{ width: 20, height: 20, border: `2px solid ${T.border}`, borderTopColor: T.accent, borderRadius: '50%', margin: '0 auto 10px' }} />Reading archive…
           </div>}
           {error && <div style={{ padding: 24, textAlign: 'center' }}>
             <div style={{ fontSize: 28, marginBottom: 8 }}>⚠️</div>
-            <div style={{ fontSize: 12, color: T.red, lineHeight: 1.6 }}>{error}</div>
-            {error.includes('Password') && <div style={{ marginTop: 10, fontSize: 11, color: T.amber }}>💡 Save the file to disk then open with a tool that supports passwords (7-Zip, WinRAR).</div>}
+            <div style={{ fontSize: 12, color: T.red, lineHeight: 1.6, whiteSpace: 'pre-line' }}>{error}</div>
           </div>}
-          {!loading && !error && <>
+          {!loading && !error && !needsPassword && <>
             {crumbs.length > 0 && <div className="sb-row" onClick={() => { setCrumbs(c => c.slice(0, -1)); setPreview(null) }} style={{ color: T.textDim, fontSize: 11 }}>↩ ..</div>}
             {entries.map(([name, node]) => {
               const ext = name.split('.').pop().toLowerCase(), col = extCol[ext] || T.textDim
               const isDir = node.type === 'dir'
               const fullPath = [...crumbs, name].join('/')
-              return <div key={name} className="sb-row" style={{ cursor: 'pointer' }} onClick={() => isDir ? (setCrumbs([...crumbs, name]), setPreview(null)) : openEntry(fullPath, name)}>
+              const canPreview = !isDir && IS_VIEWABLE.test(name)
+              return <div key={name} className="sb-row" style={{ cursor: 'pointer' }} onClick={() => isDir ? (setCrumbs([...crumbs, name]), setPreview(null)) : (canPreview && openEntry(fullPath, name))}>
                 <span style={{ fontSize: 13, flexShrink: 0 }}>{isDir ? '📂' : (IS_ARCH.test(name) ? '📦' : '📄')}</span>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 11, color: isDir ? T.amber : T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</div>
-                  {node.size && <div style={{ fontSize: 9, color: T.muted }}>{fmtSz(node.size)}</div>}
+                  {node.size > 0 && <div style={{ fontSize: 9, color: T.muted }}>{fmtSz(node.size)}</div>}
                 </div>
                 {!isDir && <span style={{ fontSize: 8, fontWeight: 700, padding: '1px 3px', borderRadius: 3, border: `1px solid ${col}38`, color: col, flexShrink: 0 }}>{ext.toUpperCase()}</span>}
-                {!isDir && <button onClick={e => { e.stopPropagation(); saveEntry(fullPath, name) }} className="btn btn-green btn-xs" style={{ flexShrink: 0, fontSize: 9, padding: '1px 5px' }}>⬇</button>}
+                {!isDir && canPreview && msg.blob && <button onClick={e => { e.stopPropagation(); openEntry(fullPath, name) }} className="btn btn-ghost btn-xs" style={{ flexShrink: 0, fontSize: 9, padding: '1px 4px' }}>👁</button>}
+                {!isDir && msg.blob && <button onClick={e => { e.stopPropagation(); saveEntry(fullPath, name) }} className="btn btn-green btn-xs" style={{ flexShrink: 0, fontSize: 9, padding: '1px 5px' }}>⬇</button>}
+                {isDir && <span style={{ fontSize: 9, color: T.muted, flexShrink: 0 }}>▸</span>}
               </div>
             })}
             {!entries.length && !loading && <div style={{ textAlign: 'center', padding: 24, color: T.textDim, fontSize: 11 }}>Empty folder</div>}
@@ -990,11 +983,12 @@ function FileMsg({ msg, onExtract, onPreview, onRevoke, onZipView, onOSSandbox, 
     </div>
   </div>
 
-  const isMe = msg.from === 'me', pct = msg.pct ?? 1, done = msg.type === 'file_done' || msg.type === 'file_out'
-  const statusTxt = msg.type === 'file_out' ? 'Sent' : msg.type === 'file_done' ? 'Received' : msg.type === 'file_in' ? `${Math.round(pct * 100)}%` : '…'
+  const isMe = msg.from === 'me', pct = msg.pct ?? 1, done = msg.type === 'file_done' || (msg.type === 'file_out' && pct >= 1)
+  const isSending = msg.type === 'file_out' && pct < 1
+  const statusTxt = isSending ? `${Math.round(pct * 100)}%` : msg.type === 'file_out' ? 'Sent' : msg.type === 'file_done' ? 'Received' : msg.type === 'file_in' ? `${Math.round(pct * 100)}%` : '…'
   const statusCol = done ? T.green : T.amber
   const fname = msg.meta?.name || ''
-  const isArch = IS_ARCH.test(fname), isZipRar = IS_ARCH_VIEWABLE.test(fname), isDanger = IS_DANGEROUS.test(fname)
+  const isArch = IS_ARCH.test(fname), isZipRar = IS_ARCH_VIEWABLE.test(fname), isDanger = IS_DANGEROUS.test(fname), isUnsupported = IS_UNSUPPORTED_ARCH.test(fname)
   const canView = !!(msg.blob) && !isArch && IS_VIEWABLE.test(fname)
   const save = async () => {
     if (msg.tmpPath && window.ftps) { await window.ftps.saveFileFromTemp(msg.tmpPath, msg.meta?.name || 'file'); return }
@@ -1007,6 +1001,7 @@ function FileMsg({ msg, onExtract, onPreview, onRevoke, onZipView, onOSSandbox, 
       ⚠ Security threats: {msg.threats.join(' · ')}
     </div>}
     {isDanger && <div style={{ padding: '4px 8px', background: T.amber + '10', border: `1px solid ${T.amber}28`, borderRadius: 5, marginBottom: 6, fontSize: 10, color: T.amber }}>⚠ Executable file — treat with caution</div>}
+    {isUnsupported && <div style={{ padding: '4px 8px', background: T.red + '10', border: `1px solid ${T.red}28`, borderRadius: 5, marginBottom: 6, fontSize: 10, color: T.red }}>⚠ .{fname.split('.').pop()} is not supported — only ZIP and TAR archives can be browsed</div>}
     <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: done ? 7 : 5 }}>
       <span style={{ fontSize: 17 }}>{isArch ? '📦' : '📄'}</span>
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -1034,8 +1029,19 @@ function FileMsg({ msg, onExtract, onPreview, onRevoke, onZipView, onOSSandbox, 
     )}
     {msg.type === 'file_done' && (msg.blob || msg.tmpPath) && <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
       <button onClick={save} className="btn btn-green btn-xs" style={{ flex: 1 }}>⬇ Save</button>
-      {isZipRar && <button onClick={() => onZipView?.(msg)} className="btn btn-blue btn-xs" style={{ flex: 1 }} disabled={!msg.blob}>📂 Browse</button>}
-      {(isArch || isDanger) && <button onClick={() => onOSSandbox?.(msg)} className="btn btn-amber btn-xs" style={{ flex: 1 }} disabled={!msg.blob && !msg.tmpPath}>🛡 Sandbox</button>}
+      {/* Issue 7/12: Browse works for both in-memory (blob) and large (tmpPath) archives */}
+      {isZipRar && msg.blob && <button onClick={() => onZipView?.(msg)} className="btn btn-blue btn-xs" style={{ flex: 1 }}>📂 Browse</button>}
+      {isZipRar && !msg.blob && msg.tmpPath && <button onClick={async () => {
+        // Large archive: load via IPC for listing without base64 overhead
+        notify('Reading archive…', 'info')
+        const result = await window.ftps?.extractArchiveFromPath(fname, msg.tmpPath)
+        if (result?.ok) {
+          // Create a synthetic blob-like msg with tree for ZipViewer (just tree, no full blob)
+          onZipView?.({ ...msg, archivePath: msg.tmpPath, archiveTree: result.tree })
+          notify('', 'ok')
+        } else notify('Cannot browse large archive: ' + (result?.error || ''), 'err')
+      }} className="btn btn-blue btn-xs" style={{ flex: 1 }}>📂 Browse</button>}
+      {(isArch || isDanger) && <button onClick={() => onOSSandbox?.(msg)} className="btn btn-amber btn-xs" style={{ flex: 1 }}>🛡 Sandbox</button>}
       {!isArch && !isDanger && canView && <button onClick={() => onPreview?.(msg)} className="btn btn-blue btn-xs" style={{ flex: 1 }}>👁 View</button>}
       {msg.blob && !isArch && (IS_IMG.test(fname) || IS_PDF.test(fname)) && (
         <button onClick={async () => {
@@ -1069,8 +1075,8 @@ function FolderMsg({ msg, onOpen, onRevoke }) {
   </div>
 }
 
-// ── FOLDER OFFER MSG (sender side — no progress, just "shared" card) ─────────
-function FolderOfferMsg({ msg }) {
+// ── FOLDER OFFER MSG (sender side — offered/sending/done + revoke) ─────────
+function FolderOfferMsg({ msg, onRevoke }) {
   const statusMap = { offered: { c: T.blue, t: '📤 Offered' }, sending: { c: T.amber, t: '⟳ Sending…' }, done: { c: T.green, t: '✓ Sent' } }
   const s = statusMap[msg.status || 'offered'] || statusMap.offered
   return <div style={{ padding: '9px 11px', background: T.blue + '0b', border: `1px solid ${T.blue}26`, borderRadius: 8, maxWidth: '68%', minWidth: 210 }}>
@@ -1087,6 +1093,8 @@ function FolderOfferMsg({ msg }) {
       <span>↑ {fmtSz(msg.calcSpeed)}/s</span>
       <span>{msg.calcEta > 0 ? `~${fmtTime(msg.calcEta)} remaining` : ''}</span>
     </div>}
+    {/* Revoke: available while offered or sending */}
+    {msg.status !== 'done' && <button onClick={ev => { ev.stopPropagation(); onRevoke?.(msg.fid) }} className="btn btn-ghost btn-xs" style={{ color: T.red, border: `1px solid ${T.red}20`, marginTop: 6, width: '100%' }}>🚫 Revoke Offer</button>}
     <div style={{ fontSize: 10, color: T.muted, marginTop: 6, textAlign: 'right' }}>{msg.time}</div>
   </div>
 }
@@ -1095,36 +1103,67 @@ function FolderOfferMsg({ msg }) {
 function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
   const [expanded, setExpanded] = useState(false)
   const [crumbs, setCrumbs] = useState([])
+  const [previewEntry, setPreviewEntry] = useState(null)
+  const [loadingEntry, setLoadingEntry] = useState(null)
   const status = msg.status || 'available'
 
-  // Build tree from flat file list
-  const buildTree = files => {
+  // Build tree from flat file list, stripping the top-level folder name prefix
+  const buildTree = (files, rootName) => {
     const root = {}
     files?.forEach(f => {
-      const parts = (f.relPath || f.name).split('/')
+      let rp = f.relPath || f.name
+      // Strip the root folder name prefix (e.g. "MyFolder/sub/file.txt" → "sub/file.txt")
+      if (rootName && rp.startsWith(rootName + '/')) rp = rp.slice(rootName.length + 1)
+      const parts = rp.split('/').filter(Boolean)
       let node = root
       parts.forEach((p, i) => {
-        if (!node[p]) node[p] = i === parts.length - 1 ? { type: 'file', name: f.name, size: f.size, index: f.index } : { type: 'dir', children: {} }
+        if (!node[p]) node[p] = i === parts.length - 1
+          ? { type: 'file', name: f.name, size: f.size, index: f.index }
+          : { type: 'dir', children: {} }
         if (i < parts.length - 1) node = node[p].children
       })
     })
     return root
   }
 
-  const tree = useMemo(() => buildTree(msg.tree), [msg.tree]) // FIX: KNOWN-03 — depend on msg.tree, not msg.fid
+  const tree = useMemo(() => buildTree(msg.tree), [msg.tree])
   const cur = crumbs.reduce((n, s) => n?.[s]?.children ?? n?.[s] ?? null, tree) || tree
   const entries = Object.entries(cur || {})
 
-  const statusMap = { available: { c: T.green, t: '📬 Available' }, pulling: { c: T.amber, t: '⟳ Receiving…' }, done: { c: T.green, t: '✓ Received' } }
+  const statusMap = {
+    available: { c: T.green, t: '📬 Available' },
+    pulling: { c: T.amber, t: '⟳ Receiving…' },
+    done: { c: T.green, t: '✓ Received' }
+  }
   const s = statusMap[status] || statusMap.available
 
-  const pullAll = () => onPull?.(peerId, msg.fid, null)
-  const pullFile = idx => onPull?.(peerId, msg.fid, idx)
+  const pullAll = () => onPull?.(peerId, msg.fid, null, { name: msg.name, totalFiles: msg.totalFiles, totalBytes: msg.totalBytes }, false)
+  const pullAsZip = () => onPull?.(peerId, msg.fid, null, { name: msg.name, totalFiles: msg.totalFiles, totalBytes: msg.totalBytes }, true)
+  const pullFile = idx => onPull?.(peerId, msg.fid, idx, { name: msg.name, totalFiles: msg.totalFiles, totalBytes: msg.totalBytes }, false)
 
   const extCol = { pdf: '#ff6b6b', md: T.blue, py: T.amber, js: '#fbbf24', ts: '#4db8ff', jpg: T.purple, png: T.purple, json: T.amber, sh: T.red, rs: T.orange, go: T.green }
 
+  // Preview a file entry from the archive via IPC (reads single file from sender's folder offer)
+  const previewFile = async (node, name) => {
+    if (!IS_VIEWABLE.test(name)) return
+    setLoadingEntry(name)
+    try {
+      // Use the blob if we already received this file
+      const recv = (msg.receivedFiles || []).find(f => f.name === name || (f.relPath || '').endsWith('/' + name) || f.relPath === name)
+      if (recv?.blob) {
+        const text = await recv.blob.text()
+        setPreviewEntry({ name, type: IS_IMG.test(name) ? 'img' : 'text', content: text, blob: recv.blob })
+        setLoadingEntry(null)
+        return
+      }
+      setPreviewEntry({ name, type: 'loading' })
+    } finally {
+      setLoadingEntry(null)
+    }
+  }
+
   return <div style={{ background: T.green + '07', border: `1px solid ${T.green}20`, borderRadius: 8, maxWidth: '90%', minWidth: 240, overflow: 'hidden' }}>
-    {/* Header — click to expand */}
+    {/* Header */}
     <div style={{ padding: '9px 11px', display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => setExpanded(e => !e)}>
       <span style={{ fontSize: 17, flexShrink: 0 }}>📂</span>
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -1134,24 +1173,62 @@ function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
       <span className="stag" style={{ color: s.c, background: s.c + '12', border: `1px solid ${s.c}28`, flexShrink: 0 }}>{s.t}</span>
       <span style={{ fontSize: 10, color: T.textDim, flexShrink: 0 }}>{expanded ? '▾' : '▸'}</span>
     </div>
-    {/* Receive progress */}
+
+    {/* Receive progress bar (only when actually receiving, not just browsing) */}
     {status === 'pulling' && <div style={{ padding: '0 11px 9px' }}>
-      <div className="prog"><div className="prog-fill" style={{ width: '100%', background: T.amber, animation: 'pulse 1s infinite' }} /></div>{/* FIX: KNOWN-06 — add pulse animation */}
-      <div style={{ fontSize: 10, color: T.textDim, marginTop: 3 }}>↓ Receiving files…</div>
+      <div className="prog"><div className="prog-fill" style={{ width: '100%', background: T.amber, animation: 'pulse 1s infinite' }} /></div>
+      <div style={{ fontSize: 10, color: T.textDim, marginTop: 3 }}>⟳ Receiving files…</div>
     </div>}
+
+    {/* Received single files (single-file pulls) */}
+    {(msg.receivedFiles || []).length > 0 && status !== 'done' && (
+      <div style={{ padding: '4px 8px 6px', borderTop: `1px solid ${T.green}18`, background: T.green + '05' }}>
+        <div style={{ fontSize: 10, color: T.green, fontWeight: 600, marginBottom: 3 }}>✓ Pulled files:</div>
+        {(msg.receivedFiles || []).map((f, i) => {
+          const canView = IS_VIEWABLE.test(f.name || '') && !!f.blob
+          return <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '2px 0' }}>
+            <span style={{ fontSize: 10 }}>📄</span>
+            <span style={{ fontSize: 10, flex: 1, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.relPath || f.name}</span>
+            <span style={{ fontSize: 9, color: T.muted }}>{fmtSz(f.size || 0)}</span>
+            {canView && <button onClick={async () => {
+              const text = await f.blob.text()
+              setPreviewEntry({ name: f.name, type: IS_IMG.test(f.name) ? 'img' : 'text', content: text, blob: f.blob })
+            }} className="btn btn-ghost btn-xs" style={{ fontSize: 8, padding: '1px 4px' }}>👁</button>}
+            <button onClick={async () => {
+              if (f.tmpPath) { await window.ftps?.saveFileFromTemp(f.tmpPath, f.name); return }
+              if (f.blob && window.ftps) { const r = new FileReader(); r.onload = async () => await window.ftps.saveFile(f.name, r.result.split(',')[1]); r.readAsDataURL(f.blob) }
+              else if (f.blob) { const a = document.createElement('a'); a.href = URL.createObjectURL(f.blob); a.download = f.name; a.click() }
+            }} className="btn btn-green btn-xs" style={{ fontSize: 8, padding: '1px 4px' }}>⬇</button>
+          </div>
+        })}
+      </div>
+    )}
+
+    {/* File preview overlay */}
+    {previewEntry && <div style={{ position: 'relative', borderTop: `1px solid ${T.border}` }}>
+      <div style={{ padding: '6px 8px', background: T.surface, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{ fontSize: 11, color: T.text, fontWeight: 600 }}>{previewEntry.name}</span>
+        <button onClick={() => setPreviewEntry(null)} style={{ background: 'none', border: 'none', color: T.textDim, fontSize: 14, cursor: 'pointer', lineHeight: 1 }}>×</button>
+      </div>
+      <div style={{ maxHeight: 200, overflow: 'auto', padding: 8 }}>
+        {previewEntry.type === 'loading' && <div style={{ color: T.textDim, fontSize: 11 }}>Loading…</div>}
+        {previewEntry.type === 'text' && <pre style={{ fontSize: 11, color: T.text, fontFamily: 'monospace', whiteSpace: 'pre-wrap', margin: 0 }}>{previewEntry.content?.slice(0, 50000)}</pre>}
+        {previewEntry.type === 'img' && previewEntry.blob && <img src={URL.createObjectURL(previewEntry.blob)} style={{ maxWidth: '100%', maxHeight: 180, objectFit: 'contain' }} alt={previewEntry.name} />}
+      </div>
+    </div>}
+
     {/* Expanded tree browser + pull actions */}
     {expanded && <div style={{ borderTop: `1px solid ${T.green}18` }}>
       {/* Toolbar */}
       <div style={{ padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 5, background: T.surface, flexWrap: 'wrap' }}>
         <span style={{ fontSize: 10, color: T.textDim, flex: 1 }}>
-          {status === 'done' ? '✓ All files received' : `${msg.totalFiles} files — request what you need`}
+          {status === 'done' ? '✓ All files received' : `${msg.totalFiles} files — browse & pull`}
         </span>
-        {status === 'available' && <button onClick={pullAll} className="btn btn-green btn-xs">📥 Pull All</button>}
-        {status === 'available' && <button onClick={async () => {
-          // Pull all then ZIP — sets pulling status while receiving
-          onPull?.(peerId, msg.fid, null)
-        }} className="btn btn-blue btn-xs" title="Download all files as a single ZIP">📦 Pull as ZIP</button>}
-        {status === 'pulling' && <span style={{ fontSize: 10, color: T.amber }}>⟳ Receiving files…</span>}
+        {status === 'available' && <>
+          <button onClick={pullAll} className="btn btn-green btn-xs" title="Download all files preserving folder structure">📥 Pull All</button>
+          <button onClick={pullAsZip} className="btn btn-blue btn-xs" title="Download all files as a single ZIP">📦 Pull as ZIP</button>
+        </>}
+        {status === 'pulling' && <span style={{ fontSize: 10, color: T.amber }}>⟳ Receiving…</span>}
         {status === 'done' && <span style={{ fontSize: 10, color: T.green }}>✓ Received</span>}
       </div>
       {/* Breadcrumb */}
@@ -1170,12 +1247,27 @@ function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
           const ext = (name.split('.').pop() || '').toLowerCase()
           const col = extCol[ext] || T.textDim
           const isDang = IS_DANGEROUS.test(name)
+          const canPreview = !isDir && IS_VIEWABLE.test(name)
+          const pulledFile = !isDir ? (msg.receivedFiles || []).find(f => f.name === name || (f.relPath || '').endsWith('/' + name)) : null
+          const alreadyPulled = !!pulledFile
           return <div key={name} className="sb-row" style={{ cursor: isDir ? 'pointer' : 'default' }} onClick={() => isDir && setCrumbs([...crumbs, name])}>
-            <span style={{ fontSize: 12, flexShrink: 0 }}>{isDir ? '📂' : (isDang ? '⚠️' : '📄')}</span>
-            <span style={{ fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isDir ? T.amber : T.text }}>{name}</span>
+            <span style={{ fontSize: 12, flexShrink: 0 }}>{isDir ? '📂' : (isDang ? '⚠️' : alreadyPulled ? '✅' : '📄')}</span>
+            <span style={{ fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isDir ? T.amber : (alreadyPulled ? T.green : T.text) }}>{name}</span>
             {!isDir && <span style={{ fontSize: 9, color: T.muted, flexShrink: 0 }}>{fmtSz(node.size || 0)}</span>}
             {!isDir && <span style={{ fontSize: 8, fontWeight: 700, padding: '1px 3px', borderRadius: 3, border: `1px solid ${col}38`, color: col, flexShrink: 0 }}>{ext.toUpperCase()}</span>}
-            {!isDir && status === 'available' && <button onClick={e => { e.stopPropagation(); pullFile(node.index) }} className="btn btn-blue btn-xs" style={{ flexShrink: 0, fontSize: 9, padding: '2px 5px' }} title="Pull this file from sender">📥</button>}
+            {/* View: if already pulled show preview; if not pulled+viewable show pull-then-view */}
+            {canPreview && alreadyPulled && pulledFile.blob && <button onClick={e => {
+              e.stopPropagation()
+              pulledFile.blob.text().then(text => setPreviewEntry({ name, type: IS_IMG.test(name) ? 'img' : 'text', content: text, blob: pulledFile.blob }))
+            }} className="btn btn-ghost btn-xs" style={{ flexShrink: 0, fontSize: 9, padding: '2px 5px', color: T.accent }} title="Preview file">👁</button>}
+            {canPreview && !alreadyPulled && status === 'available' && <button onClick={e => {
+              e.stopPropagation()
+              // Pull this file then auto-preview once received
+              pullFile(node.index)
+              // Set a pending preview flag — will trigger once file arrives in receivedFiles
+              setPreviewEntry({ name, type: 'loading', content: 'Pulling file…' })
+            }} className="btn btn-ghost btn-xs" style={{ flexShrink: 0, fontSize: 9, padding: '2px 5px', color: T.textDim }} title="Pull and preview">👁</button>}
+            {!isDir && status === 'available' && !alreadyPulled && <button onClick={e => { e.stopPropagation(); pullFile(node.index) }} className="btn btn-blue btn-xs" style={{ flexShrink: 0, fontSize: 9, padding: '2px 5px' }} title="Download this file">📥</button>}
             {isDir && <span style={{ fontSize: 9, color: T.muted, flexShrink: 0 }}>▸</span>}
           </div>
         })}
@@ -1188,13 +1280,51 @@ function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
 
 // ── FOLDER RECV MSG (receiver side — shows received folder progress + save) ───
 function FolderRecvMsg({ msg, folderDataRef, notify }) {
-  const done = msg.complete // FIX: KNOWN-05 — removed dead `pct` variable (progress bar uses inline calculation)
+  const done = msg.complete
   const [expanded, setExpanded] = useState(false)
-  const files = (folderDataRef?.current?.[msg.folderFid]?.files || []).filter(Boolean)
+  const [autoZipping, setAutoZipping] = useState(false)
+
+  // NOTE: folderDataRef is a ref — we read it lazily inside effects/handlers
+  // NOT at render time, because the ref updates without causing re-renders.
+  const getFiles = () => (folderDataRef?.current?.[msg.folderFid]?.files || []).filter(Boolean)
+
+  // For the expanded file list we need to trigger a re-render when files arrive.
+  // We use receivedCount from msg (which IS state-driven) as the trigger.
+  const files = getFiles()
+
+  // Pull-as-ZIP: trigger after all files received
+  useEffect(() => {
+    if (!done || !msg.pullAsZip || autoZipping) return
+    // Read ref at effect-run-time (after state update settles)
+    const freshFiles = getFiles()
+    if (freshFiles.length === 0) return
+    setAutoZipping(true)
+    ;(async () => {
+      try {
+        notify('📦 Creating ZIP…', 'info')
+        const zipFiles = freshFiles.map(f => ({ name: f.relPath || f.name, blob: f.blob || null }))
+        const zipBlob = await createZipBlob(zipFiles)
+        if (window.ftps) {
+          const r = new FileReader()
+          r.onload = async () => await window.ftps.saveFile(msg.name + '.zip', r.result.split(',')[1])
+          r.readAsDataURL(zipBlob)
+        } else {
+          const a = document.createElement('a'); a.href = URL.createObjectURL(zipBlob); a.download = msg.name + '.zip'; a.click()
+        }
+        notify('📦 ZIP ready — choose save location', 'ok')
+      } catch (e) {
+        notify('ZIP failed: ' + e.message, 'err')
+      } finally {
+        setAutoZipping(false)
+      }
+    })()
+  }, [done, msg.pullAsZip]) // intentionally omit autoZipping/files to avoid stale deps
 
   const blobToB64 = f => new Promise((res, rej) => { if (!f.blob) { res(null); return }; const r = new FileReader(); r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(f.blob) })
   const saveAll = async () => {
-    const payload = await Promise.all(files.map(async f => ({ relPath: f.relPath || f.name, name: f.name, dataB64: f.blob ? await blobToB64(f) : null, tmpPath: f.tmpPath || null })))
+    const freshFiles = getFiles()
+    if (freshFiles.length === 0) { notify('No files received yet', 'err'); return }
+    const payload = await Promise.all(freshFiles.map(async f => ({ relPath: f.relPath || f.name, name: f.name, dataB64: f.blob ? await blobToB64(f) : null, tmpPath: f.tmpPath || null })))
     const r = await window.ftps?.saveToDir(payload, msg.name)
     if (r?.ok) notify?.(`Saved to ${r.dir}`, 'ok'); else if (!r?.canceled) notify?.('Save failed', 'err')
   }
@@ -1204,6 +1334,7 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
     if (window.ftps) { const r = new FileReader(); r.onload = async () => await window.ftps.saveFile(f.name, r.result.split(',')[1]); r.readAsDataURL(f.blob) }
     else { const a = document.createElement('a'); a.href = URL.createObjectURL(f.blob); a.download = f.name; document.body.appendChild(a); a.click(); document.body.removeChild(a) }
   }
+
   return <div style={{ background: T.green + '08', border: `1px solid ${T.green}22`, borderRadius: 8, maxWidth: '85%', minWidth: 220, overflow: 'hidden' }}>
     <div style={{ padding: '9px 11px', display: 'flex', alignItems: 'center', gap: 8, cursor: done ? 'pointer' : 'default' }} onClick={() => done && setExpanded(e => !e)}>
       <span style={{ fontSize: 17, flexShrink: 0 }}>📂</span>
@@ -1212,18 +1343,16 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
         <div style={{ fontSize: 11, color: T.textDim }}>{msg.totalFiles} files · {fmtSz(msg.totalBytes || 0)}</div>
       </div>
       <span className="stag" style={{ color: done ? T.green : T.amber, background: (done ? T.green : T.amber) + '12', border: `1px solid ${(done ? T.green : T.amber)}28`, flexShrink: 0 }}>
-        {done ? '✓ Received' : `${msg.receivedCount || 0}/${msg.totalFiles}`}
+        {autoZipping ? '📦 Zipping…' : done ? (msg.pullAsZip ? '📦 Saving ZIP…' : '✓ Received') : `${msg.receivedCount || 0}/${msg.totalFiles}`}
       </span>
-      {done && <span style={{ fontSize: 10, color: T.textDim, flexShrink: 0 }}>{expanded ? '▾' : '▸'}</span>}
+      {done && !autoZipping && <span style={{ fontSize: 10, color: T.textDim, flexShrink: 0 }}>{expanded ? '▾' : '▸'}</span>}
     </div>
     {!done && <div style={{ padding: '0 11px 9px' }}>
-      {/* BUG-17 fix: use actual received/total ratio instead of indeterminate 100% */}
       <div className="prog" style={{ marginBottom: 3 }}><div className="prog-fill" style={{ width: `${msg.totalFiles > 0 ? Math.round((msg.receivedCount || 0) / msg.totalFiles * 100) : 0}%`, background: T.green, transition: 'width .3s' }} /></div>
       <div style={{ fontSize: 11, color: T.textDim, marginTop: 1, display: 'flex', justifyContent: 'space-between' }}>
-        <span>↓ {msg.receivedCount || 0} of {msg.totalFiles} files received</span>
+        <span>↓ {msg.receivedCount || 0} of {msg.totalFiles} files</span>
         <span>{msg.totalFiles > 0 ? Math.round((msg.receivedCount || 0) / msg.totalFiles * 100) : 0}%</span>
       </div>
-      
       {/* Speed computation */}
       {(() => {
         const hist = msg.speedHistory || []
@@ -1240,25 +1369,24 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
           <span>{eta > 0 ? `~${fmtTime(eta)} remaining` : ''}</span>
         </div>
       })()}
-      
       {/* Stall Detection */}
       {(() => {
         if (!msg.lastGotT) return null
         const stallMs = Date.now() - msg.lastGotT
-        if (stallMs > 30000) return <div style={{ fontSize: 10, color: T.red, marginTop: 5 }}>❌ Transfer failed or sender disconnected</div>
-        if (stallMs > 10000) return <div style={{ fontSize: 10, color: T.amber, marginTop: 5 }}>⚠ Transfer stalled ({Math.floor(stallMs/1000)}s)</div>
+        if (stallMs > 30000) return <div style={{ fontSize: 10, color: T.red, marginTop: 5 }}>❌ Transfer stalled — sender may have disconnected</div>
+        if (stallMs > 10000) return <div style={{ fontSize: 10, color: T.amber, marginTop: 5 }}>⚠ Waiting… ({Math.floor(stallMs / 1000)}s)</div>
         return null
       })()}
-
-      <div style={{ fontSize: 9, color: T.amber, marginTop: 5 }}>⚠ Large folders may take time — files transfer one at a time over encrypted TCP</div>
     </div>}
     {done && expanded && <div style={{ borderTop: `1px solid ${T.green}20` }}>
       <div style={{ padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 5, background: T.surface }}>
-        <span style={{ fontSize: 10, color: T.textDim, flex: 1 }}>{files.length} files received</span>
+        <span style={{ fontSize: 10, color: T.textDim, flex: 1 }}>{files.length} file{files.length !== 1 ? 's' : ''} received</span>
         <button onClick={async () => {
           try {
+            const freshFiles = getFiles()
+            if (freshFiles.length === 0) { notify('No files to ZIP', 'err'); return }
             notify('Creating ZIP…', 'info')
-            const zipFiles = files.map(f => ({ name: f.relPath || f.name, blob: f.blob || null }))
+            const zipFiles = freshFiles.map(f => ({ name: f.relPath || f.name, blob: f.blob || null }))
             const zipBlob = await createZipBlob(zipFiles)
             if (window.ftps) {
               const r = new FileReader(); r.onload = async () => await window.ftps.saveFile(msg.name + '.zip', r.result.split(',')[1]); r.readAsDataURL(zipBlob)
@@ -1563,9 +1691,9 @@ function HelpModal({ onClose, inline = false }) {
       {tab === 'sandbox' && <>
         <div style={{ background: T.amber + '08', border: `1px solid ${T.amber}18`, borderRadius: 8, padding: '12px 16px', marginBottom: 18 }}>
           <div style={{ fontSize: 13, color: T.text, fontWeight: 600, marginBottom: 4 }}>🛡 Sandbox & Archive Security</div>
-          <div style={{ fontSize: 12, color: T.textMid, lineHeight: 1.8 }}>P2N offers two levels of file inspection: an in-app archive viewer (ZIP/RAR) and OS-level sandboxing (Windows Sandbox / Linux firejail). Both keep suspicious files away from your real system.</div>
+          <div style={{ fontSize: 12, color: T.textMid, lineHeight: 1.8 }}>P2N offers two levels of file inspection: an in-app archive viewer (ZIP/TAR) and OS-level sandboxing (Windows Sandbox / Linux firejail). Both keep suspicious files away from your real system.</div>
         </div>
-        <S n="1" col={T.blue} title="In-App Archive Viewer" body="ZIP and RAR files can be browsed directly inside P2N — click '📂 Browse' on the file card. Read-only, in-memory, nothing is extracted to disk. Preview text, images, and PDFs safely." />
+        <S n="1" col={T.blue} title="In-App Archive Viewer" body="ZIP and TAR files can be browsed directly inside P2N — click '📂 Browse' on the file card. Read-only, in-memory, nothing is extracted to disk. Preview text, images, and PDFs safely." />
         <S n="2" col={T.amber} title="OS Sandbox (Windows / Linux)" body="Click '🛡 Sandbox' on any archive or executable file. On Windows, this launches Windows Sandbox (Hyper-V VM) — a full isolated virtual machine. On Linux, firejail/bubblewrap creates a restricted namespace. Everything is deleted when the sandbox closes." />
         <S n="3" col={T.green} title="Save selectively" body="After inspecting, click ⬇ on individual files to save to a location you choose. Nothing is auto-saved or auto-extracted to your real filesystem." />
         <S n="4" col={T.purple} title="AV scan" body="Click 'Explorer' to open the temp folder in your OS file manager — Windows Defender / ClamAV scans on access automatically. P2N also runs its own threat scanner on every received file (magic byte checks, polyglot detection, PDF/image analysis)." />
@@ -1637,6 +1765,7 @@ export default function App() {
   const [selPeer, setSelPeer] = useState(null)
   const [peers, setPeers] = useState([])
   const peersRef = useRef([])
+  const peerIdentityKeysRef = useRef({})  // keeps in sync with peerIdentityKeys state for closure-safe dedup
   const [msgs, setMsgs] = useState({})
   const [input, setInput] = useState('')
   const [folderView, setFolderView] = useState(null)
@@ -1657,10 +1786,14 @@ export default function App() {
   // BUG-14 fix: showAttach was dead state (never used in UI) — removed
   const [peerFingerprints, setPeerFingerprints] = useState({})
   const [peerIdentityKeys, setPeerIdentityKeys] = useState({})  // peerId → identityKey for tofuAccept
+  const myIdentityKeyRef = useRef('')   // own Ed25519 pub key — used for self-connection guard
+  const myOnionAddrRef   = useRef('')   // own .onion hostname — used for self-connection guard
   const [verifiedPeers, setVerifiedPeers] = useState(new Set())
   const [discoveredPeers, setDiscoveredPeers] = useState([])  // mDNS discovered peers
   const [pendingPeerRequests, setPendingPeerRequests] = useState([]) // CHANGE 7b
   const [sentPeerRequests, setSentPeerRequests] = useState(new Set()) // CHANGE 7b
+  const sentPeerRequestsRef = useRef(new Set()) // FIX: ref mirror to avoid stale closure in onOpen
+  const pendingMdnsRequests = useRef(new Map()) // FIX: event-driven mDNS connect (replaces setTimeout)
   // connection state
   const [listenPort, setListenPort] = useState('7900')
   const [listenActive, setListenActive] = useState(false)
@@ -1670,10 +1803,11 @@ export default function App() {
   const [connErr, setConnErr] = useState('')
   // Tor state
   const [torStatus, setTorStatus] = useState('off') // off|starting|running|error
+  const [torBootstrap, setTorBootstrap] = useState(0) // 0–100 bootstrap %
+  const [torBootstrapMsg, setTorBootstrapMsg] = useState('Initializing…')
   const [onionAddr, setOnionAddr] = useState('')
   const [onionInput, setOnionInput] = useState('')
   const [torError, setTorError] = useState('')  // specific Tor error message
-  const [torBootPct, setTorBootPct] = useState(0)  // Tor bootstrap progress 0-100
   // FIX: Separate connection state for Tor vs local — they must not block each other
   const [torConnState, setTorConnState] = useState('idle') // idle|connecting|done|error
   const [torConnErr, setTorConnErr] = useState('')
@@ -1711,6 +1845,9 @@ export default function App() {
 
   // A4 FIX: Keep peersRef in sync so async callbacks/closures always see current peers
   useEffect(() => { peersRef.current = peers }, [peers])
+  useEffect(() => { peerIdentityKeysRef.current = peerIdentityKeys }, [peerIdentityKeys])
+  // FIX: Keep sentPeerRequestsRef in sync so TCPBridge onOpen always reads current state
+  useEffect(() => { sentPeerRequestsRef.current = sentPeerRequests }, [sentPeerRequests])
   // B10 FIX: Keep settRef in sync so TCPBridge handlers always see current settings
   const settRef = useRef(sett)
   useEffect(() => { settRef.current = sett }, [sett])
@@ -1749,8 +1886,13 @@ export default function App() {
   useEffect(() => {
     window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => { })
   }, [])
-  // B4/C1: Load blocked peers on mount
-  useEffect(() => { window.ftps?.getBlocked?.().then(r => { if (r) setBlockedPeers(r) }).catch(() => { }) }, [])
+  // B4/C1: Load blocked peers on mount + keep in sync via ftps:peer-blocked event
+  useEffect(() => {
+    const refresh = () => window.ftps?.getBlocked?.().then(r => { if (Array.isArray(r)) setBlockedPeers(r) }).catch(() => {})
+    refresh()
+    const unsub = window.ftps?.on('ftps:peer-blocked', () => refresh())
+    return () => unsub?.()
+  }, [])
 
   // Issue 11: Auto-expire pending mDNS connection requests after 30 seconds
   useEffect(() => {
@@ -1795,12 +1937,33 @@ export default function App() {
   useEffect(() => {
     const us = [
       window.ftps?.on('ftps:tor-status', d => {
-        setTorStatus(d.status);
-        if (d.progress !== undefined) setTorBootPct(d.progress);
-        if (d.onionAddress) setOnionAddr(d.onionAddress + ':' + (d.port || 7000));
-        if (d.error) setTorError(d.error);
-        if (d.status === 'running') { setTorError(''); setTorBootPct(100) }
-        if (d.status === 'off') { setOnionAddr(''); setTorError(''); setTorBootPct(0) }
+        setTorStatus(d.status)
+        // Bootstrap progress (0–100) — main.js emits this during startup
+        if (d.progress !== undefined) {
+          setTorBootstrap(d.progress)
+          const labels = {
+            5:  'Connecting to directory server…',
+            14: 'Fetching network consensus…',
+            40: 'Loading relay descriptors…',
+            60: 'Building circuits…',
+            75: 'Establishing guard connections…',
+            80: 'Connecting to entry guard…',
+            90: 'Almost there…',
+            100:'Connected to Tor network!',
+          }
+          const best = Object.keys(labels).reverse().find(k => d.progress >= parseInt(k))
+          if (best) setTorBootstrapMsg(labels[best])
+        }
+        if (d.status === 'starting' && d.progress === undefined) {
+          setTorBootstrap(0); setTorBootstrapMsg('Starting Tor process…')
+        }
+        if (d.onionAddress) {
+          setOnionAddr(d.onionAddress + ':' + (d.port || 7000))
+          myOnionAddrRef.current = d.onionAddress   // self-connection guard
+        }
+        if (d.error) setTorError(d.error)
+        if (d.status === 'running') { setTorError(''); setTorBootstrap(100); setTorBootstrapMsg('Connected!') }
+        if (d.status === 'off')     { setOnionAddr(''); setTorError(''); setTorBootstrap(0); setTorBootstrapMsg('Initializing…'); myOnionAddrRef.current = '' }
       }),
       // FIX: KNOWN-02 — removed dead subscriptions: ftps:upnp-status, ftps:pairing-status, ftps:stun-result
       // None of these channels are emitted by main.js
@@ -1833,13 +1996,30 @@ export default function App() {
         setPeers(ps => {
           const wasReconn = ps.find(p => p.id === peerId)?.reconnecting
           if (wasReconn) {
-             // flash green connected UI
              setTimeout(() => setPeers(ps2 => ps2.map(p2 => p2.id === peerId ? { ...p2, newlyConnected: false } : p2)), 3000)
              return ps.map(p => p.id === peerId ? { ...p, reconnecting: false, newlyConnected: true } : p)
           }
           return ps.map(p => p.id === peerId ? { ...p, reconnecting: false } : p)
         })
-      })
+      }),
+      // Issue 5/11: Network status — notify user when offline/online and reconnecting
+      window.ftps?.on('ftps:network-status', ({ online }) => {
+        if (online) {
+          addLog('OK', 'Network back online — reconnecting peers…')
+          notify('🌐 Network restored — reconnecting…', 'ok')
+        } else {
+          addLog('WARN', 'Network offline — transfers paused')
+          notify('📡 Network offline — will reconnect when available', 'err')
+        }
+      }),
+      // BUG 5C FIX: On unblock, reconnect but DON'T auto-approve.
+      // Mark as needing re-approval so unblocked peers go through the request flow.
+      window.ftps?.on('ftps:peer-unblocked', ({ peerId }) => {
+        addLog('OK', `Peer ${peerId} unblocked — they can now rediscover and send a new request`)
+        notify(`Peer unblocked — they must send a new connection request`, 'ok')
+        // Do NOT auto-reconnect. Let them re-discover via mDNS or manual connect.
+        // This prevents the bug where unblocked peers bypass the approval gate.
+      }),
     ]
     return () => us.forEach(u => u?.())
   }, [screen])
@@ -1883,42 +2063,101 @@ export default function App() {
   useEffect(() => {
     bridgeRef.current = new TCPBridge({
       onOpen(pid, pn, fingerprint, tofu, tofuDetail, identityKey) {
-        // FIX #7: Determine if this is a fresh reconnect (was online before).
-        // On reconnect: clear the removedMe flag and stale messages so old conversation
-        // doesn't bleed through, and "🚫 This peer has removed you" banner disappears.
+
+        // ── SELF-CONNECTION GUARD ─────────────────────────────────────────────
+        // If the connecting peer has our own identity key, we connected to ourselves.
+        // Disconnect immediately — silently, no chat message needed.
+        if (identityKey && myIdentityKeyRef.current && identityKey === myIdentityKeyRef.current) {
+          bridgeRef.current?.disconnect(pid)
+          notify('⚠ Cannot connect to yourself', 'err')
+          addLog('WARN', 'Self-connection rejected', pid)
+          return
+        }
+
+        // ── MULTI-PATH DEDUPLICATION ──────────────────────────────────────────
+        // Same person may connect via both mDNS/LAN and Tor simultaneously.
+        // Identify them by their Ed25519 identity key (unique per session).
+        // Keep only the newest connection; silently drop the older duplicate.
+        if (identityKey) {
+          const dupPeer = peersRef.current.find(p => {
+            const existing = peerIdentityKeysRef.current[p.id]
+            return existing === identityKey && p.id !== pid
+          })
+          if (dupPeer) {
+            // Same person, different path — disconnect old, adopt new pid
+            addLog('INFO', `Multi-path dedup: ${pn || pid} already connected as ${dupPeer.id} — switching to new path`)
+            bridgeRef.current?.disconnect(dupPeer.id)
+            // Migrate chat history from old pid to new pid
+            setMsgs(p => {
+              const old = p[dupPeer.id] || []
+              const cur = p[pid] || []
+              const n = { ...p }
+              delete n[dupPeer.id]
+              n[pid] = [...old, ...cur]
+              return n
+            })
+            setPeers(ps => ps.filter(p => p.id !== dupPeer.id))
+            pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `🔄 Switched to faster path`, time: now8() })
+          }
+        }
+
+        // keep a ref for dedup lookups without stale closure issues
+        if (!window.__p2nIkRef) window.__p2nIkRef = {}
+        if (identityKey) window.__p2nIkRef[pid] = identityKey
+
         setPeers(ps => {
           const ex = ps.find(p => p.id === pid)
           if (ex) return ps.map(p => p.id === pid ? { ...p, online: true, reconnecting: false, removedMe: false, name: p.name || pn } : p)
-          return [...ps, { id: pid, name: pn, online: true, reconnecting: false, removedMe: false }]
+          // Direct connections (non-mDNS) are auto-approved; mDNS peers get approved: false until peer_accept
+          const isDirectConnect = !sentPeerRequestsRef.current.has(pid)
+          return [...ps, { id: pid, name: pn, online: true, reconnecting: false, removedMe: false, approved: isDirectConnect }]
         })
-        // FIX #7: Also clear the removedByPeers ref so send is re-enabled after reconnect
-        // (The peer re-connected voluntarily, so the removal is clearly no longer in effect)
         removedByPeersRef.current.delete(pid)
-        // FIX #7: Clear old chat history on fresh peer connection if setting is ON
-        if (settRef.current.clearMsgsOnReconnect) {
+        if (settRef.current.clearMsgsOnReconnect && tofu !== 'trusted') {
           setMsgs(p => { const n = { ...p }; delete n[pid]; return n })
         }
         if (fingerprint) setPeerFingerprints(fp => ({ ...fp, [pid]: fingerprint }))
         if (identityKey) setPeerIdentityKeys(ik => ({ ...ik, [pid]: identityKey }))
         if (tofu === 'changed') {
-          // Only show modal and warning if the key CHANGED
+          // Only show modal and warning if the key CHANGED — genuine MITM concern
           setShowTofuWarn({ peerId: pid, peerName: pn, tofuDetail })
           pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `⚠️ WARNING: Peer key has changed! Verify identity before continuing.`, time: now8() })
         } else if (tofu === 'trusted') {
-          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `🔒 Connected · Trusted peer · ECDH P-256 · AES-256-GCM`, time: now8() })
+          // Reconnect within session — just a brief confirmation
+          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `🔒 Reconnected · Trusted · E2E Encrypted`, time: now8() })
         } else {
-          // 'new' TOFU state (first time LAN or tor connect): silent connect
-          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `🔒 Connected · New peer · ECDH P-256 · AES-256-GCM`, time: now8() })
+          // 'new' — first time seeing this peer this session. Clean, non-alarming message.
+          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `🔒 Connected · E2E Encrypted (ECDH P-256 · AES-256-GCM)`, time: now8() })
+          // Only show fingerprint for new peers — useful for manual verification
+          if (fingerprint) pushMsg(pid, { id: Date.now() + 1, from: 'sys', type: 'sys', text: `🔑 Verify fingerprint out-of-band: ${fingerprint}`, time: now8() })
         }
-        if (fingerprint) pushMsg(pid, { id: Date.now() + 1, from: 'sys', type: 'sys', text: `🔑 Session fingerprint: ${fingerprint}`, time: now8() })
         addLog('OK', `Connected: ${pn || pid}`, fingerprint ? `FP: ${fingerprint}` : '')
         notify(`${pn || 'Peer'} connected`, 'ok')
         // FIX: Auto-select the newly connected peer so the chat panel is never blank,
         // and reset connState so the connect form is reusable without a manual Reset.
-        setSelPeer({ id: pid, name: pn, online: true, reconnecting: false })
         setConnState('idle'); setConnErr('')
         setTorConnState('idle'); setTorConnErr('')
-        setTab('peers')
+        // v4.1: Only auto-navigate to chat for direct IP connections, NOT mDNS requests
+        const hasPendingMdns = pendingMdnsRequests.current.size > 0
+        if (!hasPendingMdns) {
+          setSelPeer({ id: pid, name: pn, online: true, reconnecting: false })
+          setTab('peers')
+        }
+
+        // FIX 3: Resolve pending mDNS requests immediately on connect (replaces setTimeout(600))
+        const pendingReq = pendingMdnsRequests.current.get(pid) || pendingMdnsRequests.current.get(pn)
+        // Also check by matching any pending request's nodeId/name against the newly connected peer
+        let resolvedNodeId = null
+        for (const [nodeId, req] of pendingMdnsRequests.current) {
+          if (req.name === pn || nodeId === pid) { resolvedNodeId = nodeId; break }
+        }
+        if (resolvedNodeId) {
+          const req = pendingMdnsRequests.current.get(resolvedNodeId)
+          pendingMdnsRequests.current.delete(resolvedNodeId)
+          bridgeRef.current?.sendMsg(pid, { type: 'peer_request', fromName: req?.fromName || account?.name || 'Unknown' })
+          setSentPeerRequests(s => new Set([...s, pid]))
+          notify(`Request sent to ${pn || 'peer'}`, 'ok')
+        }
       },
       onClose(pid) {
         setPeers(ps => ps.map(p => p.id === pid ? { ...p, online: false, reconnecting: false } : p))
@@ -1947,9 +2186,11 @@ export default function App() {
         }
         else if (msg.type === 'peer_accept') {
           setSentPeerRequests(s => { const n = new Set(s); n.delete(pid); return n })
+          // Mark peer as approved so chat is unlocked
+          setPeers(ps => ps.map(p => p.id === pid ? { ...p, approved: true } : p))
           pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `✓ ${pn} accepted your connection request`, time: now8() })
           notify(`${pn} accepted — you can now chat`, 'ok')
-          setSelPeer({ id: pid, name: pn, online: true, reconnecting: false }); setTab('peers')
+          setSelPeer({ id: pid, name: pn, online: true, reconnecting: false, approved: true }); setTab('peers')
         }
         else if (msg.type === 'peer_reject') {
           setSentPeerRequests(s => { const n = new Set(s); n.delete(pid); return n })
@@ -1963,9 +2204,24 @@ export default function App() {
           fid: msg.fid, name: msg.name, totalFiles: msg.totalFiles, totalBytes: msg.totalBytes,
           tree: msg.tree, status: 'available', time: now8(),
         })
-        // A5 FIX: Receiver gets folder_pull_done → update browse card status
+        // Sender revoked the folder offer
+        else if (msg.type === 'folder_offer_revoked') {
+          setMsgs(p => ({
+            ...p, [pid]: (p[pid] || []).map(m =>
+              m.id === 'fb_' + msg.fid ? { ...m, status: 'revoked' } : m
+            )
+          }))
+          notify(`${pn} revoked the folder offer`, 'info')
+        }
+        // A5 FIX: Receiver gets folder_pull_done → mark both browse and recv card as done
         else if (msg.type === 'folder_pull_done') {
-          setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fb_' + msg.fid ? { ...m, status: 'done' } : m) }))
+          setMsgs(p => ({
+            ...p, [pid]: (p[pid] || []).map(m =>
+              (m.id === 'fb_' + msg.fid || m.id === 'fr_' + msg.fid)
+                ? { ...m, status: 'done' }
+                : m
+            )
+          }))
         }
         // B2 FIX: Other side removed us — mark in ref so send gives specific error
         else if (msg.type === 'peer_removed') {
@@ -2006,23 +2262,37 @@ export default function App() {
                 }).catch(() => { })
             }
           } else {
-            // Pull all files via full folder transfer — FIX #5: streaming per file
+            // BUG 1 FIX: Pull all files with CONCURRENCY=3 worker pool (was sequential)
+            // BUG 6 FIX: Track failed files and only mark done after all settle
             const files = folder.files
+            const CONCURRENCY = 3
               ; (async () => {
-                for (let i = 0; i < files.length; i++) {
-                  const file = files[i]
-                  const fileFid = crypto.randomUUID()
-                  const relPath = file.webkitRelativePath || file.name
-                  try {
-                    if (bridgeRef.current?.sendFolderFile) {
-                      await bridgeRef.current.sendFolderFile(pid, file, fileFid, msg.fid, relPath, i, () => { })
-                    } else {
-                      await bridgeRef.current?.sendFile(pid, file, () => { })
-                    }
-                  } catch { }
+                const queue = files.map((file, i) => ({ file, i }))
+                let failCount = 0
+                const worker = async () => {
+                  while (queue.length > 0) {
+                    const { file, i } = queue.shift()
+                    const fileFid = crypto.randomUUID()
+                    const relPath = file.webkitRelativePath || file.name
+                    try {
+                      if (bridgeRef.current?.sendFolderFile) {
+                        await bridgeRef.current.sendFolderFile(pid, file, fileFid, msg.fid, relPath, i, () => { })
+                      } else {
+                        await bridgeRef.current?.sendFile(pid, file, () => { })
+                      }
+                    } catch { failCount++ }
+                  }
                 }
-                setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'done' } : m) }))
-                bridgeRef.current?.sendMsg(pid, { type: 'folder_pull_done', fid: msg.fid })
+                await Promise.allSettled(
+                  Array.from({ length: Math.min(CONCURRENCY, files.length) }, () => worker())
+                )
+                // BUG 6 FIX: Only mark as done after ALL workers finish — prevents race
+                if (failCount > 0) {
+                  setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'done', failCount } : m) }))
+                } else {
+                  setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'done' } : m) }))
+                }
+                bridgeRef.current?.sendMsg(pid, { type: 'folder_pull_done', fid: msg.fid, failCount })
               })().catch(() => {
                 setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'offered' } : m) }))
               })
@@ -2102,35 +2372,66 @@ export default function App() {
       },
       onFolderFileDone(pid, folderFid, fileIndex, meta, blob, tmpPath) {
         // Store file data keyed by index — blob or tmpPath depending on file size
+        if (!folderDataRef.current[folderFid]) {
+          // Single-file browse-pull: create lightweight entry
+          folderDataRef.current[folderFid] = { name: meta.name, files: [], expectedCount: 1, isBrowsePull: true }
+        }
         const fd = folderDataRef.current[folderFid]
         if (fd) {
           fd.files[fileIndex] = {
             relPath: meta.folderRelPath || meta.name,
             name: meta.name,
             size: meta.size,
-            blob: blob || null,    // small files: Blob object
-            tmpPath: tmpPath || null, // large files: disk path
+            blob: blob || null,
+            tmpPath: tmpPath || null,
           }
         }
-        // Update receivedCount in message (triggers re-render for progress bar)
-        setMsgs(p => ({
-          ...p, [pid]: (p[pid] || []).map(m =>
-            m.id === 'fr_' + folderFid 
-              ? { 
-                  ...m, 
-                  receivedCount: (m.receivedCount || 0) + 1,
-                  bytesSent: (m.bytesSent || 0) + (meta.size || 0),
-                  speedHistory: [...(m.speedHistory || []).filter(h => Date.now() - h.t < 2000), { t: Date.now(), b: (m.bytesSent || 0) + (meta.size || 0) }],
-                  lastGotT: Date.now() // For stall detection
-                } 
-              : m
-          )
-        }))
+        // Update the correct message type
+        setMsgs(p => {
+          const peerMsgs = p[pid] || []
+          const hasRecvMsg = peerMsgs.some(m => m.id === 'fr_' + folderFid)
+          if (hasRecvMsg) {
+            // Pull-all path: update progress in the folder_recv card
+            return {
+              ...p, [pid]: peerMsgs.map(m =>
+                m.id === 'fr_' + folderFid
+                  ? {
+                    ...m,
+                    receivedCount: (m.receivedCount || 0) + 1,
+                    bytesSent: (m.bytesSent || 0) + (meta.size || 0),
+                    speedHistory: [...(m.speedHistory || []).filter(h => Date.now() - h.t < 2000), { t: Date.now(), b: (m.bytesSent || 0) + (meta.size || 0) }],
+                    lastGotT: Date.now()
+                  }
+                  : m
+              )
+            }
+          } else {
+            // Single-file pull via browse card: show received file inline in the browse card
+            return {
+              ...p, [pid]: peerMsgs.map(m =>
+                m.id === 'fb_' + folderFid
+                  ? {
+                    ...m,
+                    status: 'available',  // reset status so user can pull more
+                    receivedFiles: [
+                      ...(m.receivedFiles || []).filter(f => f.name !== meta.name),
+                      { relPath: meta.folderRelPath || meta.name, name: meta.name, size: meta.size, blob, tmpPath }
+                    ]
+                  }
+                  : m
+              )
+            }
+          }
+        })
       },
       onFolderComplete(pid, fid, name, fileCount) {
         setMsgs(p => ({
           ...p, [pid]: (p[pid] || []).map(m =>
-            m.id === 'fr_' + fid ? { ...m, complete: true, receivedCount: fileCount, speedHistory: [] } : m
+            m.id === 'fr_' + fid
+              ? { ...m, complete: true, receivedCount: fileCount, speedHistory: [] }
+              : m.id === 'fb_' + fid
+                ? { ...m, status: 'done' }
+                : m
           )
         }))
         addLog('OK', `Folder received: ${name}`, `${fileCount} files`)
@@ -2183,23 +2484,25 @@ export default function App() {
       } catch { fileToSend = file }
     }
     const ok = await bridgeRef.current?.sendFile(selPeer.id, fileToSend, pct => {
-      setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).map(m => {
-        if (m.id !== fid + '_out') return m
-        const now = Date.now()
-        const bytesSent = Math.round(pct * (m.meta?.size || 0))
-        const hist = [...(m.speedHistory || []).filter(h => now - h.t < 2000), { t: now, b: bytesSent }]
-        let calcSpeed = 0, calcEta = 0
-        if (hist.length >= 2) {
-          const dt = (hist[hist.length - 1].t - hist[0].t) / 1000
-          if (dt > 0) {
-            calcSpeed = (hist[hist.length - 1].b - hist[0].b) / dt
-            const rem = (m.meta?.size || 0) - bytesSent
-            if (calcSpeed > 0 && rem > 0) calcEta = Math.round(rem / calcSpeed)
+      const bytesSent = Math.round((fileToSend.size || 0) * pct)
+      const now = Date.now()
+      setMsgs(p => ({
+        ...p, [selPeer.id]: (p[selPeer.id] || []).map(m => {
+          if (m.id !== fid + '_out') return m
+          const hist = [...(m.speedHistory || []).filter(h => now - h.t < 2500), { t: now, b: bytesSent }]
+          let calcSpeed = 0, calcEta = 0
+          if (hist.length >= 2) {
+            const dt = (hist[hist.length - 1].t - hist[0].t) / 1000
+            if (dt > 0) {
+              calcSpeed = (hist[hist.length - 1].b - hist[0].b) / dt
+              const rem = (fileToSend.size || 0) - bytesSent
+              calcEta = calcSpeed > 0 ? Math.round(rem / calcSpeed) : 0
+            }
           }
-        }
-        return { ...m, pct, bytesSent, speedHistory: hist, calcSpeed, calcEta }
-      }) }))
-    }, fid, true)  // pass fid + useStream=true so tcpbridge uses file.path when available
+          return { ...m, pct, bytesSent, speedHistory: hist, calcSpeed, calcEta }
+        })
+      }))
+    }, fid, true)
     if (!ok) {
       notify(`Send failed: ${file.name}`, 'err')
       setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).filter(m => m.id !== fid + '_out') }))
@@ -2213,6 +2516,16 @@ export default function App() {
     if (!selPeer) return
     if (removedByPeersRef.current.has(selPeer.id)) {
       notify('❌ Cannot send file — this peer has removed you from their list', 'err')
+      return
+    }
+    // v4.1: Block sending unsupported archive formats
+    if (IS_UNSUPPORTED_ARCH.test(file.name)) {
+      notify(`❌ .${file.name.split('.').pop()} is not supported — only ZIP and TAR archives can be sent`, 'err')
+      return
+    }
+    // BUG 7 FIX: Reject bare .bz2, .gz, .xz files (not wrapped in .tar)
+    if (IS_BARE_COMPRESSED.test(file.name)) {
+      notify(`❌ Standalone .${file.name.split('.').pop()} files are not supported — use .tar.${file.name.split('.').pop()} or .zip instead`, 'err')
       return
     }
     // Issue 4: Warn before sending dangerous/executable files
@@ -2254,17 +2567,49 @@ export default function App() {
   }, [selPeer, pushMsg, addLog, notify])
 
   // doPullFolder — receiver side: request files from sender's shared folder
-  const doPullFolder = useCallback(async (peerId, fid, fileIndex) => {
-    setMsgs(p => ({
-      ...p, [peerId]: (p[peerId] || []).map(m =>
-        m.id === 'fb_' + fid ? { ...m, status: 'pulling' } : m
-      )
-    }))
+  // fileIndex: null = pull all, number = pull single file
+  // folderMeta: { name, totalFiles, totalBytes } from the browse card
+  // asZip: true = auto-ZIP when done
+  const doPullFolder = useCallback(async (peerId, fid, fileIndex, folderMeta, asZip) => {
+    if (fileIndex === null) {
+      // Pull all — create a folder_recv progress message so the receiver sees progress
+      if (!folderDataRef.current[fid]) {
+        folderDataRef.current[fid] = { name: folderMeta?.name || 'Folder', files: [], expectedCount: folderMeta?.totalFiles || 0 }
+      }
+      // Create the receiving progress card below the browse card
+      setMsgs(p => {
+        const pid_msgs = p[peerId] || []
+        const alreadyHasRecv = pid_msgs.some(m => m.id === 'fr_' + fid)
+        if (alreadyHasRecv) return p
+        return {
+          ...p, [peerId]: [...pid_msgs, {
+            id: 'fr_' + fid, from: 'them', type: 'folder_recv',
+            folderFid: fid, name: folderMeta?.name || 'Folder',
+            totalFiles: folderMeta?.totalFiles || 0, totalBytes: folderMeta?.totalBytes || 0,
+            receivedCount: 0, complete: false, pullAsZip: !!asZip, time: now8()
+          }]
+        }
+      })
+      // Mark browse card as pulling
+      setMsgs(p => ({
+        ...p, [peerId]: (p[peerId] || []).map(m =>
+          m.id === 'fb_' + fid ? { ...m, status: 'pulling' } : m
+        )
+      }))
+    } else {
+      // Single file pull — mark browse card as pulling (briefly) and track in receivedFiles
+      // The file will arrive via onFolderFileDone which updates receivedFiles in the browse msg
+      setMsgs(p => ({
+        ...p, [peerId]: (p[peerId] || []).map(m =>
+          m.id === 'fb_' + fid ? { ...m, status: 'pulling' } : m
+        )
+      }))
+    }
     await bridgeRef.current?.sendMsg(peerId, {
       type: 'folder_pull', fid,
       fileIndex: fileIndex != null ? fileIndex : null,
     })
-  }, [])
+  }, [pushMsg])
 
   // doExtract — gate for archive extraction (shows warning if warnArch is on)
   const doExtract = useCallback((msg) => {
@@ -2279,23 +2624,33 @@ export default function App() {
   // doExtractAction — actually extract archive into sandboxed temp dir
   const doExtractAction = useCallback(async (msg) => {
     setShowArchConfirm(null)
-    if (!msg.blob) { notify('File not loaded in memory', 'err'); return }
+    // Support both blob (small files) and tmpPath (large files >32MB)
+    if (!msg.blob && !msg.tmpPath) { notify('File not loaded in memory', 'err'); return }
     setSandboxLoading(true)
     try {
-      const r = new FileReader()
-      const b64 = await new Promise((res, rej) => {
-        r.onload = () => res(r.result.split(',')[1])
-        r.onerror = rej
-        r.readAsDataURL(msg.blob)
-      })
-      const result = await window.ftps?.extractArchive(msg.meta?.name || 'archive', b64)
+      let result
+      if (msg.tmpPath) {
+        // Large file: use path-based extraction to avoid memory spike
+        result = await window.ftps?.extractArchiveFromPath(msg.meta?.name || 'archive', msg.tmpPath)
+      } else {
+        const r = new FileReader()
+        const b64 = await new Promise((res, rej) => {
+          r.onload = () => res(r.result.split(',')[1])
+          r.onerror = rej
+          r.readAsDataURL(msg.blob)
+        })
+        result = await window.ftps?.extractArchive(msg.meta?.name || 'archive', b64)
+      }
       setSandboxLoading(false)
       if (result?.ok) {
         setSandbox({ name: msg.meta?.name, sandboxDir: result.sandboxDir, sandboxId: result.sandboxId, tree: result.tree })
         addLog('OK', `Archive extracted: ${msg.meta?.name}`, result.sandboxDir)
         notify('Archive ready in sandbox', 'ok')
+      } else if (result?.passwordProtected) {
+        notify('🔐 Archive is password-protected — cannot extract', 'err')
+        addLog('WARN', 'Password-protected archive', msg.meta?.name)
       } else {
-        notify('Extract failed: ' + (result?.error || 'unknown'), 'err')
+        notify('Extract failed: ' + (result?.error || 'Install 7-Zip for full format support'), 'err')
         addLog('ERR', 'Extract failed', result?.error || '')
       }
     } catch (e) {
@@ -2381,6 +2736,7 @@ export default function App() {
     myId.current = makeId(form.name)
     const res = await window.ftps?.setIdentity(form.name.trim(), myId.current)
     if (res?.nodeId) myId.current = res.nodeId
+    if (res?.identityKey) myIdentityKeyRef.current = res.identityKey  // self-connection guard
     setAccount(form); lastAct.current = Date.now(); setLockTimer(sett.lockMin * 60)
     // FIX: save session to sessionStorage so Refresh UI can restore without re-setup
     saveSession(form, myId.current)
@@ -2406,8 +2762,12 @@ export default function App() {
       const t = lockTries + 1; setLockTries(t); addLog('WARN', `Failed unlock attempt ${t}`)
       if (t >= sett.maxTries) {
         addLog('ERR', 'Max attempts — session wiped')
+        // Stop Tor so it restarts fresh when the next session starts
+        window.ftps?.stopTor()
         bridgeRef.current?.closeAll(); setAccount(null); setScreen('setup')
         setMsgs({}); setPeers([]); setForm({ name: '', passphrase: '', password: '' }); setLockTries(0); setLockErr('')
+        setTorStatus('off'); setOnionAddr(''); setTorError(''); setTorBootstrap(0)
+        myIdentityKeyRef.current = ''; myOnionAddrRef.current = ''
       } else setLockErr(`Wrong · ${sett.maxTries - t} attempt${sett.maxTries - t !== 1 ? 's' : ''} left`)
     }
   }
@@ -2416,13 +2776,19 @@ export default function App() {
   // doTerminate — complete session wipe, ALL state reset to clean slate
   const doTerminate = () => {
     clearSavedSession(); window.ftps?.clearSession(); addLog('INFO', 'Session ended')
+    // Stop Tor so it restarts cleanly with a fresh identity next session
+    window.ftps?.stopTor()
     bridgeRef.current?.closeAll()
+    // Clear identity refs so self-connect guard doesn't hold stale keys
+    myIdentityKeyRef.current = ''; myOnionAddrRef.current = ''
+    peerIdentityKeysRef.current = {}
+    if (window.__p2nIkRef) window.__p2nIkRef = {}
     setAccount(null); setScreen('setup'); setMsgs({}); setPeers([])
     setForm({ name: '', passphrase: '', password: '' })
     setLockForm({ pp: '', pw: '' }); setLockErr(''); setLockTries(0)
     setConnState('idle'); setConnErr(''); setConnectAddr('')
     setTorConnState('idle'); setTorConnErr(''); setOnionInput('')
-    setTorStatus('off'); setOnionAddr(''); setTorError('')
+    setTorStatus('off'); setOnionAddr(''); setTorError(''); setTorBootstrap(0); setTorBootstrapMsg('Initializing…')
     setListenActive(false); setListenInfo(null)
     setDiscoveredPeers([]); setPeerFingerprints({}); setPeerIdentityKeys({})
     setVerifiedPeers(new Set()); setSysStats(null); setLogs([])
@@ -2431,7 +2797,6 @@ export default function App() {
     setBlockedPeers([])
     setSett2Raw({ ...DEFAULT_SETTINGS })
     folderDataRef.current = {}; sharedFoldersRef.current = {}; removedByPeersRef.current.clear(); folderPullFidsRef.current.clear()
-    // Restore saved port so the connect tab always shows what the user last saved
     window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => { })
   }
 
@@ -2451,8 +2816,20 @@ export default function App() {
   const doConnect = async () => {
     const t = connectAddr.trim(); if (!t) { notify('Enter IP:port', 'err'); return }
     const parts = t.split(':'); if (parts.length < 2 || !parts[0] || !parts[1]) { notify('Format: 192.168.x.x:7900', 'err'); return }
+    const targetHost = parts[0].trim(), targetPort = parseInt(parts[1])
+    // Self-connection guard: check if target matches any of our own local IPs + port
+    if (listenInfo) {
+      const myPort = listenInfo.port
+      const myIPs = (listenInfo.localIPs || []).map(i => i.address)
+      const selfIPs = [...myIPs, '127.0.0.1', 'localhost', '::1']
+      if (selfIPs.includes(targetHost) && targetPort === myPort) {
+        notify('⚠ That is your own address — cannot connect to yourself', 'err')
+        addLog('WARN', 'Self-connect blocked (direct)')
+        return
+      }
+    }
     setConnState('connecting'); setConnErr('')
-    const r = await window.ftps?.connect(parts[0], parts[1])
+    const r = await window.ftps?.connect(targetHost, String(targetPort))
     if (!r) { notify('Electron API unavailable', 'err'); setConnState('idle'); return }
     if (r.ok) { setConnState('done'); notify('Connected — handshaking…') }
     else { setConnState('error'); setConnErr(r.error || 'Failed'); addLog('ERR', 'Connect failed', r.error || ''); notify('Failed: ' + (r.error || ''), 'err') }
@@ -2512,11 +2889,16 @@ export default function App() {
   const doConnectOnion = async () => {
     const addr = onionInput.trim(); if (!addr) { notify('Enter .onion address', 'err'); return }
     const parts = addr.split(':')
-    // BUG-07 fix: validate .onion format and port
     if (!parts[0].endsWith('.onion')) { notify('Address must end in .onion', 'err'); return }
     if (parts[0].length < 16) { notify('Invalid .onion address (too short)', 'err'); return }
     const port = parseInt(parts[1])
     if (!parts[1] || isNaN(port) || port < 1 || port > 65535) { notify('Invalid port — format: xxxx.onion:7900', 'err'); return }
+    // Self-connection guard: compare against our own onion address
+    if (myOnionAddrRef.current && parts[0] === myOnionAddrRef.current) {
+      notify('⚠ That is your own onion address — cannot connect to yourself', 'err')
+      addLog('WARN', 'Self-connect blocked (Tor)')
+      return
+    }
     setTorConnState('connecting'); setTorConnErr('')
     addLog('INFO', `Connecting via Tor to ${addr}`)
     const r = await window.ftps?.connectOnion(parts[0], port)
@@ -2763,6 +3145,7 @@ export default function App() {
           {[
             { id: 'connect', icon: '⊕', label: 'Connect' },
             { id: 'peers', icon: '◉', label: 'Network' },
+            { id: 'requests', icon: '📬', label: 'Requests', badge: pendingPeerRequests.length },
             { id: 'logs', icon: '📋', label: 'Logs', badge: tab !== 'logs' ? unreadLogs : 0 },
             { id: 'network', icon: '⬡', label: 'My Network' },
             { id: 'stats', icon: '▲', label: 'Stats' },
@@ -2771,9 +3154,9 @@ export default function App() {
           ].map(it => (
             <button key={it.id} onClick={() => {
               setTab(it.id)
-              if (it.id !== 'peers') setSelPeer(null)
+              // Never clear selPeer on tab switch — peer stays selected so chat is preserved
               if (it.id === 'logs') { setUnreadLogs(0) }
-              else setLogSearch('')  // clear log search when switching away
+              else if (it.id !== 'logs') setLogSearch('')
             }} className={`nav-item${tab === it.id ? ' act' : ''}`}>
               <span style={{ width: 17, textAlign: 'center', fontSize: 13, flexShrink: 0 }}>{it.icon}</span>
               <span style={{ flex: 1 }}>{it.label}</span>
@@ -2841,6 +3224,10 @@ export default function App() {
                     <div style={{ fontSize: 10, color: T.purple, letterSpacing: 1.5, marginBottom: 11, fontWeight: 700 }}>② CONNECT TO PEER</div>
                     <div style={{ fontSize: 10, color: T.textDim, marginBottom: 5, letterSpacing: 1, fontWeight: 600 }}>IP:PORT (Same Network)</div>
                     <input value={connectAddr} onChange={e => setConnectAddr(e.target.value)} onKeyDown={e => e.key === 'Enter' && doConnect()} className="inp" placeholder="192.168.1.x:7900" style={{ marginBottom: 7 }} disabled={connState === 'connecting'} />
+                    {/* BUG 3 FIX: Clarify that no secret code is needed — just IP:PORT */}
+                    <div style={{ fontSize: 10, color: T.textDim, marginBottom: 7, lineHeight: 1.5 }}>
+                      No password or secret code needed — encryption is automatic via ECDH key exchange. After connecting, verify your peer's fingerprint via the <strong style={{ color: T.accent }}>✔ Verify</strong> button.
+                    </div>
                     <button onClick={doConnect} className="btn btn-purple" style={{ width: '100%', padding: 8 }} disabled={connState === 'connecting' || !connectAddr.trim()}>
                       {connState === 'connecting' ? '⟳ Connecting…' : '→ Connect'}
                     </button>
@@ -2865,19 +3252,51 @@ export default function App() {
                       <div style={{ fontSize: 10, color: T.purple, fontWeight: 700, marginBottom: 6, letterSpacing: 1 }}>GENERATE ONION LINK</div>
                       {torStatus !== 'running'
                         ? <button onClick={doStartTor} className="btn btn-purple" style={{ width: '100%', padding: 9 }} disabled={torStatus === 'starting'}>
-                          {torStatus === 'starting' ? '⟳ Starting Tor…' : '🧅 Start Tor & Generate Link'}
+                          {torStatus === 'starting' ? '⟳ Bootstrapping Tor…' : '🧅 Start Tor & Generate Link'}
                         </button>
                         : <button onClick={doStopTor} className="btn btn-danger" style={{ width: '100%', padding: 9 }}>■ Stop Tor</button>
                       }
                       {torStatus === 'starting' && (
-                        <div style={{ marginTop: 7, padding: '8px 11px', background: T.amber + '10', border: `1px solid ${T.amber}30`, borderRadius: 5 }}>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: T.amber, marginBottom: 4, fontWeight: 600 }}>
-                            <span>⟳ Bootstrapping Tor…</span>
-                            <span>{torBootPct}%</span>
+                        <div style={{ marginTop: 8, padding: '10px 12px', background: '#1a1040', border: `1px solid ${T.purple}30`, borderRadius: 8 }}>
+                          {/* Header row */}
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 7 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <div className="spin" style={{ width: 10, height: 10, border: `2px solid ${T.purple}40`, borderTopColor: T.purple, borderRadius: '50%', flexShrink: 0 }} />
+                              <span style={{ fontSize: 10, color: T.purple, fontWeight: 700, letterSpacing: 1 }}>BOOTSTRAPPING</span>
+                            </div>
+                            <span style={{ fontSize: 11, color: T.purple, fontWeight: 700, fontFamily: 'monospace' }}>{torBootstrap}%</span>
                           </div>
-                          <div className="prog"><div className="prog-fill" style={{ width: `${torBootPct}%`, background: T.amber, transition: 'width .3s' }} /></div>
-                          <div style={{ fontSize: 10, color: T.textDim, marginTop: 4 }}>
-                            {torBootPct < 25 ? 'Connecting to the Tor network…' : torBootPct < 80 ? 'Building circuits…' : torBootPct < 100 ? 'Almost ready…' : 'Generating onion address…'}
+                          {/* Progress track */}
+                          <div style={{ height: 6, background: `${T.purple}18`, borderRadius: 6, overflow: 'hidden', marginBottom: 6, position: 'relative' }}>
+                            <div style={{
+                              height: '100%', borderRadius: 6,
+                              width: `${torBootstrap}%`,
+                              background: `linear-gradient(90deg, #6e40c9, ${T.purple}, #c084fc)`,
+                              transition: 'width 0.8s cubic-bezier(0.4,0,0.2,1)',
+                              boxShadow: `0 0 8px ${T.purple}60`,
+                            }} />
+                            {/* Shimmer overlay */}
+                            <div style={{
+                              position: 'absolute', inset: 0, borderRadius: 6,
+                              background: 'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.08) 50%, transparent 100%)',
+                              animation: 'shimmer 1.8s infinite',
+                            }} />
+                          </div>
+                          {/* Stage label */}
+                          <div style={{ fontSize: 10, color: T.textDim, lineHeight: 1.4 }}>{torBootstrapMsg}</div>
+                          {/* Milestone dots */}
+                          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6, position: 'relative' }}>
+                            {[0, 25, 50, 75, 100].map(m => (
+                              <div key={m} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                                <div style={{
+                                  width: 6, height: 6, borderRadius: '50%',
+                                  background: torBootstrap >= m ? T.purple : `${T.purple}28`,
+                                  boxShadow: torBootstrap >= m ? `0 0 4px ${T.purple}80` : 'none',
+                                  transition: 'all 0.4s',
+                                }} />
+                                <span style={{ fontSize: 8, color: torBootstrap >= m ? T.purple : T.muted, fontFamily: 'monospace' }}>{m}%</span>
+                              </div>
+                            ))}
                           </div>
                         </div>
                       )}
@@ -2994,11 +3413,22 @@ export default function App() {
                                       ? renderMD(msg.text)
                                       : escH(msg.text.replace(/\*\*\*(.+?)\*\*\*/g, '$1').replace(/\*\*(.+?)\*\*/g, '$1').replace(/\*(.+?)\*/g, '$1').replace(/~~(.+?)~~/g, '$1').replace(/`([^`]+)`/g, '$1').replace(/^#+\s/gm, '')).replace(/\n/g, '<br>')
                               }} />
-                            <div style={{ fontSize: 10, color: T.muted, marginTop: 3, textAlign: 'right', display: 'flex', justifyContent: 'flex-end', gap: 4 }}>{msg.time}{msg.from === 'me' && <span style={{ color: T.accentDim }}>✓</span>}</div>
+                            <div style={{ fontSize: 10, color: T.muted, marginTop: 3, textAlign: 'right', display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
+                              {/* BUG 5B FIX: Show blocked badge if this peer is in blocked list */}
+                              {msg.from === 'them' && blockedPeers.some(bp => bp.id === selPeer?.id) && <span style={{ color: T.red, fontWeight: 700, fontSize: 9, padding: '0 4px', background: T.red + '12', borderRadius: 3, border: `1px solid ${T.red}25` }}>🚫 Blocked</span>}
+                              {msg.time}{msg.from === 'me' && <span style={{ color: T.accentDim }}>✓</span>}
+                            </div>
                           </div>}
                           {['file_out', 'file_in', 'file_done', 'revoked'].includes(msg.type) && <FileMsg msg={msg} onExtract={doExtract} onPreview={m => setFileView(m)} onRevoke={doRevoke} onZipView={m => setZipView(m)} onOSSandbox={m => setOsSandbox(m)} warnArch={sett.warnArch} />}
                           {msg.type === 'folder' && <FolderMsg msg={msg} onOpen={() => setFolderView(msg.folder)} onRevoke={doRevoke} />}
-                          {msg.type === 'folder_offer' && <FolderOfferMsg msg={msg} />}
+                          {msg.type === 'folder_offer' && <FolderOfferMsg msg={msg} onRevoke={fid => {
+                            // Revoke the offer: remove from sharedFolders so sender ignores future pulls
+                            if (sharedFoldersRef.current[fid]) delete sharedFoldersRef.current[fid]
+                            setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).map(m => m.id === 'fo_' + fid ? { ...m, status: 'done' } : m) }))
+                            // Notify peer the offer is revoked
+                            bridgeRef.current?.sendMsg(selPeer.id, { type: 'folder_offer_revoked', fid })
+                            notify('Folder offer revoked', 'ok')
+                          }} />}
                           {msg.type === 'folder_browse' && <FolderBrowseMsg msg={msg} peerId={selPeer?.id} onPull={doPullFolder} notify={notify} />}
                           {msg.type === 'folder_recv' && <FolderRecvMsg msg={msg} folderDataRef={folderDataRef} notify={notify} />}
                         </div>
@@ -3018,12 +3448,18 @@ export default function App() {
                         onClick={() => setSett2(p => ({ ...p, md: !p.md }))}
                       >MD {sett.md ? 'ON' : 'OFF'}</span>
                     </div>}
-                    {/* Input */}
+                    {/* Input — disabled if peer hasn't accepted yet */}
                     <div style={{ padding: '8px 11px', borderTop: `1px solid ${T.border}`, background: T.surface, flexShrink: 0 }}>
+                      {sentPeerRequests.has(selPeer.id) && !selPeer.approved ? (
+                        <div style={{ padding: '10px 12px', background: T.amber + '0a', border: `1px solid ${T.amber}25`, borderRadius: 8, fontSize: 11, color: T.amber, textAlign: 'center' }}>
+                          ⟳ Waiting for {selPeer.name || 'peer'} to accept your connection request…
+                        </div>
+                      ) : (
                       <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
                         <textarea value={input} onChange={e => { setInput(e.target.value); lastAct.current = Date.now() }} onKeyDown={e => { lastAct.current = Date.now(); if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend() } }} placeholder={selPeer.removedMe ? '🚫 Cannot send — this peer removed you' : 'Message… Shift+Enter = newline'} disabled={!!selPeer.removedMe} rows={2} style={{ flex: 1, background: T.bg, border: `1px solid ${T.border}`, borderRadius: 8, padding: '7px 11px', color: T.text, fontFamily: 'inherit', fontSize: 13, resize: 'none', lineHeight: 1.5, transition: 'border-color .12s' }} onFocus={e => e.target.style.borderColor = T.accentDim} onBlur={e => e.target.style.borderColor = T.border} />
                         <button onClick={doSend} style={{ width: 34, height: 34, borderRadius: 8, background: input.trim() ? T.accent : T.panel, border: `1px solid ${input.trim() ? T.accent : T.border}`, color: input.trim() ? '#0d1117' : T.textDim, fontSize: 15, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, transition: 'all .12s', fontWeight: 700 }}>↑</button>
                       </div>
+                      )}
                     </div>
                   </div>
                 )}
@@ -3080,9 +3516,134 @@ export default function App() {
               </div>
             )}
 
+            {/* ── REQUESTS ── */}
+            {tab === 'requests' && (
+              <div style={{ flex: 1, overflowY: 'auto', padding: 16 }} className="fadein">
+                <div style={{ fontSize: 10, color: T.amber, fontWeight: 700, letterSpacing: 2, marginBottom: 16 }}>📬 CONNECTION REQUESTS</div>
+                {pendingPeerRequests.length === 0 ? (
+                  <div className="card" style={{ padding: 32, textAlign: 'center' }}>
+                    <div style={{ fontSize: 32, marginBottom: 12 }}>📭</div>
+                    <div style={{ fontSize: 14, color: T.text, fontWeight: 600, marginBottom: 6 }}>No pending requests</div>
+                    <div style={{ fontSize: 12, color: T.textDim, lineHeight: 1.6 }}>When someone on your local network wants to connect, their request will appear here. You can accept or decline.</div>
+                  </div>
+                ) : (
+                  <div className="card" style={{ padding: 0, overflow: 'hidden', border: `1px solid ${T.amber}30` }}>
+                    <div style={{ padding: '10px 14px', background: T.amber + '08', borderBottom: `1px solid ${T.amber}20`, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 14 }}>📬</span>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 11, color: T.amber, fontWeight: 700 }}>INCOMING REQUESTS</div>
+                        <div style={{ fontSize: 10, color: T.textDim }}>{pendingPeerRequests.length} pending · accept to start chatting</div>
+                      </div>
+                    </div>
+                    {pendingPeerRequests.map(req => {
+                      const elapsed = Math.max(0, Math.round((Date.now() - req.timestamp) / 1000))
+                      const remaining = Math.max(0, 60 - elapsed)
+                      return (
+                        <div key={req.peerId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderBottom: `1px solid ${T.border}20` }}>
+                          <div style={{ width: 42, height: 42, borderRadius: '50%', background: T.amber + '18', border: `2px solid ${T.amber}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18, flexShrink: 0, color: T.amber, fontWeight: 700 }}>
+                            {(req.fromName || req.peerName || '?')[0].toUpperCase()}
+                          </div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, color: T.text, fontWeight: 600 }}>{req.fromName || req.peerName || req.peerId}</div>
+                            <div style={{ fontSize: 10, color: T.textDim }}>{req.peerId}</div>
+                            <div style={{ fontSize: 10, color: remaining < 15 ? T.red : T.muted, marginTop: 2 }}>wants to connect · {remaining}s remaining</div>
+                          </div>
+                          <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                            <button onClick={() => {
+                              bridgeRef.current?.sendMsg(req.peerId, { type: 'peer_accept' })
+                              setPendingPeerRequests(p => p.filter(r => r.peerId !== req.peerId))
+                              notify(`${req.fromName || req.peerName} accepted`, 'ok')
+                              const peer = peersRef.current.find(p => p.id === req.peerId)
+                              setSelPeer(peer || { id: req.peerId, name: req.fromName || req.peerName, online: true }); setTab('peers')
+                            }} className="btn btn-green btn-sm" style={{ padding: '6px 14px', fontWeight: 700 }}>✓ Accept</button>
+                            <button onClick={() => {
+                              bridgeRef.current?.sendMsg(req.peerId, { type: 'peer_reject' })
+                              setPendingPeerRequests(p => p.filter(r => r.peerId !== req.peerId))
+                              bridgeRef.current?.disconnect(req.peerId)
+                              setPeers(ps => ps.filter(p => p.id !== req.peerId))
+                              notify(`${req.fromName || req.peerName} declined`, 'info')
+                            }} className="btn btn-ghost btn-sm" style={{ padding: '6px 14px', color: T.red, fontWeight: 700 }}>✕ Decline</button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                    <div style={{ padding: '8px 14px', fontSize: 10, color: T.textDim, background: T.bg + '80', borderTop: `1px solid ${T.border}15` }}>
+                      Requests expire after 60 seconds · accept to add peer to your Network
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* ── MY NETWORK ── */}
             {tab === 'network' && (
               <div style={{ flex: 1, overflowY: 'auto', padding: 16 }} className="fadein">
+
+                {/* Tor Bootstrap Card — shown in Network tab while Tor is starting */}
+                {torStatus === 'starting' && (
+                  <div style={{ marginBottom: 14, padding: '14px 16px', background: 'linear-gradient(135deg, #1a1040 0%, #0d1117 100%)', border: `1px solid ${T.purple}40`, borderRadius: 10, boxShadow: `0 0 24px ${T.purple}18` }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+                      <div style={{ fontSize: 20 }}>🧅</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 12, color: T.purple, fontWeight: 700, letterSpacing: 0.5 }}>Tor Network — Bootstrapping</div>
+                        <div style={{ fontSize: 10, color: T.textDim, marginTop: 1 }}>Building anonymous circuits through the Tor network…</div>
+                      </div>
+                      <div style={{ fontSize: 20, fontWeight: 800, color: T.purple, fontFamily: 'monospace' }}>{torBootstrap}%</div>
+                    </div>
+                    {/* Main progress bar */}
+                    <div style={{ height: 8, background: `${T.purple}15`, borderRadius: 8, overflow: 'hidden', position: 'relative', marginBottom: 10 }}>
+                      <div style={{
+                        height: '100%', borderRadius: 8,
+                        width: `${torBootstrap}%`,
+                        background: `linear-gradient(90deg, #4c1d95, ${T.purple}, #c084fc)`,
+                        transition: 'width 0.9s cubic-bezier(0.4,0,0.2,1)',
+                        boxShadow: `0 0 12px ${T.purple}50`,
+                        position: 'relative', overflow: 'hidden',
+                      }}>
+                        <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.15) 50%, transparent 100%)', animation: 'shimmer 1.6s infinite' }} />
+                      </div>
+                    </div>
+                    {/* Stage message */}
+                    <div style={{ fontSize: 11, color: T.textDim, marginBottom: 10, minHeight: 16 }}>
+                      <span style={{ color: T.purple }}>›</span> {torBootstrapMsg}
+                    </div>
+                    {/* Milestone track */}
+                    <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', position: 'relative' }}>
+                      {/* Connector line */}
+                      <div style={{ position: 'absolute', top: 5, left: 5, right: 5, height: 1, background: `${T.purple}20` }} />
+                      {[
+                        { pct: 0,   label: 'Start' },
+                        { pct: 14,  label: 'Consensus' },
+                        { pct: 40,  label: 'Relays' },
+                        { pct: 75,  label: 'Circuits' },
+                        { pct: 100, label: 'Ready' },
+                      ].map(({ pct, label }) => (
+                        <div key={pct} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, zIndex: 1 }}>
+                          <div style={{
+                            width: 10, height: 10, borderRadius: '50%',
+                            background: torBootstrap >= pct ? T.purple : '#1a1040',
+                            border: `2px solid ${torBootstrap >= pct ? T.purple : `${T.purple}40`}`,
+                            boxShadow: torBootstrap >= pct ? `0 0 6px ${T.purple}80` : 'none',
+                            transition: 'all 0.5s ease',
+                          }} />
+                          <span style={{ fontSize: 8, color: torBootstrap >= pct ? T.purple : T.muted, fontWeight: torBootstrap >= pct ? 700 : 400 }}>{label}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Tor running banner in network tab */}
+                {torStatus === 'running' && onionAddr && (
+                  <div style={{ marginBottom: 14, padding: '10px 14px', background: 'linear-gradient(135deg, #1a1040 0%, #0d1117 100%)', border: `1px solid ${T.purple}40`, borderRadius: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div style={{ fontSize: 18 }}>🧅</div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 11, color: T.purple, fontWeight: 700 }}>Tor Hidden Service Active</div>
+                      <div style={{ fontSize: 10, color: T.textDim, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{onionAddr}</div>
+                    </div>
+                    <div style={{ width: 8, height: 8, borderRadius: '50%', background: T.purple, boxShadow: `0 0 8px ${T.purple}`, flexShrink: 0, animation: 'pulse 2s infinite' }} />
+                  </div>
+                )}
                 <div className="card glass glow-accent" style={{ padding: 16, marginBottom: 16, position: 'relative', overflow: 'hidden' }}>
                   <div style={{ fontSize: 10, color: T.accent, fontWeight: 700, letterSpacing: 2, marginBottom: 15 }}>NETWORK TOPOLOGY</div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-around', padding: '10px 0' }}>
@@ -3167,72 +3728,64 @@ export default function App() {
                 </div>
                 {/* mDNS Discovered Peers */}
                 {discoveredPeers.length > 0 && (
-                  <div className="card" style={{ padding: 14, marginBottom: 10 }}>
-                    <div style={{ fontSize: 10, color: T.green, fontWeight: 700, letterSpacing: 1, marginBottom: 9 }}>📡 NEARBY PEERS (AUTO-DISCOVERED)</div>
-                    {discoveredPeers.map((dp, i) => (
-                      <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 0', borderBottom: `1px solid ${T.border}` }}>
-                        <div>
-                          <div style={{ fontSize: 12, color: T.text, fontWeight: 600 }}>{dp.name || 'Unknown'}</div>
-                          <div style={{ fontSize: 10, color: T.textDim, fontFamily: 'monospace' }}>{dp.address}:{dp.port}</div>
-                        </div>
-                        <button onClick={async () => {
-                          try {
-                            notify(`Sending request to ${dp.name || dp.address}…`, 'ok')
-                            const r = await window.ftps?.connect(dp.address, String(dp.port))
-                            if (r?.ok) {
-                              // After TCP connects, send peer_request message
-                              setTimeout(() => {
-                                // A9 FIX: use peersRef.current instead of stale closure
-                                const peerList = [...peersRef.current]
-                                const newPeer = peerList.find(p => p.online && !sentPeerRequests.has(p.id))
-                                if (newPeer) {
-                                  bridgeRef.current?.sendMsg(newPeer.id, { type: 'peer_request', fromName: account?.name || 'Unknown' })
-                                  setSentPeerRequests(s => new Set([...s, newPeer.id]))
-                                  notify(`Request sent to ${dp.name || dp.address}`, 'ok')
+                  <div className="card" style={{ padding: 0, marginBottom: 10, overflow: 'hidden', border: `1px solid ${T.green}30` }}>
+                    <div style={{ padding: '10px 14px', background: T.green + '08', borderBottom: `1px solid ${T.green}20`, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 14 }}>📡</span>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 11, color: T.green, fontWeight: 700 }}>NEARBY PEERS — SAME NETWORK</div>
+                        <div style={{ fontSize: 10, color: T.textDim }}>Auto-discovered via mDNS · approval required to chat</div>
+                      </div>
+                    </div>
+
+                    {/* Discovered peers list */}
+                    {discoveredPeers.length > 0 && <div style={{ padding: '8px 14px' }}>
+                      {discoveredPeers.map((dp, i) => {
+                        // Check if we already sent a request to this node
+                        const alreadySent = sentPeerRequests.has(dp.nodeId) || peersRef.current.some(p => p.online && (msgs[p.id]?.length > 0))
+                        const alreadyConnected = peersRef.current.some(p => p.online && p.name === dp.name && p.id !== myId.current)
+                        return (
+                          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: i < discoveredPeers.length - 1 ? `1px solid ${T.border}20` : 'none' }}>
+                            <div style={{ width: 36, height: 36, borderRadius: '50%', background: T.green + '15', border: `2px solid ${T.green}30`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, flexShrink: 0 }}>
+                              {(dp.name || '?')[0].toUpperCase()}
+                            </div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ fontSize: 12, color: T.text, fontWeight: 600 }}>{dp.name || 'Unknown'}</div>
+                              <div style={{ fontSize: 10, color: T.textDim, fontFamily: 'monospace' }}>{dp.nodeId || 'mDNS'} · Port {dp.port}</div>
+                            </div>
+                            {alreadyConnected ? (
+                              <span style={{ fontSize: 10, color: T.green, fontWeight: 600 }}>● Connected</span>
+                            ) : sentPeerRequests.has(dp.nodeId) ? (
+                              <span style={{ fontSize: 10, color: T.amber }}>⟳ Pending…</span>
+                            ) : (
+                              <button onClick={async () => {
+                                // Self-connect guard
+                                if (listenInfo) {
+                                  const myIPs = (listenInfo.localIPs || []).map(i => i.address)
+                                  if ([...myIPs, '127.0.0.1'].includes(dp.address) && dp.port === listenInfo.port) {
+                                    notify('⚠ That is your own device', 'err'); return
+                                  }
                                 }
-                              }, 500)
-                            } else { notify('Failed: ' + (r?.error || 'unknown'), 'err') }
-                          } catch (err) {
-                            notify('Connection error: ' + (err?.message || 'unknown'), 'err')
-                            addLog('ERR', `Connect to ${dp.address}:${dp.port} failed`, err?.message || '')
-                          }
-                        }} className="btn btn-ghost btn-sm" style={{ color: T.amber, border: `1px solid ${T.amber}30` }}>📡 Send Request</button>
-                      </div>
-                    ))}
-                    {/* CHANGE 7b: Pending incoming requests */}
-                    {pendingPeerRequests.length > 0 && (
-                      <div style={{ marginTop: 10, padding: '8px 10px', background: T.amber + '08', border: `1px solid ${T.amber}22`, borderRadius: 6 }}>
-                        <div style={{ fontSize: 10, color: T.amber, fontWeight: 700, marginBottom: 6 }}>📬 INCOMING REQUESTS</div>
-                        {pendingPeerRequests.map(req => {
-                          const elapsed = Math.max(0, Math.round((Date.now() - req.timestamp) / 1000))
-                          const remaining = Math.max(0, 30 - elapsed)
-                          return (
-                          <div key={req.peerId} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 0', borderBottom: `1px solid ${T.border}30` }}>
-                            <div>
-                              <div style={{ fontSize: 11, color: T.text }}>{req.fromName || req.peerName || req.peerId}</div>
-                              <div style={{ fontSize: 11, color: remaining < 10 ? T.red : T.textDim }}>{remaining}s remaining</div>
-                            </div>
-                            <div style={{ display: 'flex', gap: 5 }}>
-                              <button onClick={() => {
-                                bridgeRef.current?.sendMsg(req.peerId, { type: 'peer_accept' })
-                                setPendingPeerRequests(p => p.filter(r => r.peerId !== req.peerId))
-                                notify(`${req.fromName || req.peerName} accepted`, 'ok')
-                                setSelPeer(peers.find(p => p.id === req.peerId) || { id: req.peerId, name: req.fromName, online: true }); setTab('peers')
-                              }} className="btn btn-green btn-xs">✓ Accept</button>
-                              <button onClick={() => {
-                                bridgeRef.current?.sendMsg(req.peerId, { type: 'peer_reject' })
-                                setPendingPeerRequests(p => p.filter(r => r.peerId !== req.peerId))
-                                bridgeRef.current?.disconnect(req.peerId)
-                                setPeers(ps => ps.filter(p => p.id !== req.peerId))
-                                notify(`${req.fromName || req.peerName} declined`, 'info')
-                              }} className="btn btn-danger btn-xs">✕ Decline</button>
-                            </div>
+                                try {
+                                  notify(`Connecting to ${dp.name || dp.address}…`, 'ok')
+                                  const r = await window.ftps?.connect(dp.address, String(dp.port))
+                                  if (r?.ok) {
+                                    // Mark as sent immediately using nodeId (stable before peerId arrives)
+                                    setSentPeerRequests(s => new Set([...s, dp.nodeId]))
+                                    // FIX 3: Register pending request — resolved instantly when onOpen fires
+                                    pendingMdnsRequests.current.set(dp.nodeId, { name: dp.name, fromName: account?.name || 'Unknown' })
+                                  } else { notify('Connect failed: ' + (r?.error || ''), 'err') }
+                                } catch (err) { notify('Error: ' + (err?.message || ''), 'err') }
+                              }} className="btn btn-ghost btn-sm" style={{ color: T.green, border: `1px solid ${T.green}30`, flexShrink: 0 }}>
+                                Add ＋
+                              </button>
+                            )}
                           </div>
-                          )
-                        })}
-                      </div>
-                    )}
-                    <div style={{ fontSize: 11, color: T.textDim, marginTop: 6 }}>📡 Peers auto-discovered via mDNS on your local network</div>
+                        )
+                      })}
+                    </div>}
+                    <div style={{ padding: '6px 14px', fontSize: 10, color: T.textDim, borderTop: `1px solid ${T.border}15`, background: T.bg + '80' }}>
+                      Peers must accept your request before you can chat · requests expire after 60s
+                    </div>
                   </div>
                 )}
                 {discoveredPeers.length === 0 && listenActive && (
@@ -3242,9 +3795,16 @@ export default function App() {
                       ⚠ If no peers appear: both devices must be on the same WiFi/LAN.
                       On Windows, allow the app through Windows Defender Firewall, or run:
                     </div>
-                    <div style={{ fontFamily: 'monospace', fontSize: 10, color: T.blue, marginTop: 3, background: T.bg, padding: '3px 7px', borderRadius: 4 }}>
-                      netsh advfirewall firewall add rule name="P2N mDNS" dir=in action=allow protocol=UDP localport=7476
-                    </div>
+                    {/* BUG 4 FIX: Copyable firewall rules with click-to-copy and copy button */}
+                    {[
+                      `netsh advfirewall firewall add rule name="P2N mDNS" dir=in action=allow protocol=UDP localport=7476`,
+                      `netsh advfirewall firewall add rule name="P2N TCP" dir=in action=allow protocol=TCP localport=${listenPort}`,
+                    ].map((rule, idx) => (
+                      <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4, background: T.bg, padding: '4px 7px', borderRadius: 4, cursor: 'pointer' }} onClick={() => { navigator.clipboard?.writeText(rule); notify('Copied!', 'ok') }}>
+                        <code style={{ flex: 1, fontFamily: 'monospace', fontSize: 10, color: T.blue, wordBreak: 'break-all' }}>{rule}</code>
+                        <button onClick={e => { e.stopPropagation(); navigator.clipboard?.writeText(rule); notify('Copied!', 'ok') }} className="btn btn-ghost btn-xs" style={{ flexShrink: 0, fontSize: 12 }}>⎘</button>
+                      </div>
+                    ))}
                   </div>
                 )}
                 {discoveredPeers.length === 0 && !listenActive && (
@@ -3275,7 +3835,7 @@ export default function App() {
                   <div className="card" style={{ padding: 16 }}>
                     <div className="sh" style={{ marginBottom: 15 }}>System Resources</div>
                     <ResourceBar label="Process RAM (RSS)" val={sysStats?.rss || 0} max={1024 * 1024 * 1024} col={T.purple} />
-                    <ResourceBar label="CPU Load Avg" val={(sysStats?.loadAvg || 0) * 100} max={100} col={T.blue} />
+                    <ResourceBar label="CPU Load Avg" val={sysStats?.cpuPercent || (sysStats?.loadAvg || 0) * 100} max={100} col={T.blue} />
                     <ResourceBar label="Heap Used" val={sysStats?.heapUsed || 0} max={sysStats?.heapTotal || 1} col={T.accent} />
                     <div style={{ marginTop: 10, background: T.bg, padding: 8, borderRadius: 6, border: `1px solid ${T.border}` }}>
                       <div style={{ fontSize: 10, color: T.textDim, textTransform: 'uppercase', marginBottom: 4 }}>Internal Node Engine</div>
