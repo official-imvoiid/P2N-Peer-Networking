@@ -265,7 +265,7 @@ const phrase = () => { const w = () => WORDS[Math.floor(Math.random() * WORDS.le
 const IS_ARCH = /\.(zip|tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz)$/i
 const IS_ZIP = /\.zip$/i
 const IS_ARCH_VIEWABLE = /\.(zip|tar|tgz|tar\.gz|tar\.bz2|tar\.xz)$/i  // archives we can list/browse
-const IS_UNSUPPORTED_ARCH = /\.(rar|7z)$/i  // v4: RAR/7z removed — show warning instead
+const IS_UNSUPPORTED_ARCH = /\.(rar|7z|iso|dmg|apk|cab|pkg|deb|rpm|z|lz|lzma|lzo)$/i  // v4: Block unsupported archives
 // BUG 7 FIX: Bare compressed files (.bz2, .gz, .xz without .tar prefix) are NOT valid archives
 const IS_BARE_COMPRESSED = /(?<!\.tar)\.(bz2|gz|xz)$/i
 // all git-tracked text / code types
@@ -765,7 +765,7 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
     if (!msg.blob) return; setPreviewLoading(true)
     if (previewUrlRef.current) { URL.revokeObjectURL(previewUrlRef.current); previewUrlRef.current = null }
     const b64 = await getB64()
-    const result = await window.ftps?.readArchiveEntry(fname, b64, entryPath)
+    const result = await window.ftps?.readArchiveEntry(fname, b64, entryPath, password || null)
     setPreviewLoading(false)
     if (!result?.ok) { setPreview({ name: entryName, type: 'err', msg: result?.error || 'Cannot read file' }); return }
     const buf = Uint8Array.from(atob(result.dataB64), c => c.charCodeAt(0))
@@ -778,7 +778,7 @@ function ZipViewer({ msg, onClose, onOSSandbox }) {
   const saveEntry = async (entryPath, entryName) => {
     if (!msg.blob) return
     const b64 = await getB64()
-    const result = await window.ftps?.readArchiveEntry(fname, b64, entryPath)
+    const result = await window.ftps?.readArchiveEntry(fname, b64, entryPath, password || null)
     if (result?.ok) await window.ftps?.saveFile(entryName, result.dataB64)
   }
 
@@ -1373,8 +1373,8 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
       {(() => {
         if (!msg.lastGotT) return null
         const stallMs = Date.now() - msg.lastGotT
-        if (stallMs > 30000) return <div style={{ fontSize: 10, color: T.red, marginTop: 5 }}>❌ Transfer stalled — sender may have disconnected</div>
-        if (stallMs > 10000) return <div style={{ fontSize: 10, color: T.amber, marginTop: 5 }}>⚠ Waiting… ({Math.floor(stallMs / 1000)}s)</div>
+        if (stallMs > 120000) return <div style={{ fontSize: 10, color: T.red, marginTop: 5 }}>❌ Transfer stalled — sender may have disconnected</div>
+        if (stallMs > 30000) return <div style={{ fontSize: 10, color: T.amber, marginTop: 5 }}>⚠ Waiting… ({Math.floor(stallMs / 1000)}s) — large files may take longer</div>
         return null
       })()}
     </div>}
@@ -1418,32 +1418,66 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
   </div>
 }
 function FileInlineViewer({ file }) {
-  const [open, setOpen] = useState(false), [content, setContent] = useState(null), [loading, setLoading] = useState(false)
-  // FIX: KNOWN-04 — revoke ObjectURL when content changes or component unmounts
-  useEffect(() => () => { if (content?.url) URL.revokeObjectURL(content.url) }, [content])
+  const [open, setOpen] = useState(false)
+  const [content, setContent] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const urlRef = useRef(null)  // track ObjectURL for safe revoke
   const name = file.name || ''
-  const open_ = () => {
-    setOpen(true); if (content) return; setLoading(true)
-    const t = setTimeout(() => setLoading(false), 5000)
-    if (!file.blob) { setLoading(false); clearTimeout(t); return }
-    if (IS_IMG.test(name)) { const u = URL.createObjectURL(file.blob); setContent({ type: 'img', url: u }); setLoading(false); clearTimeout(t) }
-    else if (IS_TEXT.test(name)) { file.blob.text().then(tx => { setContent({ type: 'text', text: tx.slice(0, 8000) }); setLoading(false); clearTimeout(t) }) }
-    else if (IS_PDF.test(name)) { const u = URL.createObjectURL(file.blob); setContent({ type: 'pdf', url: u }); setLoading(false); clearTimeout(t) }
-    else { setLoading(false); clearTimeout(t) }
+
+  // Revoke ObjectURL only on unmount, not on every content change (prevents stale URL bug)
+  useEffect(() => () => { if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = null } }, [])
+
+  const doOpen = async () => {
+    setOpen(true)
+    // Reset content on every open so stale/revoked URLs don't show
+    if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = null }
+    setContent(null)
+    setLoading(true)
+    try {
+      // Handle tmpPath (large file on disk) via IPC
+      if (!file.blob && file.tmpPath) {
+        const r = await window.ftps?.readFileForPreview(file.tmpPath)
+        if (!r?.ok) { setLoading(false); return }
+        const buf = Uint8Array.from(atob(r.dataB64), c => c.charCodeAt(0))
+        const blob = new Blob([buf], { type: file.type || 'application/octet-stream' })
+        if (IS_IMG.test(name)) { const u = URL.createObjectURL(blob); urlRef.current = u; setContent({ type: 'img', url: u }) }
+        else if (IS_TEXT.test(name)) { const tx = await blob.text(); setContent({ type: 'text', text: tx.slice(0, 80000) }) }
+        else if (IS_PDF.test(name)) { const u = URL.createObjectURL(blob); urlRef.current = u; setContent({ type: 'pdf', url: u }) }
+        else setContent({ type: 'bin' })
+        setLoading(false)
+        return
+      }
+      // Handle in-memory blob
+      if (!file.blob) { setLoading(false); return }
+      if (IS_IMG.test(name)) { const u = URL.createObjectURL(file.blob); urlRef.current = u; setContent({ type: 'img', url: u }) }
+      else if (IS_TEXT.test(name)) { const tx = await file.blob.text(); setContent({ type: 'text', text: tx.slice(0, 80000) }) }
+      else if (IS_PDF.test(name)) { const u = URL.createObjectURL(file.blob); urlRef.current = u; setContent({ type: 'pdf', url: u }) }
+      else setContent({ type: 'bin' })
+    } catch { setContent(null) }
+    setLoading(false)
   }
-  if (!open) return <button onClick={open_} className="btn btn-blue btn-xs" style={{ flexShrink: 0, padding: '2px 5px', fontSize: 9 }}>👁</button>
-  return <div className="overlay" style={{ zIndex: 700 }} onClick={() => setOpen(false)}>
+
+  const doClose = () => {
+    setOpen(false)
+    // Revoke URL when closing (not when setting new content) to avoid stale-URL third-click bug
+    if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = null }
+    setContent(null)
+  }
+
+  if (!open) return <button onClick={doOpen} className="btn btn-blue btn-xs" style={{ flexShrink: 0, padding: '2px 5px', fontSize: 9 }}>👁</button>
+  return <div className="overlay" style={{ zIndex: 700 }} onClick={doClose}>
     <div className="card fadeup" style={{ width: 'min(700px,95vw)', height: 'min(75vh,600px)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
       <div style={{ padding: '8px 14px', borderBottom: `1px solid ${T.border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
         <span style={{ fontSize: 12, fontWeight: 600, color: T.text }}>{name}</span>
-        <button onClick={() => setOpen(false)} className="btn btn-ghost btn-sm">✕</button>
+        <button onClick={doClose} className="btn btn-ghost btn-sm">✕</button>
       </div>
       <div style={{ flex: 1, overflow: 'auto', background: T.bg }}>
         {loading && <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, color: T.textDim }}><div className="spin" style={{ width: 16, height: 16, border: `2px solid ${T.border}`, borderTopColor: T.accent, borderRadius: '50%' }} />Loading…</div>}
         {!loading && content?.type === 'img' && <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}><img src={content.url} alt={name} style={{ maxWidth: '100%', maxHeight: '60vh', objectFit: 'contain', borderRadius: 5 }} /></div>}
         {!loading && content?.type === 'text' && <pre style={{ padding: 16, fontFamily: 'monospace', fontSize: 12, color: T.textMid, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{content.text}</pre>}
         {!loading && content?.type === 'pdf' && <iframe src={content.url} style={{ width: '100%', height: '100%', border: 'none' }} title={name} />}
-        {!loading && !content && <div style={{ padding: 36, textAlign: 'center', color: T.textDim, fontSize: 12 }}>No inline preview available</div>}
+        {!loading && content?.type === 'bin' && <div style={{ padding: 36, textAlign: 'center', color: T.textDim, fontSize: 12 }}>Binary file — save to disk to open</div>}
+        {!loading && !content && <div style={{ padding: 36, textAlign: 'center', color: T.textDim, fontSize: 12 }}>Preview not available — file may still be loading</div>}
       </div>
     </div>
   </div>
@@ -1792,8 +1826,8 @@ export default function App() {
   const [discoveredPeers, setDiscoveredPeers] = useState([])  // mDNS discovered peers
   const [pendingPeerRequests, setPendingPeerRequests] = useState([]) // CHANGE 7b
   const [sentPeerRequests, setSentPeerRequests] = useState(new Set()) // CHANGE 7b
+  const [rejectedRequests, setRejectedRequests] = useState([]) // Edit 5: track rejections with timer
   const sentPeerRequestsRef = useRef(new Set()) // FIX: ref mirror to avoid stale closure in onOpen
-  const pendingMdnsRequests = useRef(new Map()) // FIX: event-driven mDNS connect (replaces setTimeout)
   // connection state
   const [listenPort, setListenPort] = useState('7900')
   const [listenActive, setListenActive] = useState(false)
@@ -1828,6 +1862,7 @@ export default function App() {
   const lastBw = useRef({ in: 0, out: 0 })
 
   const bridgeRef = useRef(null), chatEnd = useRef(null)
+  const blockedPeerStateRef = useRef({})  // Edit 7: stores {name, msgs} when peer is blocked
   const fileInp = useRef(null), folderInp = useRef(null), lastAct = useRef(Date.now()), myId = useRef(getInitialNodeId())
   // Stores received folder file data keyed by folderFid — kept in ref to avoid re-renders per-chunk
   const folderDataRef = useRef({})  // {[folderFid]: {name, files:[{relPath,name,size,dataB64?,tmpPath?}]}}
@@ -1893,6 +1928,16 @@ export default function App() {
     const unsub = window.ftps?.on('ftps:peer-blocked', () => refresh())
     return () => unsub?.()
   }, [])
+
+  // Edit 5: Refresh rejection timers every second for live countdown display
+  useEffect(() => {
+    if (rejectedRequests.length === 0) return
+    const t = setInterval(() => {
+      const now = Date.now()
+      setRejectedRequests(r => r.filter(x => x.expiresAt > now))
+    }, 1000)
+    return () => clearInterval(t)
+  }, [rejectedRequests.length])
 
   // Issue 11: Auto-expire pending mDNS connection requests after 30 seconds
   useEffect(() => {
@@ -2015,10 +2060,33 @@ export default function App() {
       // BUG 5C FIX: On unblock, reconnect but DON'T auto-approve.
       // Mark as needing re-approval so unblocked peers go through the request flow.
       window.ftps?.on('ftps:peer-unblocked', ({ peerId }) => {
-        addLog('OK', `Peer ${peerId} unblocked — they can now rediscover and send a new request`)
-        notify(`Peer unblocked — they must send a new connection request`, 'ok')
-        // Do NOT auto-reconnect. Let them re-discover via mDNS or manual connect.
-        // This prevents the bug where unblocked peers bypass the approval gate.
+        // Edit 7: Restore peer's previous state when unblocking
+        const saved = blockedPeerStateRef.current[peerId]
+        if (saved) {
+          // Restore the peer in the peers list (offline, unblocked)
+          setPeers(ps => {
+            const existing = ps.find(p => p.id === peerId)
+            if (existing) {
+              return ps.map(p => p.id === peerId
+                ? { ...p, online: false, blocked: false, reconnecting: false }
+                : p
+              )
+            }
+            // Peer was removed from list — re-add them
+            return [...ps, { id: peerId, name: saved.name, online: false, blocked: false, reconnecting: false }]
+          })
+          // Restore their chat messages
+          if (saved.msgs?.length > 0) {
+            setMsgs(p => ({ ...p, [peerId]: saved.msgs }))
+          }
+          delete blockedPeerStateRef.current[peerId]
+          addLog('OK', `Peer ${peerId} unblocked — previous chat restored, awaiting their reconnect`)
+          notify(`${saved.name || peerId} unblocked — previous chat restored. They will reconnect via mDNS.`, 'ok')
+        } else {
+          addLog('OK', `Peer ${peerId} unblocked — they can now rediscover and send a new request`)
+          notify(`Peer unblocked — they must send a new connection request`, 'ok')
+        }
+        // Do NOT auto-approve — peer must still go through the request flow
       }),
     ]
     return () => us.forEach(u => u?.())
@@ -2074,6 +2142,20 @@ export default function App() {
           return
         }
 
+        // FIX 6: mDNS request reconciliation — nodeId from mDNS may differ from real pid in HELLO
+        // When mDNS "Add +" is clicked, we stored dp.nodeId as the pending request peerId.
+        // Now that HELLO arrived with real pid, find and clean up the nodeId-based entry.
+        setPendingPeerRequests(prev => {
+          // Find any sender-role request whose peerName matches the newly connected peer
+          const mdnsMatch = prev.find(r => r.role === 'sender' && (r.peerName === pn || r.peerId !== pid))
+          if (mdnsMatch && mdnsMatch.peerId !== pid) {
+            // Remove the nodeId-based entry (it will be replaced by real flow)
+            setSentPeerRequests(s => { const n = new Set(s); n.delete(mdnsMatch.peerId); return n })
+            return prev.filter(r => r.peerId !== mdnsMatch.peerId)
+          }
+          return prev
+        })
+
         // ── MULTI-PATH DEDUPLICATION ──────────────────────────────────────────
         // Same person may connect via both mDNS/LAN and Tor simultaneously.
         // Identify them by their Ed25519 identity key (unique per session).
@@ -2107,12 +2189,12 @@ export default function App() {
 
         setPeers(ps => {
           const ex = ps.find(p => p.id === pid)
-          if (ex) return ps.map(p => p.id === pid ? { ...p, online: true, reconnecting: false, removedMe: false, name: p.name || pn } : p)
-          // Direct connections (non-mDNS) are auto-approved; mDNS peers get approved: false until peer_accept
-          const isDirectConnect = !sentPeerRequestsRef.current.has(pid)
-          return [...ps, { id: pid, name: pn, online: true, reconnecting: false, removedMe: false, approved: isDirectConnect }]
+          if (ex) return ps.map(p => p.id === pid ? { ...p, online: true, reconnecting: false, removedMe: false, name: p.name || pn, approved: true } : p)
+          return [...ps, { id: pid, name: pn, online: true, reconnecting: false, removedMe: false, approved: true }]
         })
         removedByPeersRef.current.delete(pid)
+        setPendingPeerRequests(p => p.filter(r => r.peerId !== pid))
+        
         if (settRef.current.clearMsgsOnReconnect && tofu !== 'trusted') {
           setMsgs(p => { const n = { ...p }; delete n[pid]; return n })
         }
@@ -2133,41 +2215,74 @@ export default function App() {
         }
         addLog('OK', `Connected: ${pn || pid}`, fingerprint ? `FP: ${fingerprint}` : '')
         notify(`${pn || 'Peer'} connected`, 'ok')
-        // FIX: Auto-select the newly connected peer so the chat panel is never blank,
-        // and reset connState so the connect form is reusable without a manual Reset.
+        // Edit 5: Only navigate to chat when a NEW peer is fully approved and connected.
+        // For reconnects (tofu==='trusted'), restore the chat view.
+        // For genuinely new first-time connections the user sees the chat once approved.
         setConnState('idle'); setConnErr('')
         setTorConnState('idle'); setTorConnErr('')
-        // v4.1: Only auto-navigate to chat for direct IP connections, NOT mDNS requests
-        const hasPendingMdns = pendingMdnsRequests.current.size > 0
-        if (!hasPendingMdns) {
-          setSelPeer({ id: pid, name: pn, online: true, reconnecting: false })
-          setTab('peers')
-        }
-
-        // FIX 3: Resolve pending mDNS requests immediately on connect (replaces setTimeout(600))
-        const pendingReq = pendingMdnsRequests.current.get(pid) || pendingMdnsRequests.current.get(pn)
-        // Also check by matching any pending request's nodeId/name against the newly connected peer
-        let resolvedNodeId = null
-        for (const [nodeId, req] of pendingMdnsRequests.current) {
-          if (req.name === pn || nodeId === pid) { resolvedNodeId = nodeId; break }
-        }
-        if (resolvedNodeId) {
-          const req = pendingMdnsRequests.current.get(resolvedNodeId)
-          pendingMdnsRequests.current.delete(resolvedNodeId)
-          bridgeRef.current?.sendMsg(pid, { type: 'peer_request', fromName: req?.fromName || account?.name || 'Unknown' })
-          setSentPeerRequests(s => new Set([...s, pid]))
-          notify(`Request sent to ${pn || 'peer'}`, 'ok')
-        }
+        setSelPeer({ id: pid, name: pn, online: true, reconnecting: false, approved: true })
+        setTab('peers')
+      },
+      onRequested(peerId, peerName, fingerprint, tofu, tofuDetail, identityKey, role) {
+        setPendingPeerRequests(p => {
+          // FIX 6: Replace any existing placeholder entry (added from mDNS click) with real peerId
+          // The placeholder was added with dp.nodeId; now we have the real pid from HELLO
+          const hasExact = p.some(r => r.peerId === peerId)
+          if (hasExact) return p  // already have real entry, nothing to do
+          // Check for a placeholder sender entry by name (from mDNS click)
+          const placeholderIdx = role === 'sender'
+            ? p.findIndex(r => r.role === 'sender' && r.peerName === peerName && r.peerId !== peerId)
+            : -1
+          if (placeholderIdx >= 0) {
+            // Replace placeholder with real peerId
+            const updated = [...p]
+            updated[placeholderIdx] = { peerId, peerName, fingerprint, tofu, tofuDetail, identityKey, role, timestamp: Date.now() }
+            // Clean up old nodeId from sentPeerRequests
+            setSentPeerRequests(s => {
+              const n = new Set(s)
+              n.delete(p[placeholderIdx].peerId)
+              n.add(peerId)
+              return n
+            })
+            return updated
+          }
+          return [...p, { peerId, peerName, fingerprint, tofu, tofuDetail, identityKey, role, timestamp: Date.now() }];
+        });
+        if (role === 'receiver') notify(`📡 ${peerName || 'Peer'} wants to connect`, 'info');
+      },
+      onRejected(peerId) {
+        const peerName = pendingPeerRequests.find(r => r.peerId === peerId)?.peerName || peerId
+        setPendingPeerRequests(p => p.filter(r => r.peerId !== peerId));
+        setSentPeerRequests(s => { const n = new Set(s); n.delete(peerId); return n })
+        // Edit 5: Add to rejected list with 10-min expiry timer
+        setRejectedRequests(r => [...r.filter(x => x.peerId !== peerId), {
+          peerId, peerName, rejectedAt: Date.now(), expiresAt: Date.now() + 10 * 60 * 1000
+        }])
+        notify(`Your request was declined — blocked for 10 minutes`, 'err');
+      },
+      onWithdrawn(peerId) {
+        setPendingPeerRequests(p => p.filter(r => r.peerId !== peerId));
+        notify(`Connection request was withdrawn`, 'info');
       },
       onClose(pid) {
+        const peer = peersRef.current.find(p => p.id === pid)
         setPeers(ps => ps.map(p => p.id === pid ? { ...p, online: false, reconnecting: false } : p))
-        pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: '⚠ Disconnected', time: now8() })
+        // Show reconnect hint if we were actively trying to reconnect
+        const wasReconnecting = peer?.reconnecting
+        pushMsg(pid, {
+          id: Date.now(), from: 'sys', type: 'sys',
+          text: wasReconnecting
+            ? '⚠ Disconnected — peer may have blocked you or went offline'
+            : '⚠ Disconnected',
+          time: now8()
+        })
         addLog('WARN', 'Disconnected', pid)
         notify('Peer disconnected', 'err')
       },
       onReconnecting(pid, attempt, maxAttempts) {
-        setPeers(ps => ps.map(p => p.id === pid ? { ...p, reconnecting: true } : p))
-        addLog('INFO', `Reconnecting to ${pid}`, `attempt ${attempt}/${maxAttempts}`)
+        setPeers(ps => ps.map(p => p.id === pid ? { ...p, reconnecting: true, reconnectAttempt: attempt } : p))
+        const maxLabel = maxAttempts > 20 ? '∞' : maxAttempts
+        addLog('INFO', `Reconnecting to ${pid}`, `attempt ${attempt}/${maxLabel}`)
       },
       onMsg(pid, msg) {
         // A4 FIX: use peersRef.current instead of stale `peers` closure
@@ -2179,25 +2294,7 @@ export default function App() {
           const receiverMsgId = msg.fid + '_in'
           setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === receiverMsgId ? { ...m, blob: null, tmpPath: null, type: 'revoked', revokedAt: new Date().toLocaleTimeString() } : m) }))
         }
-        // CHANGE 7b: Peer request/accept/reject for mDNS discovered peers
-        else if (msg.type === 'peer_request') {
-          setPendingPeerRequests(p => [...p.filter(r => r.peerId !== pid), { peerId: pid, peerName: pn, fromName: msg.fromName, timestamp: Date.now() }])
-          notify(`📡 ${msg.fromName || pn} wants to connect`, 'info')
-        }
-        else if (msg.type === 'peer_accept') {
-          setSentPeerRequests(s => { const n = new Set(s); n.delete(pid); return n })
-          // Mark peer as approved so chat is unlocked
-          setPeers(ps => ps.map(p => p.id === pid ? { ...p, approved: true } : p))
-          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `✓ ${pn} accepted your connection request`, time: now8() })
-          notify(`${pn} accepted — you can now chat`, 'ok')
-          setSelPeer({ id: pid, name: pn, online: true, reconnecting: false, approved: true }); setTab('peers')
-        }
-        else if (msg.type === 'peer_reject') {
-          setSentPeerRequests(s => { const n = new Set(s); n.delete(pid); return n })
-          pushMsg(pid, { id: Date.now(), from: 'sys', type: 'sys', text: `✕ ${pn} declined the connection request`, time: now8() })
-          notify(`${pn} declined`, 'err')
-          bridgeRef.current?.disconnect(pid); setPeers(ps => ps.filter(p => p.id !== pid))
-        }
+        // (Messages removed: old peer_request, peer_accept, peer_reject)
         // New folder offer — receiver sees structure, can browse and pull
         else if (msg.type === 'folder_offer') pushMsg(pid, {
           id: 'fb_' + msg.fid, from: 'them', type: 'folder_browse',
@@ -2262,31 +2359,35 @@ export default function App() {
                 }).catch(() => { })
             }
           } else {
-            // BUG 1 FIX: Pull all files with CONCURRENCY=3 worker pool (was sequential)
-            // BUG 6 FIX: Track failed files and only mark done after all settle
+            // FIXED: Higher concurrency + completion fence to prevent 16281/16283 stall bug
             const files = folder.files
-            const CONCURRENCY = 3
+            const CONCURRENCY = 6  // More workers = faster parallel sends on LAN
               ; (async () => {
                 const queue = files.map((file, i) => ({ file, i }))
                 let failCount = 0
+                const inFlight = new Set()
                 const worker = async () => {
                   while (queue.length > 0) {
                     const { file, i } = queue.shift()
                     const fileFid = crypto.randomUUID()
                     const relPath = file.webkitRelativePath || file.name
+                    inFlight.add(fileFid)
                     try {
                       if (bridgeRef.current?.sendFolderFile) {
                         await bridgeRef.current.sendFolderFile(pid, file, fileFid, msg.fid, relPath, i, () => { })
                       } else {
                         await bridgeRef.current?.sendFile(pid, file, () => { })
                       }
-                    } catch { failCount++ }
+                    } catch { failCount++ } finally { inFlight.delete(fileFid) }
                   }
                 }
                 await Promise.allSettled(
                   Array.from({ length: Math.min(CONCURRENCY, files.length) }, () => worker())
                 )
-                // BUG 6 FIX: Only mark as done after ALL workers finish — prevents race
+                // Completion fence: wait 800ms after all workers finish so the last file_end
+                // frames can clear the TCP send buffer before folder_pull_done is sent.
+                // This prevents the 16281/16283 "last 2 files missing" stall bug.
+                await new Promise(r => setTimeout(r, 800))
                 if (failCount > 0) {
                   setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'done', failCount } : m) }))
                 } else {
@@ -2705,14 +2806,28 @@ export default function App() {
 
   // B4/C1: doBlockPeer — block a peer and disconnect
   const doBlockPeer = useCallback(async (peerId, peerName) => {
+    // FIX 4/7: Save full peer state BEFORE removing from UI — restores on unblock
+    setMsgs(currentMsgs => {
+      blockedPeerStateRef.current[peerId] = {
+        name: peerName,
+        msgs: currentMsgs[peerId] || [],
+        blockedAt: new Date().toISOString(),
+        // Also save peer identity info for re-connection TOFU
+        identityKey: peerIdentityKeys[peerId] || null,
+        fingerprint: peerFingerprints[peerId] || null,
+      }
+      return currentMsgs
+    })
     await window.ftps?.blockPeer(peerId, peerName, 'Manually blocked')
     bridgeRef.current?.disconnect(peerId)
+    // FIX 4: Completely remove blocked peer from UI — they are INVISIBLE until unblocked
+    // Only reachable via Settings > Blocked Peers
     setPeers(ps => ps.filter(p => p.id !== peerId))
     setMsgs(p => { const n = { ...p }; delete n[peerId]; return n })
     if (selPeer?.id === peerId) setSelPeer(null)
     setBlockedPeers(prev => [...prev.filter(b => b.id !== peerId), { id: peerId, name: peerName, blockedAt: new Date().toISOString() }])
     addLog('INFO', `Blocked peer: ${peerName || peerId}`)
-    notify(`${peerName || 'Peer'} blocked`, 'ok')
+    notify(`${peerName || 'Peer'} blocked — unblock in Settings to restore chat`, 'ok')
   }, [selPeer, addLog, notify])
 
   // ── END BUG-01 FIX ──────────────────────────────────────────────────────────
@@ -2761,13 +2876,32 @@ export default function App() {
     } else {
       const t = lockTries + 1; setLockTries(t); addLog('WARN', `Failed unlock attempt ${t}`)
       if (t >= sett.maxTries) {
-        addLog('ERR', 'Max attempts — session wiped')
-        // Stop Tor so it restarts fresh when the next session starts
+        addLog('ERR', 'Max attempts — FULL WIPE initiated')
+        // Edit 8: Full wipe — EVERYTHING cleared, no stale peers/data visible
+        window.ftps?.fullWipe?.()   // wipe backend state immediately
         window.ftps?.stopTor()
-        bridgeRef.current?.closeAll(); setAccount(null); setScreen('setup')
-        setMsgs({}); setPeers([]); setForm({ name: '', passphrase: '', password: '' }); setLockTries(0); setLockErr('')
-        setTorStatus('off'); setOnionAddr(''); setTorError(''); setTorBootstrap(0)
+        clearSavedSession()
+        sessionStorage.clear()      // wipe any other session storage
+        // Reset ALL frontend state to factory-clean
+        setAccount(null); setScreen('setup')
+        setMsgs({}); setPeers([])
+        setForm({ name: '', passphrase: '', password: '' })
+        setLockForm({ pp: '', pw: '' }); setLockTries(0); setLockErr('')
+        setTorStatus('off'); setOnionAddr(''); setTorError(''); setTorBootstrap(0); setTorBootstrapMsg('Initializing…')
+        setListenActive(false); setListenInfo(null)
+        setDiscoveredPeers([]); setPeerFingerprints({}); setPeerIdentityKeys({})
+        setVerifiedPeers(new Set()); setSysStats(null); setLogs([])
+        setSelPeer(null); setTab('connect'); setInput('')
+        setPendingPeerRequests([]); setSentPeerRequests(new Set())
+        setBlockedPeers([])
+        setConnState('idle'); setConnErr(''); setConnectAddr('')
+        setTorConnState('idle'); setTorConnErr(''); setOnionInput('')
+        setSett2Raw({ ...DEFAULT_SETTINGS })
+        folderDataRef.current = {}; sharedFoldersRef.current = {}
+        removedByPeersRef.current.clear(); folderPullFidsRef.current.clear()
         myIdentityKeyRef.current = ''; myOnionAddrRef.current = ''
+        peerIdentityKeysRef.current = {}
+        if (window.__p2nIkRef) window.__p2nIkRef = {}
       } else setLockErr(`Wrong · ${sett.maxTries - t} attempt${sett.maxTries - t !== 1 ? 's' : ''} left`)
     }
   }
@@ -2775,14 +2909,13 @@ export default function App() {
   const doLock = () => { setScreen('locked'); setLockForm({ pp: '', pw: '' }); addLog('INFO', 'Session locked') }
   // doTerminate — complete session wipe, ALL state reset to clean slate
   const doTerminate = () => {
-    clearSavedSession(); window.ftps?.clearSession(); addLog('INFO', 'Session ended')
-    // Stop Tor so it restarts cleanly with a fresh identity next session
+    // Edit 9: Immediately wipe ALL state — nothing lingers after session end
+    clearSavedSession()
+    sessionStorage.clear()          // wipe all sessionStorage
+    window.ftps?.fullWipe?.()       // wipe backend in-memory state immediately
     window.ftps?.stopTor()
-    bridgeRef.current?.closeAll()
-    // Clear identity refs so self-connect guard doesn't hold stale keys
-    myIdentityKeyRef.current = ''; myOnionAddrRef.current = ''
-    peerIdentityKeysRef.current = {}
-    if (window.__p2nIkRef) window.__p2nIkRef = {}
+    addLog('INFO', 'Session ended — all data wiped')
+    // Reset ALL frontend state
     setAccount(null); setScreen('setup'); setMsgs({}); setPeers([])
     setForm({ name: '', passphrase: '', password: '' })
     setLockForm({ pp: '', pw: '' }); setLockErr(''); setLockTries(0)
@@ -2796,7 +2929,11 @@ export default function App() {
     setPendingPeerRequests([]); setSentPeerRequests(new Set())
     setBlockedPeers([])
     setSett2Raw({ ...DEFAULT_SETTINGS })
-    folderDataRef.current = {}; sharedFoldersRef.current = {}; removedByPeersRef.current.clear(); folderPullFidsRef.current.clear()
+    folderDataRef.current = {}; sharedFoldersRef.current = {}
+    removedByPeersRef.current.clear(); folderPullFidsRef.current.clear()
+    myIdentityKeyRef.current = ''; myOnionAddrRef.current = ''
+    peerIdentityKeysRef.current = {}
+    if (window.__p2nIkRef) window.__p2nIkRef = {}
     window.ftps?.getPort?.().then(r => { if (r?.port) setListenPort(String(r.port)) }).catch(() => { })
   }
 
@@ -2831,7 +2968,12 @@ export default function App() {
     setConnState('connecting'); setConnErr('')
     const r = await window.ftps?.connect(targetHost, String(targetPort))
     if (!r) { notify('Electron API unavailable', 'err'); setConnState('idle'); return }
-    if (r.ok) { setConnState('done'); notify('Connected — handshaking…') }
+    if (r.ok) {
+      setConnState('done')
+      notify('Request sent — waiting for approval…', 'ok')
+      // Edit 5: Navigate to requests tab so sender sees their pending request
+      setTab('requests')
+    }
     else { setConnState('error'); setConnErr(r.error || 'Failed'); addLog('ERR', 'Connect failed', r.error || ''); notify('Failed: ' + (r.error || ''), 'err') }
   }
 
@@ -2903,7 +3045,12 @@ export default function App() {
     addLog('INFO', `Connecting via Tor to ${addr}`)
     const r = await window.ftps?.connectOnion(parts[0], port)
     if (!r) { notify('Electron API unavailable', 'err'); setTorConnState('idle'); return }
-    if (r.ok) { setTorConnState('done'); notify('Connected via Tor — handshaking…', 'ok') }
+    if (r.ok) {
+      setTorConnState('done')
+      notify('Tor request sent — waiting for approval…', 'ok')
+      // Edit 5: Navigate to requests tab
+      setTab('requests')
+    }
     else { setTorConnState('error'); setTorConnErr(r.error || 'Failed'); notify('Tor connect failed: ' + (r.error || ''), 'err') }
   }
 
@@ -3145,7 +3292,7 @@ export default function App() {
           {[
             { id: 'connect', icon: '⊕', label: 'Connect' },
             { id: 'peers', icon: '◉', label: 'Network' },
-            { id: 'requests', icon: '📬', label: 'Requests', badge: pendingPeerRequests.length },
+            { id: 'requests', icon: '📬', label: 'Requests', badge: pendingPeerRequests.length + rejectedRequests.filter(r => r.expiresAt > Date.now()).length },
             { id: 'logs', icon: '📋', label: 'Logs', badge: tab !== 'logs' ? unreadLogs : 0 },
             { id: 'network', icon: '⬡', label: 'My Network' },
             { id: 'stats', icon: '▲', label: 'Stats' },
@@ -3520,55 +3667,112 @@ export default function App() {
             {tab === 'requests' && (
               <div style={{ flex: 1, overflowY: 'auto', padding: 16 }} className="fadein">
                 <div style={{ fontSize: 10, color: T.amber, fontWeight: 700, letterSpacing: 2, marginBottom: 16 }}>📬 CONNECTION REQUESTS</div>
-                {pendingPeerRequests.length === 0 ? (
+
+                {/* INCOMING — peers wanting to connect to you */}
+                {(() => {
+                  const incoming = pendingPeerRequests.filter(r => r.role !== 'sender')
+                  return incoming.length > 0 && (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 10, color: T.green, fontWeight: 700, letterSpacing: 1.5, marginBottom: 8 }}>INCOMING REQUESTS</div>
+                      <div className="card" style={{ padding: 0, overflow: 'hidden', border: `1px solid ${T.green}30` }}>
+                        {incoming.map((req, i) => (
+                          <div key={req.peerId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderBottom: i < incoming.length - 1 ? `1px solid ${T.border}20` : 'none' }}>
+                            <div style={{ width: 42, height: 42, borderRadius: '50%', background: T.green + '18', border: `2px solid ${T.green}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18, flexShrink: 0, color: T.green, fontWeight: 700 }}>
+                              {(req.peerName || '?')[0].toUpperCase()}
+                            </div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ fontSize: 13, color: T.text, fontWeight: 600 }}>{req.peerName || req.peerId}</div>
+                              <div style={{ fontSize: 10, color: T.textDim, fontFamily: 'monospace' }}>{req.peerId}</div>
+                              <div style={{ fontSize: 10, color: T.green, marginTop: 2 }}>📡 Wants to connect with you</div>
+                              {req.fingerprint && <div style={{ fontSize: 9, color: T.muted, marginTop: 1, fontFamily: 'monospace' }}>FP: {req.fingerprint}</div>}
+                            </div>
+                            <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                              <button onClick={() => {
+                                window.ftps?.acceptRequest(req.peerId)
+                                setPendingPeerRequests(p => p.filter(r => r.peerId !== req.peerId))
+                                setTab('peers')
+                              }} className="btn btn-green btn-sm" style={{ padding: '7px 16px', fontWeight: 700 }}>✓ Accept</button>
+                              <button onClick={() => {
+                                window.ftps?.rejectRequest(req.peerId)
+                                setPendingPeerRequests(p => p.filter(r => r.peerId !== req.peerId))
+                                notify(`Request declined — ${req.peerName || 'Peer'} blocked for 10 minutes`, 'info')
+                              }} className="btn btn-danger btn-sm" style={{ padding: '7px 14px' }}>✕ Decline</button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* OUTGOING — sent requests waiting for approval */}
+                {(() => {
+                  const outgoing = pendingPeerRequests.filter(r => r.role === 'sender')
+                  return outgoing.length > 0 && (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 10, color: T.blue, fontWeight: 700, letterSpacing: 1.5, marginBottom: 8 }}>SENT REQUESTS</div>
+                      <div className="card" style={{ padding: 0, overflow: 'hidden', border: `1px solid ${T.blue}30` }}>
+                        {outgoing.map((req, i) => (
+                          <div key={req.peerId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderBottom: i < outgoing.length - 1 ? `1px solid ${T.border}20` : 'none' }}>
+                            <div style={{ width: 42, height: 42, borderRadius: '50%', background: T.blue + '18', border: `2px solid ${T.blue}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18, flexShrink: 0, color: T.blue, fontWeight: 700 }}>
+                              {(req.peerName || '?')[0].toUpperCase()}
+                            </div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ fontSize: 13, color: T.text, fontWeight: 600 }}>{req.peerName || req.peerId}</div>
+                              <div style={{ fontSize: 10, color: T.textDim, fontFamily: 'monospace' }}>{req.peerId}</div>
+                              <div style={{ fontSize: 10, color: T.amber, marginTop: 2, display: 'flex', alignItems: 'center', gap: 5 }}>
+                                <span className="spin" style={{ display: 'inline-block', width: 8, height: 8, border: `1.5px solid ${T.amber}40`, borderTopColor: T.amber, borderRadius: '50%' }}/>
+                                Waiting for them to accept…
+                              </div>
+                            </div>
+                            <button onClick={() => {
+                              window.ftps?.withdrawRequest(req.peerId)
+                              setPendingPeerRequests(p => p.filter(r => r.peerId !== req.peerId))
+                              setSentPeerRequests(s => { const n = new Set(s); n.delete(req.peerId); return n })
+                              notify('Request withdrawn', 'ok')
+                            }} className="btn btn-ghost btn-sm" style={{ padding: '6px 14px', color: T.textDim, flexShrink: 0 }}>Withdraw</button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {/* DECLINED — with 10-min countdown so sender knows when they can retry */}
+                {(() => {
+                  const now = Date.now()
+                  const active = rejectedRequests.filter(r => r.expiresAt > now)
+                  return active.length > 0 && (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 10, color: T.red, fontWeight: 700, letterSpacing: 1.5, marginBottom: 8 }}>DECLINED</div>
+                      <div className="card" style={{ padding: 0, overflow: 'hidden', border: `1px solid ${T.red}20` }}>
+                        {active.map((r, i) => {
+                          const remaining = Math.max(0, Math.ceil((r.expiresAt - now) / 1000))
+                          const mins = Math.floor(remaining / 60), secs = remaining % 60
+                          return (
+                            <div key={r.peerId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderBottom: i < active.length - 1 ? `1px solid ${T.border}15` : 'none', opacity: 0.75 }}>
+                              <div style={{ width: 36, height: 36, borderRadius: '50%', background: T.red + '10', border: `2px solid ${T.red}25`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 15, flexShrink: 0, color: T.red, fontWeight: 700 }}>
+                                {(r.peerName || '?')[0].toUpperCase()}
+                              </div>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <div style={{ fontSize: 12, color: T.textDim, fontWeight: 600 }}>{r.peerName || r.peerId}</div>
+                                <div style={{ fontSize: 10, color: T.red }}>✕ Declined — retry in {mins}:{String(secs).padStart(2,'0')}</div>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )
+                })()}
+
+                {pendingPeerRequests.length === 0 && rejectedRequests.filter(r => r.expiresAt > Date.now()).length === 0 && (
                   <div className="card" style={{ padding: 32, textAlign: 'center' }}>
                     <div style={{ fontSize: 32, marginBottom: 12 }}>📭</div>
                     <div style={{ fontSize: 14, color: T.text, fontWeight: 600, marginBottom: 6 }}>No pending requests</div>
-                    <div style={{ fontSize: 12, color: T.textDim, lineHeight: 1.6 }}>When someone on your local network wants to connect, their request will appear here. You can accept or decline.</div>
-                  </div>
-                ) : (
-                  <div className="card" style={{ padding: 0, overflow: 'hidden', border: `1px solid ${T.amber}30` }}>
-                    <div style={{ padding: '10px 14px', background: T.amber + '08', borderBottom: `1px solid ${T.amber}20`, display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: 14 }}>📬</span>
-                      <div style={{ flex: 1 }}>
-                        <div style={{ fontSize: 11, color: T.amber, fontWeight: 700 }}>INCOMING REQUESTS</div>
-                        <div style={{ fontSize: 10, color: T.textDim }}>{pendingPeerRequests.length} pending · accept to start chatting</div>
-                      </div>
-                    </div>
-                    {pendingPeerRequests.map(req => {
-                      const elapsed = Math.max(0, Math.round((Date.now() - req.timestamp) / 1000))
-                      const remaining = Math.max(0, 60 - elapsed)
-                      return (
-                        <div key={req.peerId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderBottom: `1px solid ${T.border}20` }}>
-                          <div style={{ width: 42, height: 42, borderRadius: '50%', background: T.amber + '18', border: `2px solid ${T.amber}40`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18, flexShrink: 0, color: T.amber, fontWeight: 700 }}>
-                            {(req.fromName || req.peerName || '?')[0].toUpperCase()}
-                          </div>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: 13, color: T.text, fontWeight: 600 }}>{req.fromName || req.peerName || req.peerId}</div>
-                            <div style={{ fontSize: 10, color: T.textDim }}>{req.peerId}</div>
-                            <div style={{ fontSize: 10, color: remaining < 15 ? T.red : T.muted, marginTop: 2 }}>wants to connect · {remaining}s remaining</div>
-                          </div>
-                          <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-                            <button onClick={() => {
-                              bridgeRef.current?.sendMsg(req.peerId, { type: 'peer_accept' })
-                              setPendingPeerRequests(p => p.filter(r => r.peerId !== req.peerId))
-                              notify(`${req.fromName || req.peerName} accepted`, 'ok')
-                              const peer = peersRef.current.find(p => p.id === req.peerId)
-                              setSelPeer(peer || { id: req.peerId, name: req.fromName || req.peerName, online: true }); setTab('peers')
-                            }} className="btn btn-green btn-sm" style={{ padding: '6px 14px', fontWeight: 700 }}>✓ Accept</button>
-                            <button onClick={() => {
-                              bridgeRef.current?.sendMsg(req.peerId, { type: 'peer_reject' })
-                              setPendingPeerRequests(p => p.filter(r => r.peerId !== req.peerId))
-                              bridgeRef.current?.disconnect(req.peerId)
-                              setPeers(ps => ps.filter(p => p.id !== req.peerId))
-                              notify(`${req.fromName || req.peerName} declined`, 'info')
-                            }} className="btn btn-ghost btn-sm" style={{ padding: '6px 14px', color: T.red, fontWeight: 700 }}>✕ Decline</button>
-                          </div>
-                        </div>
-                      )
-                    })}
-                    <div style={{ padding: '8px 14px', fontSize: 10, color: T.textDim, background: T.bg + '80', borderTop: `1px solid ${T.border}15` }}>
-                      Requests expire after 60 seconds · accept to add peer to your Network
+                    <div style={{ fontSize: 12, color: T.textDim, lineHeight: 1.6 }}>
+                      Incoming requests appear here when someone wants to connect.<br/>
+                      Your sent requests also appear here so you can withdraw them.
                     </div>
                   </div>
                 )}
@@ -3743,6 +3947,9 @@ export default function App() {
                         // Check if we already sent a request to this node
                         const alreadySent = sentPeerRequests.has(dp.nodeId) || peersRef.current.some(p => p.online && (msgs[p.id]?.length > 0))
                         const alreadyConnected = peersRef.current.some(p => p.online && p.name === dp.name && p.id !== myId.current)
+                        // FIX 4: Hide blocked peers from mDNS discovery list too
+                        const isBlockedPeer = blockedPeers.some(b => b.name === dp.name || b.id === dp.nodeId)
+                        if (isBlockedPeer) return null
                         return (
                           <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: i < discoveredPeers.length - 1 ? `1px solid ${T.border}20` : 'none' }}>
                             <div style={{ width: 36, height: 36, borderRadius: '50%', background: T.green + '15', border: `2px solid ${T.green}30`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, flexShrink: 0 }}>
@@ -3766,13 +3973,22 @@ export default function App() {
                                   }
                                 }
                                 try {
-                                  notify(`Connecting to ${dp.name || dp.address}…`, 'ok')
+                                  notify(`Request sent to ${dp.name || dp.address}…`, 'ok')
                                   const r = await window.ftps?.connect(dp.address, String(dp.port))
                                   if (r?.ok) {
                                     // Mark as sent immediately using nodeId (stable before peerId arrives)
                                     setSentPeerRequests(s => new Set([...s, dp.nodeId]))
-                                    // FIX 3: Register pending request — resolved instantly when onOpen fires
-                                    pendingMdnsRequests.current.set(dp.nodeId, { name: dp.name, fromName: account?.name || 'Unknown' })
+                                    // Edit 5: Add to pendingPeerRequests as sender so Requests tab shows it
+                                    setPendingPeerRequests(p => {
+                                      if (p.some(req => req.peerId === dp.nodeId)) return p
+                                      return [...p, {
+                                        peerId: dp.nodeId, peerName: dp.name, fingerprint: null,
+                                        tofu: null, tofuDetail: null, identityKey: null,
+                                        role: 'sender', timestamp: Date.now()
+                                      }]
+                                    })
+                                    // Navigate to requests tab so sender can see their pending request
+                                    setTab('requests')
                                   } else { notify('Connect failed: ' + (r?.error || ''), 'err') }
                                 } catch (err) { notify('Error: ' + (err?.message || ''), 'err') }
                               }} className="btn btn-ghost btn-sm" style={{ color: T.green, border: `1px solid ${T.green}30`, flexShrink: 0 }}>
@@ -3965,7 +4181,10 @@ export default function App() {
                 <div className="card" style={{ padding: 14, marginBottom: 11 }}>
                   <div className="sh">Preferences</div>
                   <div style={{ display: 'flex', alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${T.border}` }}>
-                    <div style={{ flex: 1, fontSize: 12, color: T.text }}>Warning on external links</div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: T.text }}>Warning on external links</div>
+                      <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>Applies to URLs and markdown [links] sent in chat</div>
+                    </div>
                     <button onClick={() => setSett2(p => ({ ...p, warnLinks: !p.warnLinks }))} className="btn btn-xs" style={{ background: sett.warnLinks ? T.accent + '16' : T.panel, border: `1px solid ${sett.warnLinks ? T.accent : T.border}`, color: sett.warnLinks ? T.accent : T.textDim, minWidth: 36 }}>
                       {sett.warnLinks ? 'ON' : 'OFF'}
                     </button>
@@ -4087,7 +4306,10 @@ export default function App() {
         </div>{/* end content area */}
       </div>{/* end main layout */}
 
-      <input ref={fileInp} type="file" multiple style={{ display: 'none' }} onChange={e => { [...e.target.files].forEach(f => doSendFile(f)); e.target.value = '' }} />
+      <input ref={fileInp} type="file" multiple
+        accept=".zip,.tar,.tar.gz,.tgz,.tar.bz2,.tbz2,.tar.xz,.txz,application/zip,application/x-tar,application/gzip,application/x-bzip2,application/x-xz,text/*,image/*,application/pdf,video/*,audio/*,application/json,application/xml"
+        style={{ display: 'none' }}
+        onChange={e => { [...e.target.files].forEach(f => doSendFile(f)); e.target.value = '' }} />
       <input ref={folderInp} type="file" {...{ 'webkitdirectory': '' }} multiple style={{ display: 'none' }} onChange={e => { if (e.target.files.length) doSendFolder([...e.target.files]); e.target.value = '' }} />
     </div>
   )

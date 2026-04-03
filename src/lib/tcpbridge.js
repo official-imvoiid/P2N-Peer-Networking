@@ -15,6 +15,11 @@ export class TCPBridge {
       window.ftps.on('ftps:peer-connected', ({ peerId, peerName, fingerprint, identityKey, tofu, tofuDetail }) => {
         this.h.onOpen?.(peerId, peerName, fingerprint, tofu, tofuDetail, identityKey)
       }),
+      window.ftps.on('ftps:peer-requested', ({ peerId, peerName, fingerprint, identityKey, tofu, tofuDetail, role }) => {
+        this.h.onRequested?.(peerId, peerName, fingerprint, tofu, tofuDetail, identityKey, role)
+      }),
+      window.ftps.on('ftps:peer-rejected', ({ peerId }) => this.h.onRejected?.(peerId)),
+      window.ftps.on('ftps:peer-withdrawn', ({ peerId }) => this.h.onWithdrawn?.(peerId)),
       window.ftps.on('ftps:peer-disconnected', ({ peerId }) => this.h.onClose?.(peerId)),
       window.ftps.on('ftps:peer-reconnecting', ({ peerId, attempt, maxAttempts }) => this.h.onReconnecting?.(peerId, attempt, maxAttempts)),
       window.ftps.on('ftps:message',      ({ peerId, msg }) => this.h.onMsg?.(peerId, msg)),

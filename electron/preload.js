@@ -45,7 +45,7 @@ contextBridge.exposeInMainWorld('ftps', {
   // BUG-02 FIX: 6 missing IPC bridges
   getPlatform: () => ipcRenderer.invoke('ftps:get-platform'),
   listArchive: (name, b64, password) => ipcRenderer.invoke('ftps:list-archive', { name, dataB64: b64, password: password || null }),
-  readArchiveEntry: (name, b64, entryPath) => ipcRenderer.invoke('ftps:read-archive-entry', { name, dataB64: b64, entryPath }),
+  readArchiveEntry: (name, b64, entryPath, password) => ipcRenderer.invoke('ftps:read-archive-entry', { name, dataB64: b64, entryPath, password }),
   saveFileFromTemp: (tmpPath, name) => ipcRenderer.invoke('ftps:save-file-from-temp', { tmpPath, name }),
   saveToDir: (files, folderName) => ipcRenderer.invoke('ftps:save-to-dir', { files, folderName }),
   launchOSSandbox: (opts) => ipcRenderer.invoke('ftps:launch-os-sandbox', opts),
@@ -57,6 +57,12 @@ contextBridge.exposeInMainWorld('ftps', {
   sendFileInFolder: (peerId, fid, name, size, mime, b64, folderFid, relPath, idx) =>
     ipcRenderer.invoke('ftps:send-file-in-folder', { peerId, fid, name, size, mime, dataB64: b64, folderFid, folderRelPath: relPath, fileIndex: idx }),
   sendFolderComplete: (peerId, fid, name, fileCount) => ipcRenderer.invoke('ftps:send-folder-complete', { peerId, fid, name, fileCount }),
+  
+  // Connection Requests
+  acceptRequest: (peerId) => ipcRenderer.invoke('ftps:accept-request', { peerId }),
+  rejectRequest: (peerId) => ipcRenderer.invoke('ftps:reject-request', { peerId }),
+  withdrawRequest: (peerId) => ipcRenderer.invoke('ftps:withdraw-request', { peerId }),
+  
   // CHANGE 8: Port settings persistence
   savePort: (port) => ipcRenderer.invoke('ftps:save-port', { port }),
   getPort: () => ipcRenderer.invoke('ftps:get-port'),
@@ -81,6 +87,7 @@ contextBridge.exposeInMainWorld('ftps', {
 
   // FIX #3: Rename info
   getRenameInfo: () => ipcRenderer.invoke('ftps:get-rename-info'),
+  fullWipe: () => ipcRenderer.invoke('ftps:full-wipe'),
   on: (channel, cb) => {
     const allowed = [
       'ftps:peer-connected', 'ftps:peer-disconnected', 'ftps:message',
@@ -93,6 +100,9 @@ contextBridge.exposeInMainWorld('ftps', {
       'ftps:peer-blocked',
       'ftps:peer-unblocked',
       'ftps:network-status',
+      'ftps:peer-requested',
+      'ftps:peer-rejected',
+      'ftps:peer-withdrawn',
     ]
     if (!allowed.includes(channel)) return () => { }
     const h = (_, d) => cb(d)
