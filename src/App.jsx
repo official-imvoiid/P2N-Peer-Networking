@@ -101,8 +101,12 @@ button:active:not(:disabled){transform:scale(.97)}
 .bub-me{background:${T.accent}1a;border:1px solid ${T.accent}30;border-bottom-right-radius:3px}
 .bub-them{background:${T.surface};border:1px solid ${T.border};border-bottom-left-radius:3px}
 .bub-sys{background:transparent;border:1px solid ${T.border};color:${T.textDim};font-size:11px;border-radius:20px;padding:3px 12px;max-width:100%;text-align:center}
-.prog{height:2px;background:${T.border};border-radius:2px;overflow:hidden}.prog-fill{height:100%;border-radius:2px;background:${T.accent};transition:width .3s}
-.stag{font-size:10px;padding:2px 6px;border-radius:4px;font-weight:500}
+.prog{height:3px;background:${T.border};border-radius:3px;overflow:hidden;position:relative}
+.prog-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,${T.accent},${T.blue});transition:width .3s ease}
+.prog-active .prog-fill{background:linear-gradient(90deg,${T.accent},${T.blue},${T.accent});background-size:200% 100%;animation:progShimmer 1.5s ease infinite}
+.prog-fail .prog-fill{background:${T.red};opacity:0.7}
+.stag{font-size:10px;padding:2px 7px;border-radius:5px;font-weight:600;transition:all .2s ease}
+.stag-pulse{animation:stagPulse 1.8s ease-in-out infinite}
 
 /* GFM markdown */
 .md-h1{font-size:18px;font-weight:700;color:${T.text};margin:10px 0 6px;border-bottom:1px solid ${T.border};padding-bottom:6px}
@@ -148,7 +152,38 @@ button:active:not(:disabled){transform:scale(.97)}
 @keyframes pulse{0%{opacity:.4}50%{opacity:.8}100%{opacity:.4}}
 @keyframes lockpulse{0%,100%{transform:scale(1);filter:drop-shadow(0 0 4px #d2992260)}50%{transform:scale(1.12);filter:drop-shadow(0 0 10px #d2992280)}}
 @keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(200%)}}
+@keyframes progShimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+@keyframes stagPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.85;transform:scale(1.03)}}
+@keyframes retryBounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}
+@keyframes slideIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes glowPulse{0%,100%{box-shadow:0 0 8px ${T.accent}15}50%{box-shadow:0 0 16px ${T.accent}30}}
 .pulse{animation:pulse 2s infinite ease-in-out}
+.slide-in{animation:slideIn .2s ease both}
+
+/* FIX: Enhanced file transfer cards */
+.file-card{border-radius:10px;overflow:hidden;transition:all .15s ease;position:relative}
+.file-card:hover{box-shadow:0 2px 12px #0003}
+.file-card-sending{border-left:3px solid ${T.blue}}
+.file-card-done{border-left:3px solid ${T.green}}
+.file-card-failed{border-left:3px solid ${T.red};background:${T.red}08 !important}
+.file-card-recv{border-left:3px solid ${T.green}}
+
+/* FIX: Retry button animation */
+.btn-retry{background:linear-gradient(135deg,${T.amber}18,${T.orange}12);border:1px solid ${T.amber}40;color:${T.amber};font-weight:600;transition:all .15s ease}
+.btn-retry:hover{background:linear-gradient(135deg,${T.amber}28,${T.orange}22);transform:translateY(-1px);box-shadow:0 3px 12px ${T.amber}20}
+.btn-retry:active{transform:translateY(0)}
+
+/* FIX: Transfer speed badge */
+.speed-badge{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:10px;font-size:9px;font-weight:600;background:${T.surface};border:1px solid ${T.border}}
+
+/* FIX: Folder card hover */
+.folder-card{transition:all .12s ease;position:relative;overflow:hidden}
+.folder-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,${T.green}00,${T.green}80,${T.green}00);opacity:0;transition:opacity .2s}
+.folder-card:hover::before{opacity:1}
+
+/* FIX: Better peer connected indicator */
+.peer-online{position:relative}
+.peer-online::after{content:'';position:absolute;right:-2px;bottom:-1px;width:8px;height:8px;border-radius:50%;background:${T.green};border:2px solid ${T.bg};animation:glowPulse 2s infinite}
 `
 
 // ── PURE-JS ZIP CREATOR ───────────────────────────────────────────────────────
@@ -985,46 +1020,56 @@ function FileMsg({ msg, onExtract, onPreview, onRevoke, onZipView, onOSSandbox, 
 
   const isMe = msg.from === 'me', pct = msg.pct ?? 1, done = msg.type === 'file_done' || (msg.type === 'file_out' && pct >= 1)
   const isSending = msg.type === 'file_out' && pct < 1
-  const statusTxt = isSending ? `${Math.round(pct * 100)}%` : msg.type === 'file_out' ? 'Sent' : msg.type === 'file_done' ? 'Received' : msg.type === 'file_in' ? `${Math.round(pct * 100)}%` : '…'
-  const statusCol = done ? T.green : T.amber
+  const isReceiving = msg.type === 'file_in'
+  const isFailed = !!msg.sendFailed
+  const statusTxt = isFailed ? '✗ Failed' : isSending ? `${Math.round(pct * 100)}%` : msg.type === 'file_out' ? '✓ Sent' : msg.type === 'file_done' ? '✓ Received' : msg.type === 'file_in' ? `${Math.round(pct * 100)}%` : '…'
+  const statusCol = isFailed ? T.red : done ? T.green : T.amber
   const fname = msg.meta?.name || ''
   const isArch = IS_ARCH.test(fname), isZipRar = IS_ARCH_VIEWABLE.test(fname), isDanger = IS_DANGEROUS.test(fname), isUnsupported = IS_UNSUPPORTED_ARCH.test(fname)
   const canView = !!(msg.blob) && !isArch && IS_VIEWABLE.test(fname)
+  const cardClass = `file-card ${isFailed ? 'file-card-failed' : isSending ? 'file-card-sending' : done && isMe ? 'file-card-done' : done ? 'file-card-recv' : ''} slide-in`
   const save = async () => {
     if (msg.tmpPath && window.ftps) { await window.ftps.saveFileFromTemp(msg.tmpPath, msg.meta?.name || 'file'); return }
     if (!msg.blob) return
     if (window.ftps) { const r = new FileReader(); r.onload = async () => await window.ftps.saveFile(msg.meta?.name || 'file', r.result.split(',')[1]); r.readAsDataURL(msg.blob) }
     else { const a = document.createElement('a'); a.href = URL.createObjectURL(msg.blob); a.download = msg.meta.name; document.body.appendChild(a); a.click(); document.body.removeChild(a) }
   }
-  return <div style={{ padding: '9px 11px', background: isMe ? T.blue + '0b' : T.surface, border: `1px solid ${isMe ? T.blue + '26' : T.border}`, borderRadius: 8, maxWidth: '68%' }}>
+  return <div className={cardClass} style={{ padding: '10px 12px', background: isFailed ? T.red + '08' : isMe ? T.blue + '0a' : T.surface, border: `1px solid ${isFailed ? T.red + '30' : isMe ? T.blue + '22' : T.border}`, maxWidth: '68%' }}>
     {msg.threats?.length > 0 && <div style={{ padding: '4px 8px', background: T.red + '12', border: `1px solid ${T.red}30`, borderRadius: 5, marginBottom: 6, fontSize: 10, color: T.red }}>
       ⚠ Security threats: {msg.threats.join(' · ')}
     </div>}
     {isDanger && <div style={{ padding: '4px 8px', background: T.amber + '10', border: `1px solid ${T.amber}28`, borderRadius: 5, marginBottom: 6, fontSize: 10, color: T.amber }}>⚠ Executable file — treat with caution</div>}
     {isUnsupported && <div style={{ padding: '4px 8px', background: T.red + '10', border: `1px solid ${T.red}28`, borderRadius: 5, marginBottom: 6, fontSize: 10, color: T.red }}>⚠ .{fname.split('.').pop()} is not supported — only ZIP and TAR archives can be browsed</div>}
-    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: done ? 7 : 5 }}>
-      <span style={{ fontSize: 17 }}>{isArch ? '📦' : '📄'}</span>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: done ? 7 : 5 }}>
+      <span style={{ fontSize: 18, filter: isFailed ? 'grayscale(0.5)' : 'none' }}>{isFailed ? '⚠️' : isArch ? '📦' : '📄'}</span>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 12, color: T.text, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{msg.meta?.name}</div>
+        <div style={{ fontSize: 12, color: isFailed ? T.red : T.text, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{msg.meta?.name}</div>
         <div style={{ fontSize: 11, color: T.textDim }}>{fmtSz(msg.meta?.size || 0)}</div>
       </div>
-      <span className="stag" style={{ color: statusCol, background: statusCol + '12', border: `1px solid ${statusCol}28` }}>{statusTxt}</span>
+      <span className={`stag ${(isSending || isReceiving) ? 'stag-pulse' : ''}`} style={{ color: statusCol, background: statusCol + '14', border: `1px solid ${statusCol}30` }}>{statusTxt}</span>
     </div>
-    {!done && <>
-      <div className="prog" style={{ marginBottom: 3 }}><div className="prog-fill" style={{ width: `${pct * 100}%` }} /></div>
-      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 5, display: 'flex', justifyContent: 'space-between' }}>
+    {!done && !isFailed && <>
+      <div className={`prog ${(isSending || isReceiving) ? 'prog-active' : ''}`} style={{ marginBottom: 4 }}><div className="prog-fill" style={{ width: `${pct * 100}%` }} /></div>
+      <div style={{ fontSize: 11, color: T.textDim, marginBottom: 5, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <span>{fmtSz(Math.round((msg.meta?.size || 0) * pct))} / {fmtSz(msg.meta?.size || 0)}</span>
-        <span>{Math.round(pct * 100)}%</span>
+        <span style={{ fontWeight: 600 }}>{Math.round(pct * 100)}%</span>
       </div>
-      {msg.calcSpeed > 0 && <div style={{ fontSize: 10, color: T.textDim, display: 'flex', justifyContent: 'space-between', marginTop: -3, marginBottom: 5 }}>
-        <span>{isMe ? '↑' : '↓'} {fmtSz(msg.calcSpeed)}/s</span>
-        <span>{msg.calcEta > 0 ? `~${fmtTime(msg.calcEta)} remaining` : ''}</span>
+      {msg.calcSpeed > 0 && <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: -2, marginBottom: 5 }}>
+        <span className="speed-badge" style={{ color: T.accent }}>{isMe ? '↑' : '↓'} {fmtSz(msg.calcSpeed)}/s</span>
+        <span style={{ fontSize: 10, color: T.muted }}>{msg.calcEta > 0 ? `~${fmtTime(msg.calcEta)} left` : ''}</span>
       </div>}
     </>}
+    {isFailed && <div className="prog prog-fail" style={{ marginBottom: 4 }}><div className="prog-fill" style={{ width: '100%' }} /></div>}
     {/* CHANGE 3: Cancel button during active send */}
     {isMe && !done && msg.pct !== undefined && msg.pct < 1 && (
       <button onClick={() => onRevoke?.(msg)} className="btn btn-danger btn-xs" style={{ marginTop: 5, width: '100%' }}>
         ✕ Cancel Send
+      </button>
+    )}
+    {/* FIX: Retry button on failed file sends */}
+    {isMe && msg.sendFailed && msg.failedFile && (
+      <button onClick={() => msg.onRetry?.(msg.failedFile)} className="btn btn-retry btn-xs" style={{ marginTop: 5, width: '100%' }}>
+        🔄 Retry Send
       </button>
     )}
     {msg.type === 'file_done' && (msg.blob || msg.tmpPath) && <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
@@ -1034,12 +1079,16 @@ function FileMsg({ msg, onExtract, onPreview, onRevoke, onZipView, onOSSandbox, 
       {isZipRar && !msg.blob && msg.tmpPath && <button onClick={async () => {
         // Large archive: load via IPC for listing without base64 overhead
         notify('Reading archive…', 'info')
-        const result = await window.ftps?.extractArchiveFromPath(fname, msg.tmpPath)
-        if (result?.ok) {
-          // Create a synthetic blob-like msg with tree for ZipViewer (just tree, no full blob)
-          onZipView?.({ ...msg, archivePath: msg.tmpPath, archiveTree: result.tree })
-          notify('', 'ok')
-        } else notify('Cannot browse large archive: ' + (result?.error || ''), 'err')
+        try {
+          const result = await window.ftps?.extractArchiveFromPath(fname, msg.tmpPath)
+          if (result?.ok) {
+            // Create a synthetic blob-like msg with tree for ZipViewer (just tree, no full blob)
+            onZipView?.({ ...msg, archivePath: msg.tmpPath, archiveTree: result.tree })
+            notify('', 'ok')
+          } else notify('Cannot browse large archive: ' + (result?.error || ''), 'err')
+        } catch (e) {
+          notify('Archive read failed: ' + (e.message || 'unknown error'), 'err')
+        }
       }} className="btn btn-blue btn-xs" style={{ flex: 1 }}>📂 Browse</button>}
       {(isArch || isDanger) && <button onClick={() => onOSSandbox?.(msg)} className="btn btn-amber btn-xs" style={{ flex: 1 }}>🛡 Sandbox</button>}
       {!isArch && !isDanger && canView && <button onClick={() => onPreview?.(msg)} className="btn btn-blue btn-xs" style={{ flex: 1 }}>👁 View</button>}
@@ -1107,6 +1156,39 @@ function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
   const [loadingEntry, setLoadingEntry] = useState(null)
   const status = msg.status || 'available'
 
+  // FIX Bug 4: Auto-expand tree when folder offer first arrives so users can see contents
+  const hasAutoExpanded = useRef(false)
+  useEffect(() => {
+    if (!hasAutoExpanded.current && msg.tree?.length > 0) {
+      hasAutoExpanded.current = true
+      setExpanded(true)
+    }
+  }, [msg.tree])
+
+  // FIX Bug 4: Auto-resolve loading preview when the pulled file actually arrives
+  // This watches msg.receivedFiles — when a file matching the loading preview name arrives,
+  // it auto-populates the preview with the file's content.
+  useEffect(() => {
+    if (!previewEntry || previewEntry.type !== 'loading') return
+    const recv = (msg.receivedFiles || []).find(f =>
+      f.name === previewEntry.name ||
+      (f.relPath || '').endsWith('/' + previewEntry.name) ||
+      f.relPath === previewEntry.name
+    )
+    if (recv?.blob) {
+      recv.blob.text().then(text => {
+        setPreviewEntry({
+          name: previewEntry.name,
+          type: IS_IMG.test(previewEntry.name) ? 'img' : 'text',
+          content: text,
+          blob: recv.blob
+        })
+      }).catch(() => {
+        setPreviewEntry({ name: previewEntry.name, type: 'text', content: '[Failed to read file]' })
+      })
+    }
+  }, [msg.receivedFiles, previewEntry])
+
   // Build tree from flat file list, stripping the top-level folder name prefix
   const buildTree = (files, rootName) => {
     const root = {}
@@ -1162,9 +1244,9 @@ function FolderBrowseMsg({ msg, peerId, onPull, notify }) {
     }
   }
 
-  return <div style={{ background: T.green + '07', border: `1px solid ${T.green}20`, borderRadius: 8, maxWidth: '90%', minWidth: 240, overflow: 'hidden' }}>
+  return <div className="folder-card slide-in" style={{ background: T.green + '07', border: `1px solid ${T.green}20`, borderRadius: 10, maxWidth: '90%', minWidth: 240, overflow: 'hidden' }}>
     {/* Header */}
-    <div style={{ padding: '9px 11px', display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => setExpanded(e => !e)}>
+    <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => setExpanded(e => !e)}>
       <span style={{ fontSize: 17, flexShrink: 0 }}>📂</span>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontSize: 12, color: T.text, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{msg.name}</div>
@@ -1335,7 +1417,7 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
     else { const a = document.createElement('a'); a.href = URL.createObjectURL(f.blob); a.download = f.name; document.body.appendChild(a); a.click(); document.body.removeChild(a) }
   }
 
-  return <div style={{ background: T.green + '08', border: `1px solid ${T.green}22`, borderRadius: 8, maxWidth: '85%', minWidth: 220, overflow: 'hidden' }}>
+  return <div className="slide-in" style={{ background: T.green + '08', border: `1px solid ${T.green}22`, borderRadius: 10, maxWidth: '85%', minWidth: 220, overflow: 'hidden' }}>
     <div style={{ padding: '9px 11px', display: 'flex', alignItems: 'center', gap: 8, cursor: done ? 'pointer' : 'default' }} onClick={() => done && setExpanded(e => !e)}>
       <span style={{ fontSize: 17, flexShrink: 0 }}>📂</span>
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -1348,8 +1430,8 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
       {done && !autoZipping && <span style={{ fontSize: 10, color: T.textDim, flexShrink: 0 }}>{expanded ? '▾' : '▸'}</span>}
     </div>
     {!done && <div style={{ padding: '0 11px 9px' }}>
-      <div className="prog" style={{ marginBottom: 3 }}><div className="prog-fill" style={{ width: `${msg.totalFiles > 0 ? Math.round((msg.receivedCount || 0) / msg.totalFiles * 100) : 0}%`, background: T.green, transition: 'width .3s' }} /></div>
-      <div style={{ fontSize: 11, color: T.textDim, marginTop: 1, display: 'flex', justifyContent: 'space-between' }}>
+      <div className="prog prog-active" style={{ marginBottom: 3 }}><div className="prog-fill" style={{ width: `${msg.totalFiles > 0 ? Math.round((msg.receivedCount || 0) / msg.totalFiles * 100) : 0}%`, transition: 'width .3s' }} /></div>
+      <div style={{ fontSize: 11, color: T.textDim, marginTop: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <span>↓ {msg.receivedCount || 0} of {msg.totalFiles} files</span>
         <span>{msg.totalFiles > 0 ? Math.round((msg.receivedCount || 0) / msg.totalFiles * 100) : 0}%</span>
       </div>
@@ -1364,9 +1446,9 @@ function FolderRecvMsg({ msg, folderDataRef, notify }) {
         if (speed <= 0) return null
         const remBytes = (msg.totalBytes || 0) - (msg.bytesSent || 0)
         const eta = remBytes > 0 ? Math.round(remBytes / speed) : 0
-        return <div style={{ fontSize: 10, color: T.textDim, display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
-          <span>↓ {fmtSz(speed)}/s</span>
-          <span>{eta > 0 ? `~${fmtTime(eta)} remaining` : ''}</span>
+        return <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 5 }}>
+          <span className="speed-badge" style={{ color: T.green }}>↓ {fmtSz(speed)}/s</span>
+          <span style={{ fontSize: 10, color: T.muted }}>{eta > 0 ? `~${fmtTime(eta)} left` : ''}</span>
         </div>
       })()}
       {/* Stall Detection */}
@@ -2359,9 +2441,9 @@ export default function App() {
                 }).catch(() => { })
             }
           } else {
-            // FIXED: Higher concurrency + completion fence to prevent 16281/16283 stall bug
+            // FIXED: Reduced concurrency + adaptive completion fence
             const files = folder.files
-            const CONCURRENCY = 6  // More workers = faster parallel sends on LAN
+            const CONCURRENCY = 3  // FIX: Reduced from 6 — prevents socket buffer exhaustion
               ; (async () => {
                 const queue = files.map((file, i) => ({ file, i }))
                 let failCount = 0
@@ -2384,10 +2466,9 @@ export default function App() {
                 await Promise.allSettled(
                   Array.from({ length: Math.min(CONCURRENCY, files.length) }, () => worker())
                 )
-                // Completion fence: wait 800ms after all workers finish so the last file_end
-                // frames can clear the TCP send buffer before folder_pull_done is sent.
-                // This prevents the 16281/16283 "last 2 files missing" stall bug.
-                await new Promise(r => setTimeout(r, 800))
+                // FIX: Adaptive completion delay — more files need longer for TCP to flush
+                const completionDelay = Math.min(2000, 800 + (files.length > 50 ? (files.length - 50) * 40 : 0))
+                await new Promise(r => setTimeout(r, completionDelay))
                 if (failCount > 0) {
                   setMsgs(p => ({ ...p, [pid]: (p[pid] || []).map(m => m.id === 'fo_' + msg.fid ? { ...m, status: 'done', failCount } : m) }))
                 } else {
@@ -2487,43 +2568,68 @@ export default function App() {
             tmpPath: tmpPath || null,
           }
         }
-        // Update the correct message type
-        setMsgs(p => {
-          const peerMsgs = p[pid] || []
-          const hasRecvMsg = peerMsgs.some(m => m.id === 'fr_' + folderFid)
-          if (hasRecvMsg) {
-            // Pull-all path: update progress in the folder_recv card
-            return {
-              ...p, [pid]: peerMsgs.map(m =>
-                m.id === 'fr_' + folderFid
-                  ? {
-                    ...m,
-                    receivedCount: (m.receivedCount || 0) + 1,
-                    bytesSent: (m.bytesSent || 0) + (meta.size || 0),
-                    speedHistory: [...(m.speedHistory || []).filter(h => Date.now() - h.t < 2000), { t: Date.now(), b: (m.bytesSent || 0) + (meta.size || 0) }],
-                    lastGotT: Date.now()
-                  }
-                  : m
-              )
+
+        // FIX: Throttle setMsgs to max 4/sec to prevent React state flooding
+        // on massive folder transfers (1000s of tiny files). Data is already
+        // safely stored in folderDataRef above — we just batch the UI update.
+        if (!folderDataRef.current._flushTimers) folderDataRef.current._flushTimers = {}
+        const flushKey = pid + '|' + folderFid
+
+        // Pending update params for this folder
+        if (!folderDataRef.current._pendingUpdates) folderDataRef.current._pendingUpdates = {}
+        folderDataRef.current._pendingUpdates[flushKey] = { pid, folderFid, meta, blob, tmpPath }
+
+        // If a timer is already scheduled, skip — it will pick up our latest data
+        if (folderDataRef.current._flushTimers[flushKey]) return
+
+        folderDataRef.current._flushTimers[flushKey] = setTimeout(() => {
+          delete folderDataRef.current._flushTimers[flushKey]
+          const pending = folderDataRef.current._pendingUpdates?.[flushKey]
+          if (!pending) return
+          delete folderDataRef.current._pendingUpdates[flushKey]
+          const { pid: p, folderFid: ff, meta: m, blob: b, tmpPath: tp } = pending
+
+          // Update the correct message type
+          setMsgs(prev => {
+            const peerMsgs = prev[p] || []
+            const hasRecvMsg = peerMsgs.some(msg => msg.id === 'fr_' + ff)
+            if (hasRecvMsg) {
+              // Pull-all path: update progress in the folder_recv card
+              const fdRef = folderDataRef.current[ff]
+              const receivedCount = fdRef ? fdRef.files.filter(Boolean).length : 0
+              const bytesSent = fdRef ? fdRef.files.filter(Boolean).reduce((s, f) => s + (f.size || 0), 0) : 0
+              return {
+                ...prev, [p]: peerMsgs.map(msg =>
+                  msg.id === 'fr_' + ff
+                    ? {
+                      ...msg,
+                      receivedCount,
+                      bytesSent,
+                      speedHistory: [...(msg.speedHistory || []).filter(h => Date.now() - h.t < 2000), { t: Date.now(), b: bytesSent }],
+                      lastGotT: Date.now()
+                    }
+                    : msg
+                )
+              }
+            } else {
+              // Single-file pull via browse card: show received file inline in the browse card
+              return {
+                ...prev, [p]: peerMsgs.map(msg =>
+                  msg.id === 'fb_' + ff
+                    ? {
+                      ...msg,
+                      status: 'available',  // reset status so user can pull more
+                      receivedFiles: [
+                        ...(msg.receivedFiles || []).filter(f => f.name !== m.name),
+                        { relPath: m.folderRelPath || m.name, name: m.name, size: m.size, blob: b, tmpPath: tp }
+                      ]
+                    }
+                    : msg
+                )
+              }
             }
-          } else {
-            // Single-file pull via browse card: show received file inline in the browse card
-            return {
-              ...p, [pid]: peerMsgs.map(m =>
-                m.id === 'fb_' + folderFid
-                  ? {
-                    ...m,
-                    status: 'available',  // reset status so user can pull more
-                    receivedFiles: [
-                      ...(m.receivedFiles || []).filter(f => f.name !== meta.name),
-                      { relPath: meta.folderRelPath || meta.name, name: meta.name, size: meta.size, blob, tmpPath }
-                    ]
-                  }
-                  : m
-              )
-            }
-          }
-        })
+          })
+        }, 250)  // batch every 250ms = max 4 React updates/sec
       },
       onFolderComplete(pid, fid, name, fileCount) {
         setMsgs(p => ({
@@ -2606,7 +2712,8 @@ export default function App() {
     }, fid, true)
     if (!ok) {
       notify(`Send failed: ${file.name}`, 'err')
-      setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).filter(m => m.id !== fid + '_out') }))
+      // FIX: Keep the message but mark as failed with retry option
+      setMsgs(p => ({ ...p, [selPeer.id]: (p[selPeer.id] || []).map(m => m.id === fid + '_out' ? { ...m, pct: 0, sendFailed: true, failedFile: file, onRetry: (f) => doSendFileInner(f) } : m) }))
     } else {
       notify(`Sent: ${file.name}`, 'ok')
     }
