@@ -19,9 +19,12 @@ const { exec, execFile } = require('child_process')
 
 // 512KB chunks for non-streaming (legacy base64)
 const CHUNK = 524288
-// 8MB chunks for streaming — maximum throughput for LAN; large chunks also help Tor by reducing protocol overhead
-const STREAM_CHUNK = 8388608
+// 4MB chunks for streaming — good throughput for LAN without overwhelming socket buffers
+const STREAM_CHUNK = 4194304
 const FRAME_HDR = 4
+// Max simultaneous file transfers per connection — prevents socket buffer exhaustion
+const MAX_CONCURRENT_SENDS = 3
+const MAX_CONCURRENT_RECVS = 20
 
 // ── MUTABLE STATE ─────────────────────────────────────────────────────────────
 let mainWindow = null
@@ -156,23 +159,84 @@ function secEntry(level, msg, detail = '') {
 // are seen even before the user clicks "Start Listening".
 const MDNS_ADDR = '224.0.0.251'
 const MDNS_PORT = 7476
+const MDNS_PORT_FALLBACK = 7477  // FIX: fallback port if primary is occupied
 let discoverySocket = null
 let discoveryInterval = null
 let _announcePort = null   // null = passive (receive only), number = active
 const discoveredPeers = new Map()  // key → { name, nodeId, port, address, lastSeen }
+let _joinedInterfaces = new Set()  // Track which interfaces we've joined multicast on
+let _interfaceReScanTimer = null   // Periodic re-scan timer
+let _mdnsRecoveryTimer = null      // Socket error recovery timer
 
 // Join multicast group on every non-loopback IPv4 interface so discovery
 // works regardless of which NIC is connected to the local network.
 function _joinMulticastAll(sock) {
-  try { sock.addMembership(MDNS_ADDR) } catch { }   // default interface
+  try { sock.addMembership(MDNS_ADDR); _joinedInterfaces.add('default') } catch (e) {
+    secEntry('WARN', 'mDNS default membership failed', e.message)
+  }
   const ifaces = os.networkInterfaces()
   for (const name of Object.keys(ifaces)) {
     for (const iface of (ifaces[name] || [])) {
       if (iface.family === 'IPv4' && !iface.internal) {
-        try { sock.addMembership(MDNS_ADDR, iface.address) } catch { }
+        const key = name + ':' + iface.address
+        if (_joinedInterfaces.has(key)) continue  // already joined
+        try {
+          sock.addMembership(MDNS_ADDR, iface.address)
+          _joinedInterfaces.add(key)
+          secEntry('OK', `mDNS joined multicast on ${name} (${iface.address})`)
+        } catch (e) {
+          // FIX: Try setMulticastInterface as fallback for stubborn interfaces
+          try {
+            sock.setMulticastInterface(iface.address)
+            _joinedInterfaces.add(key)
+            secEntry('OK', `mDNS setMulticastInterface fallback on ${name} (${iface.address})`)
+          } catch {
+            secEntry('WARN', `mDNS join failed on ${name} (${iface.address})`, e.message)
+          }
+        }
       }
     }
   }
+}
+
+// FIX: Periodic re-scan for new network interfaces (WiFi join/leave, VPN, etc.)
+function _startInterfaceReScan() {
+  if (_interfaceReScanTimer) return
+  _interfaceReScanTimer = setInterval(() => {
+    if (!discoverySocket) return
+    _joinMulticastAll(discoverySocket)
+  }, 30000)  // re-scan every 30s
+}
+
+// FIX: Send unicast broadcast as fallback for devices that block multicast
+function _sendBroadcastAnnounce() {
+  if (!discoverySocket || !_announcePort) return
+  try {
+    const msg = Buffer.from(JSON.stringify({
+      type: 'P2N_ANNOUNCE',
+      name: myName,
+      nodeId: myNodeId,
+      port: _announcePort,
+      v: 1,
+    }))
+    try { discoverySocket.setBroadcast(true) } catch { }
+    // Send to subnet broadcast address on all interfaces
+    const ifaces = os.networkInterfaces()
+    for (const name of Object.keys(ifaces)) {
+      for (const iface of (ifaces[name] || [])) {
+        if (iface.family === 'IPv4' && !iface.internal && iface.netmask) {
+          try {
+            // Calculate broadcast address from IP and netmask
+            const ipParts = iface.address.split('.').map(Number)
+            const maskParts = iface.netmask.split('.').map(Number)
+            const broadcastParts = ipParts.map((ip, i) => (ip | (~maskParts[i] & 255)))
+            const broadcastAddr = broadcastParts.join('.')
+            discoverySocket.send(msg, MDNS_PORT, broadcastAddr, () => { })
+          } catch { }
+        }
+      }
+    }
+  } catch { }
 }
 
 // Handle one received mDNS announcement packet.
@@ -205,22 +269,41 @@ function _onDiscoveryMsg(data, rinfo) {
 function _ensureDiscoverySocket() {
   if (discoverySocket) return Promise.resolve()
   return new Promise(resolve => {
-    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
-    discoverySocket = sock
-    sock.on('error', e => {
-      secEntry('WARN', 'mDNS socket error', e.message)
-      discoverySocket = null
-      resolve()  // resolve anyway so callers don't hang
-    })
-    sock.on('message', _onDiscoveryMsg)
-    // Explicitly bind to '0.0.0.0' for reliable multicast reception on all platforms.
-    sock.bind(MDNS_PORT, '0.0.0.0', () => {
-      _joinMulticastAll(sock)
-      try { sock.setMulticastTTL(4) } catch { }
-      try { sock.setMulticastLoopback(true) } catch { }  // allow same-machine testing
-      secEntry('OK', 'mDNS discovery socket ready (passive)')
-      resolve()
-    })
+    const tryBind = (port) => {
+      const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+      discoverySocket = sock
+      sock.on('error', e => {
+        secEntry('WARN', `mDNS socket error on port ${port}`, e.message)
+        discoverySocket = null
+        _joinedInterfaces.clear()
+        // FIX: Auto-recover from socket errors after 5s
+        if (!_mdnsRecoveryTimer) {
+          _mdnsRecoveryTimer = setTimeout(() => {
+            _mdnsRecoveryTimer = null
+            secEntry('INFO', 'mDNS attempting socket recovery…')
+            _ensureDiscoverySocket().catch(() => {})
+          }, 5000)
+        }
+        resolve()  // resolve anyway so callers don't hang
+      })
+      sock.on('message', _onDiscoveryMsg)
+      sock.bind(port, '0.0.0.0', () => {
+        _joinMulticastAll(sock)
+        try { sock.setMulticastTTL(4) } catch { }
+        try { sock.setMulticastLoopback(true) } catch { }  // allow same-machine testing
+        try { sock.setBroadcast(true) } catch { }  // FIX: enable broadcast for fallback
+        _startInterfaceReScan()  // FIX: start periodic re-scan
+        secEntry('OK', `mDNS discovery socket ready on port ${port} (passive)`)
+        resolve()
+      })
+    }
+    // Try primary port, fall back to secondary if occupied
+    try {
+      tryBind(MDNS_PORT)
+    } catch {
+      secEntry('WARN', `mDNS port ${MDNS_PORT} failed, trying fallback ${MDNS_PORT_FALLBACK}`)
+      tryBind(MDNS_PORT_FALLBACK)
+    }
   })
 }
 
@@ -237,6 +320,7 @@ function startDiscovery(listenPort) {
   _ensureDiscoverySocket().then(() => {
     if (!discoverySocket) return
     clearInterval(discoveryInterval)
+    let announceCount = 0
     const announce = () => {
       if (!discoverySocket || !_announcePort) return
       try {
@@ -247,7 +331,13 @@ function startDiscovery(listenPort) {
           port: _announcePort,
           v: 1,
         }))
+        // Send to multicast address
         discoverySocket.send(msg, MDNS_PORT, MDNS_ADDR, () => { })
+        // FIX: Also try fallback port in case peer is on that
+        discoverySocket.send(msg, MDNS_PORT_FALLBACK, MDNS_ADDR, () => { })
+        announceCount++
+        // FIX: Every 3rd announce, also send broadcast for devices that block multicast
+        if (announceCount % 3 === 0) _sendBroadcastAnnounce()
       } catch { }
     }
     announce()
@@ -268,6 +358,9 @@ function stopDiscovery() {
 // Full teardown — called only on app quit.
 function _shutdownDiscovery() {
   stopDiscovery()
+  if (_interfaceReScanTimer) { clearInterval(_interfaceReScanTimer); _interfaceReScanTimer = null }
+  if (_mdnsRecoveryTimer) { clearTimeout(_mdnsRecoveryTimer); _mdnsRecoveryTimer = null }
+  _joinedInterfaces.clear()
   if (discoverySocket) { try { discoverySocket.close() } catch { }; discoverySocket = null }
 }
 
@@ -676,14 +769,27 @@ function connectViaTor(onionHost, port) {
         let friendlyMsg = err.message
         if (err.code === 'ECONNREFUSED' || err.message.includes('ECONNREFUSED')) {
           friendlyMsg = 'Tor daemon not running — restart the app or enable Tor in Settings'
-          // Attempt Tor restart if server is up
+          // FIX: Rate-limit Tor auto-restart to prevent infinite restart loops
+          // Max 3 restarts per session, with 60s cooldown between attempts
           if (tcpServer) {
             const port = tcpServer.address()?.port
-            if (port) {
-              secEntry('WARN', 'Tor SOCKS port refused — attempting restart')
-              emit('ftps:tor-status', { status: 'error', error: 'Tor crashed — restarting…' })
+            const now = Date.now()
+            if (!connectViaTor._restartCount) connectViaTor._restartCount = 0
+            if (!connectViaTor._lastRestart) connectViaTor._lastRestart = 0
+            const cooldownOk = now - connectViaTor._lastRestart > 60000
+            const retriesOk = connectViaTor._restartCount < 3
+            if (port && cooldownOk && retriesOk) {
+              connectViaTor._restartCount++
+              connectViaTor._lastRestart = now
+              secEntry('WARN', `Tor SOCKS port refused — attempting restart (${connectViaTor._restartCount}/3)`)
+              emit('ftps:tor-status', { status: 'error', error: `Tor crashed — restarting (attempt ${connectViaTor._restartCount}/3)…` })
               stopTorDaemon()
               startTorHiddenService(port).catch(() => {})
+            } else if (!retriesOk) {
+              secEntry('ERR', 'Tor restart limit reached (3/3) — manual restart required')
+              emit('ftps:tor-status', { status: 'error', error: 'Tor failed to start after 3 attempts — restart the app' })
+            } else {
+              secEntry('WARN', `Tor restart cooldown active (${Math.round((60000 - (now - connectViaTor._lastRestart)) / 1000)}s remaining)`)
             }
           }
         } else if (err.message.includes('network unreachable')) {
@@ -715,7 +821,7 @@ function connectViaTor(onionHost, port) {
       }
     }
 
-    sock.setTimeout(60000, () => fail(new Error('SOCKS5 timeout — onion connections can be slow, try again')))
+    sock.setTimeout(120000, () => fail(new Error('SOCKS5 timeout — onion connections can be slow, try again')))
     sock.on('error', fail)
 
     sock.connect(torSocksPort, '127.0.0.1', () => {
@@ -824,14 +930,38 @@ function startNetworkPolling() {
   }, 5000)
 }
 
-// <!-- FIX: Issue 13 --> Keepalive ping to prevent NAT/Tor circuit timeouts
+// FIX: Keepalive ping to prevent NAT/Tor circuit timeouts
+// Tor connections get pinged more frequently (15s) because circuits die faster
 setInterval(() => {
   peers.forEach(conn => {
     if (conn.ready) {
       try { conn.send({ type: 'ping', t: Date.now() }) } catch { }
     }
   })
-}, 30000)
+}, 15000)
+
+// FIX: Periodic GC sweep — clean up orphaned file transfer state every 60s
+setInterval(() => {
+  peers.forEach(conn => {
+    if (!conn.ready) return
+    // Clean up completed/stale _activeSends entries
+    if (conn._activeSends) {
+      for (const [fid, abort] of conn._activeSends) {
+        if (abort.cancelled) conn._activeSends.delete(fid)
+      }
+    }
+    // Clean up stale _filebufs (receiving) — if no progress in 2 minutes, drop
+    for (const [fid, fb] of conn._filebufs) {
+      const staleMs = Date.now() - (fb._lastChunkTime || fb._startTime || Date.now())
+      if (staleMs > 120000) {
+        secEntry('WARN', `GC: cleaning stale file receive: ${fb.meta?.name || fid} (${Math.round(staleMs/1000)}s idle)`)
+        if (fb.ws) try { fb.ws.destroy() } catch { }
+        if (fb.tmpPath) try { fs.unlinkSync(fb.tmpPath) } catch { }
+        conn._filebufs.delete(fid)
+      }
+    }
+  })
+}, 60000)
 
 // ── ARCHIVE SANDBOX ───────────────────────────────────────────────────────────
 const sandboxes = new Map()
@@ -1059,6 +1189,8 @@ class PeerConn {
     this._closed      = false
     this._txSeq       = 0n   // monotonic send counter (BigInt for safe uint64)
     this._rxSeq       = -1n  // last accepted receive seq (-1 = none yet)
+    // FIX: Detect Tor connections for behavior tuning
+    this.isTor        = !!(initiatorInfo?.host?.endsWith('.onion'))
     // <!-- FIX: Issue 5 --> Store remote address for bidirectional reconnect
     this._remoteAddress = socket.remoteAddress || null
     this._remotePort    = socket.remotePort || null
@@ -1295,7 +1427,10 @@ class PeerConn {
       const frame  = Buffer.concat([iv, ct, enc.getAuthTag()])  // 12+N+16
       const hdr    = Buffer.allocUnsafe(4)
       hdr.writeUInt32BE(frame.length, 0)
+      // FIX: Cork/uncork to reduce syscall overhead and improve throughput
+      try { this.socket.cork() } catch { }
       this.socket.write(Buffer.concat([hdr, frame]))
+      try { this.socket.uncork() } catch { }
       totalBytesSent += 4 + frame.length
       return true
     } catch (e) { secEntry('ERR', 'Send failed', e.message); return false }
@@ -1323,7 +1458,10 @@ class PeerConn {
       const frame = Buffer.concat([iv, ct, enc.getAuthTag()])
       const hdr = Buffer.allocUnsafe(4)
       hdr.writeUInt32BE(frame.length, 0)
+      // FIX: Cork/uncork to reduce syscall overhead
+      try { this.socket.cork() } catch { }
       this.socket.write(Buffer.concat([hdr, frame]))
+      try { this.socket.uncork() } catch { }
       totalBytesSent += 4 + frame.length
       return true
     } catch (e) { secEntry('ERR', 'Binary send failed', e.message); return false }
@@ -1362,6 +1500,12 @@ class PeerConn {
     switch (msg.type) {
       case 'chat': emit('ftps:message', { peerId: this.id, msg }); break
       case 'file_start': {
+        // FIX: Reject if too many concurrent receives — prevents memory exhaustion
+        if (this._filebufs.size >= MAX_CONCURRENT_RECVS) {
+          secEntry('WARN', `Too many concurrent receives (${this._filebufs.size}), rejecting ${msg.name}`)
+          this.send({ type: 'file_abort', fid: msg.fid, reason: 'too_many' })
+          break
+        }
         const largeTmpPath = path.join(os.tmpdir(), 'p2n-recv-' + msg.fid + '-' + crypto.randomBytes(4).toString('hex'))
         // FIX 8A: Open a WriteStream immediately for large files — chunks write directly to disk
         // instead of accumulating in RAM. For small files (<1MB) we still use in-memory buffer.
@@ -1373,7 +1517,8 @@ class PeerConn {
         this._filebufs.set(msg.fid, {
           meta: msg, chunks: ws ? null : new Map(),
           tmpPath: largeTmpPath, written: 0, nextExpected: 0,
-          ws, reorderBuf: ws ? new Map() : null, lastProgressEmit: 0
+          ws, reorderBuf: ws ? new Map() : null, lastProgressEmit: 0,
+          _startTime: Date.now(), _lastChunkTime: Date.now()  // FIX: track for GC
         })
         emit('ftps:file-start', { peerId: this.id, meta: msg })
         break
@@ -1402,9 +1547,10 @@ class PeerConn {
             }
           } else {
             // Small file: in-memory
-            fb.chunks.set(msg.i, chunk)
+          fb.chunks.set(msg.i, chunk)
             fb.written = fb.chunks.size
           }
+          fb._lastChunkTime = Date.now()  // FIX: track for GC
           // FIX 8C: Throttle progress to max 10/sec per fid
           const now = Date.now()
           if (now - fb.lastProgressEmit > 100) {
@@ -1423,6 +1569,13 @@ class PeerConn {
             // FIX 8A: Close the write stream — file is already on disk
             try {
               await new Promise((res, rej) => { fb.ws.on('finish', res); fb.ws.on('error', rej); fb.ws.end() })
+              // FIX: fsync to guarantee data is flushed to physical storage before
+              // declaring success. Without this, a power loss at 100% could truncate.
+              try {
+                const syncFd = fs.openSync(fb.tmpPath, 'r')
+                fs.fsyncSync(syncFd)
+                fs.closeSync(syncFd)
+              } catch { /* best-effort — tmpPath may be inaccessible */ }
               emit('ftps:file-done', { peerId: this.id, meta: fb.meta, dataB64: null, tmpPath: fb.tmpPath })
               secEntry('OK', `File received (streamed): ${fb.meta.name}`, `${fb.meta.size}B → ${fb.tmpPath}`)
             } catch (e) {
@@ -1440,6 +1593,8 @@ class PeerConn {
           if (fb.meta.folderFid !== undefined) {
             emit('ftps:folder-file-done', { peerId: this.id, folderFid: fb.meta.folderFid, fileIndex: fb.meta.fileIndex, meta: fb.meta })
           }
+          // FIX: Send ack back to sender for flow control in folder transfers
+          this.send({ type: 'file_ack', fid: msg.fid })
           this._filebufs.delete(msg.fid)
         }
         break
@@ -1460,6 +1615,9 @@ class PeerConn {
         emit('ftps:folder-complete', { peerId: this.id, fid: msg.fid, name: msg.name, fileCount: msg.fileCount })
         break
       }
+      // FIX: Handle file_ack silently — flow control signal, no UI action needed
+      case 'file_ack': break
+      case 'ping': break  // keepalive, already handled
       default: emit('ftps:message', { peerId: this.id, msg }); break
     }
   }
@@ -1469,16 +1627,32 @@ class PeerConn {
   // This lets us handle files of any size (10GB+) without loading into memory.
   async sendFile(fid, name, size, mime, dataB64, extraMeta = {}, filePath = null) {
     this._activeSends = this._activeSends || new Map()
+    // FIX: Enforce max concurrent sends to prevent socket buffer exhaustion
+    const activeSendCount = [...(this._activeSends.values())].filter(a => !a.cancelled).length
+    if (activeSendCount >= MAX_CONCURRENT_SENDS) {
+      secEntry('WARN', `Max concurrent sends (${MAX_CONCURRENT_SENDS}) reached, queuing: ${name}`)
+      // Wait for a slot to open (check every 500ms)
+      await new Promise(resolve => {
+        const check = setInterval(() => {
+          const active = [...(this._activeSends.values())].filter(a => !a.cancelled).length
+          if (active < MAX_CONCURRENT_SENDS || this._closed) {
+            clearInterval(check)
+            resolve()
+          }
+        }, 500)
+      })
+      if (this._closed) return
+    }
     const abort = { cancelled: false, _drainResolve: null }
     this._activeSends.set(fid, abort)
-    // Use 2MB chunks for Tor — reduces per-chunk encryption overhead by 4x vs 512KB
-    // LAN gets full 8MB chunks for maximum throughput
-    const isTor = !!(this._initiator?.host?.endsWith('.onion'))
-    const TOR_CHUNK = 2 * 1024 * 1024  // 2MB chunks for Tor — balances throughput vs circuit limits
+    // FIX: Use 512KB chunks for Tor — smaller chunks survive circuit breaks better
+    // LAN gets 4MB chunks for good throughput without overwhelming buffers
+    const isTor = this.isTor || !!(this._initiator?.host?.endsWith('.onion'))
+    const TOR_CHUNK = 512 * 1024  // 512KB chunks for Tor — reliable over circuits
     const chunkSize = filePath ? (isTor ? TOR_CHUNK : STREAM_CHUNK) : CHUNK
     const total = Math.ceil(size / chunkSize)
     this.send({ type: 'file_start', fid, name, size, total, mime, ...extraMeta })
-    secEntry('OK', `Sending: ${name}`, `${size}B${filePath ? ' (stream)' : ''}${isTor ? ' [Tor 2MB chunks]' : ''}`)
+    secEntry('OK', `Sending: ${name}`, `${size}B${filePath ? ' (stream)' : ''}${isTor ? ' [Tor 512KB chunks]' : ''}`)
 
     // FIX 8C: Throttle send-progress to max 10/sec
     let lastSendProgressEmit = 0
@@ -1489,9 +1663,9 @@ class PeerConn {
         emit('ftps:send-progress', { peerId: this.id, fid, pct: (i + 1) / total, bytesSent: Math.min((i + 1) * chunkSize, size) })
       }
     }
-    // FIX 8B: Backpressure helper — wait for drain if socket buffer is full
-    // Tor gets 2MB threshold to match chunk size; LAN gets 8MB
-    const drainThreshold = isTor ? 2 * 1024 * 1024 : 8 * 1024 * 1024
+    // FIX: Backpressure helper — wait for drain if socket buffer is full
+    // Match threshold to chunk size for each transport
+    const drainThreshold = isTor ? 512 * 1024 : 4 * 1024 * 1024
     const waitForDrain = () => {
       if (this.socket && !this.socket.destroyed && this.socket.writableLength > drainThreshold) {
         return new Promise(r => {
@@ -1582,11 +1756,21 @@ class PeerConn {
     const id = this.id, name = this.name, wasReady = this.ready
     this.ready = false; try { this.socket.destroy() } catch { }
     
+    // FIX: Clean up stale _sendQueue items (older than 60s) to prevent reconnect bomb
+    if (this._sendQueue.length > 0) {
+      const cutoff = Date.now() - 60000
+      this._sendQueue = this._sendQueue.filter(item => !item._queuedAt || item._queuedAt > cutoff)
+    }
+    
     // Determine if we can reconnect. Either we initiated it, OR we have their remote IP/Port
     const canReconnect = this._initiator || (this._remoteAddress && this._remotePort && this._remoteAddress !== '127.0.0.1')
     
+    // FIX: For Tor connections, don't count natural circuit breaks against reconnect limit
+    // Tor circuits break naturally and should always be retried
+    const effectiveReconnectMax = this.isTor ? reconnectMax * 3 : reconnectMax
+    
     // <!-- FIX: Issue 5 --> Bidirectional reconnects using remote address
-    if (wasReady && canReconnect && !this._closed && this._reconnectAttempt < reconnectMax) {
+    if (wasReady && canReconnect && !this._closed && this._reconnectAttempt < effectiveReconnectMax) {
       this._reconnecting = true; this._reconnectAttempt++
       const delay = RECONNECT_DELAYS[Math.min(this._reconnectAttempt - 1, RECONNECT_DELAYS.length - 1)]
       secEntry('INFO', `Reconnecting to ${name || id} (${this._reconnectAttempt}/${reconnectMax})`, `in ${delay}ms`)
