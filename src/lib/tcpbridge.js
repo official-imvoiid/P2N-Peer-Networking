@@ -91,21 +91,27 @@ export class TCPBridge {
       const unsub = window.ftps.on('ftps:send-progress', ({ peerId: pid, fid: f2, pct }) => {
         if (pid === peerId && f2 === fid) onProg?.(pct)
       })
-      const res = await window.ftps.sendFileStream(
-        peerId, fid, file.name, file.size,
-        file.type || 'application/octet-stream', filePath
-      )
-      unsub?.()
-      return res?.ok ? fid : false
+      try {
+        const res = await window.ftps.sendFileStream(
+          peerId, fid, file.name, file.size,
+          file.type || 'application/octet-stream', filePath
+        )
+        return res?.ok ? fid : false
+      } finally {
+        unsub?.()  // FIX: guarantee cleanup even if sendFileStream throws
+      }
     } else {
       // FALLBACK PATH: legacy FileReader base64 (Blobs, generated data, etc.)
       const dataB64 = await fileToBase64(file)
       const unsub = window.ftps.on('ftps:send-progress', ({ peerId: pid, fid: f2, pct }) => {
         if (pid === peerId && f2 === fid) onProg?.(pct)
       })
-      const res = await window.ftps.sendFile(peerId, fid, file.name, file.size, file.type || 'application/octet-stream', dataB64)
-      unsub?.()
-      return res.ok ? fid : false
+      try {
+        const res = await window.ftps.sendFile(peerId, fid, file.name, file.size, file.type || 'application/octet-stream', dataB64)
+        return res?.ok ? fid : false
+      } finally {
+        unsub?.()  // FIX: guarantee cleanup even if sendFile throws
+      }
     }
   }
   // FIX #5: Folder send also uses streaming per file
@@ -115,45 +121,69 @@ export class TCPBridge {
       const unsub = window.ftps.on('ftps:send-progress', ({ peerId: pid, fid: f2, pct }) => {
         if (pid === peerId && f2 === fid) onProg?.(pct)
       })
-      const res = await window.ftps.sendFileInFolderStream(
-        peerId, fid, file.name, file.size,
-        file.type || 'application/octet-stream',
-        filePath, folderFid, relPath, fileIndex
-      )
-      unsub?.()
-      return res?.ok ? fid : false
+      try {
+        const res = await window.ftps.sendFileInFolderStream(
+          peerId, fid, file.name, file.size,
+          file.type || 'application/octet-stream',
+          filePath, folderFid, relPath, fileIndex
+        )
+        return res?.ok ? fid : false
+      } finally {
+        unsub?.()  // FIX: guarantee cleanup even if sendFileInFolderStream throws
+      }
     } else {
       const dataB64 = await fileToBase64(file)
       const unsub = window.ftps.on('ftps:send-progress', ({ peerId: pid, fid: f2, pct }) => {
         if (pid === peerId && f2 === fid) onProg?.(pct)
       })
-      const res = await window.ftps.sendFileInFolder(
-        peerId, fid, file.name, file.size, file.type || 'application/octet-stream',
-        dataB64, folderFid, relPath, fileIndex
-      )
-      unsub?.()
-      return res?.ok ? fid : false
+      try {
+        const res = await window.ftps.sendFileInFolder(
+          peerId, fid, file.name, file.size, file.type || 'application/octet-stream',
+          dataB64, folderFid, relPath, fileIndex
+        )
+        return res?.ok ? fid : false
+      } finally {
+        unsub?.()  // FIX: guarantee cleanup even if sendFileInFolder throws
+      }
     }
   }
   async sendFolder(peerId, files, onEvent) {
-    // v4.1: Parallel file sending — send up to 3 files concurrently for faster throughput
-    const CONCURRENCY = 3
+    // FIX: Reduced concurrency from 3 to 2 — keeps pipeline full without overwhelming socket
+    const CONCURRENCY = 2
+    const MAX_RETRIES = 1  // Retry failed files once
     const total = files.length
     let completed = 0
+    let failCount = 0
+    const FAIL_THRESHOLD = Math.max(3, Math.ceil(total * 0.3))  // Abort if >30% fail
     const queue = [...files.entries()]
 
     const worker = async () => {
       while (queue.length > 0) {
+        // FIX: Abort remaining if too many failures
+        if (failCount >= FAIL_THRESHOLD) {
+          onEvent?.({ type: 'error', index: -1, total, error: `Too many failures (${failCount}/${total}) — aborting remaining` })
+          break
+        }
         const [i, file] = queue.shift()
-        try {
-          await this.sendFile(peerId, file, (pct) => {
-            onEvent?.({ type: 'progress', index: i, total, pct })
-          })
-          completed++
-          onEvent?.({ type: 'file_done', index: i, total })
-        } catch (e) {
-          completed++
-          onEvent?.({ type: 'error', index: i, total, error: e.message })
+        let success = false
+        for (let attempt = 0; attempt <= MAX_RETRIES && !success; attempt++) {
+          try {
+            await this.sendFile(peerId, file, (pct) => {
+              onEvent?.({ type: 'progress', index: i, total, pct })
+            })
+            success = true
+            completed++
+            onEvent?.({ type: 'file_done', index: i, total })
+          } catch (e) {
+            if (attempt < MAX_RETRIES) {
+              onEvent?.({ type: 'retry', index: i, total, attempt: attempt + 1, error: e.message })
+              await new Promise(r => setTimeout(r, 1000))  // Wait 1s before retry
+            } else {
+              failCount++
+              completed++
+              onEvent?.({ type: 'error', index: i, total, error: e.message })
+            }
+          }
         }
       }
     }
@@ -162,7 +192,7 @@ export class TCPBridge {
     await Promise.allSettled(
       Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker())
     )
-    onEvent?.({ type: 'done', total })
+    onEvent?.({ type: 'done', total, failCount })
   }
   disconnect(peerId) { window.ftps.disconnect(peerId) }
   closeAll()         { window.ftps.closeAll() }
