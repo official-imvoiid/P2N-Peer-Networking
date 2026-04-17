@@ -42,7 +42,7 @@ contextBridge.exposeInMainWorld('ftps', {
   getMaxRetries: () => ipcRenderer.invoke('ftps:get-max-retries'),
   setTorEnabled: (v) => ipcRenderer.invoke('ftps:set-tor-enabled', { enabled: v }),
 
-  // BUG-02 FIX: 6 missing IPC bridges
+  // missing IPC bridges
   getPlatform: () => ipcRenderer.invoke('ftps:get-platform'),
   listArchive: (name, b64, password) => ipcRenderer.invoke('ftps:list-archive', { name, dataB64: b64, password: password || null }),
   readArchiveEntry: (name, b64, entryPath, password) => ipcRenderer.invoke('ftps:read-archive-entry', { name, dataB64: b64, entryPath, password }),
@@ -50,42 +50,42 @@ contextBridge.exposeInMainWorld('ftps', {
   saveToDir: (files, folderName) => ipcRenderer.invoke('ftps:save-to-dir', { files, folderName }),
   launchOSSandbox: (opts) => ipcRenderer.invoke('ftps:launch-os-sandbox', opts),
 
-  // CHANGE 3: Cancel file send mid-transfer
+  // Cancel file send mid-transfer
   cancelSend: (peerId, fid) => ipcRenderer.invoke('ftps:cancel-send', { peerId, fid }),
-  // CHANGE 4: Folder transfer protocol
+  // Folder transfer protocol
   sendFolderManifest: (peerId, manifest) => ipcRenderer.invoke('ftps:send-folder-manifest', { peerId, manifest }),
   sendFileInFolder: (peerId, fid, name, size, mime, b64, folderFid, relPath, idx) =>
     ipcRenderer.invoke('ftps:send-file-in-folder', { peerId, fid, name, size, mime, dataB64: b64, folderFid, folderRelPath: relPath, fileIndex: idx }),
   sendFolderComplete: (peerId, fid, name, fileCount) => ipcRenderer.invoke('ftps:send-folder-complete', { peerId, fid, name, fileCount }),
-  
+
   // Connection Requests
   acceptRequest: (peerId) => ipcRenderer.invoke('ftps:accept-request', { peerId }),
   rejectRequest: (peerId) => ipcRenderer.invoke('ftps:reject-request', { peerId }),
   withdrawRequest: (peerId) => ipcRenderer.invoke('ftps:withdraw-request', { peerId }),
-  
-  // CHANGE 8: Port settings persistence
+
+  // Port settings persistence
   savePort: (port) => ipcRenderer.invoke('ftps:save-port', { port }),
   getPort: () => ipcRenderer.invoke('ftps:get-port'),
 
-  // B4/C1: Blocked peers
+  // Blocked peers
   blockPeer: (peerId, peerName, reason) => ipcRenderer.invoke('ftps:block-peer', { peerId, peerName, reason }),
   unblockPeer: (peerId) => ipcRenderer.invoke('ftps:unblock-peer', { peerId }),
   getBlocked: () => ipcRenderer.invoke('ftps:get-blocked'),
-  // <!-- FIX: Issue 9 --> Block IP
+  // Block IP
   blockIp: (ip, reason) => ipcRenderer.invoke('ftps:block-ip', { ip, reason }),
 
-  // FIX #2/#5: Streaming file send (path-based, no RAM limit)
+  // Streaming file send (path-based, no RAM limit)
   sendFileStream: (peerId, fid, name, size, mime, filePath, extraMeta) =>
     ipcRenderer.invoke('ftps:send-file-stream', { peerId, fid, name, size, mime, filePath, extraMeta }),
   sendFileInFolderStream: (peerId, fid, name, size, mime, filePath, folderFid, relPath, idx) =>
     ipcRenderer.invoke('ftps:send-file-in-folder', { peerId, fid, name, size, mime, filePath, folderFid, folderRelPath: relPath, fileIndex: idx }),
-  
-  // <!-- FIX: Issue 9 & 12 --> New archive and file capabilities
+
+  // New archive and file capabilities
   extractArchiveFromPath: (name, archPath) => ipcRenderer.invoke('ftps:extract-archive-from-path', { name, archPath }),
   readFileForPreview: (filePath) => ipcRenderer.invoke('ftps:read-file-for-preview', { filePath }),
   find7z: () => ipcRenderer.invoke('ftps:find-7z'),
 
-  // FIX #3: Rename info
+  // Rename info
   getRenameInfo: () => ipcRenderer.invoke('ftps:get-rename-info'),
   fullWipe: () => ipcRenderer.invoke('ftps:full-wipe'),
   on: (channel, cb) => {
