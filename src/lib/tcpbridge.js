@@ -22,9 +22,9 @@ export class TCPBridge {
       window.ftps.on('ftps:peer-withdrawn', ({ peerId }) => this.h.onWithdrawn?.(peerId)),
       window.ftps.on('ftps:peer-disconnected', ({ peerId }) => this.h.onClose?.(peerId)),
       window.ftps.on('ftps:peer-reconnecting', ({ peerId, attempt, maxAttempts }) => this.h.onReconnecting?.(peerId, attempt, maxAttempts)),
-      window.ftps.on('ftps:message',      ({ peerId, msg }) => this.h.onMsg?.(peerId, msg)),
-      window.ftps.on('ftps:file-start',   ({ peerId, meta }) => this.h.onFileStart?.(peerId, meta)),
-      window.ftps.on('ftps:file-progress',({ peerId, fid, pct }) => this.h.onFileProg?.(peerId, fid, pct)),
+      window.ftps.on('ftps:message', ({ peerId, msg }) => this.h.onMsg?.(peerId, msg)),
+      window.ftps.on('ftps:file-start', ({ peerId, meta }) => this.h.onFileStart?.(peerId, meta)),
+      window.ftps.on('ftps:file-progress', ({ peerId, fid, pct }) => this.h.onFileProg?.(peerId, fid, pct)),
       window.ftps.on('ftps:file-done', ({ peerId, meta, dataB64, tmpPath }) => {
         // If this file belongs to a folder transfer, stash blob/tmpPath for
         // ftps:folder-file-done (which arrives right after) then return early —
@@ -39,7 +39,7 @@ export class TCPBridge {
           }
           return
         }
-        // BUG-06 fix: large standalone files (>32MB) arrive with tmpPath and no dataB64
+        // large standalone files (>32MB) arrive with tmpPath and no dataB64
         if (tmpPath && !dataB64) {
           this.h.onFileDone?.(peerId, meta, null, tmpPath)
           return
@@ -47,7 +47,7 @@ export class TCPBridge {
         const bytes = Uint8Array.from(atob(dataB64), c => c.charCodeAt(0))
         this.h.onFileDone?.(peerId, meta, new Blob([bytes], { type: meta.mime || 'application/octet-stream' }), null)
       }),
-      window.ftps.on('ftps:send-progress',({ peerId, fid, pct }) => this.h.onSendProg?.(peerId, fid, pct)),
+      window.ftps.on('ftps:send-progress', ({ peerId, fid, pct }) => this.h.onSendProg?.(peerId, fid, pct)),
 
       // ── Folder protocol events ──────────────────────────────────────────────
       // main.js emits this when a folder_manifest message arrives from the sender
@@ -76,10 +76,10 @@ export class TCPBridge {
     ]
   }
   async sendMsg(peerId, payload) {
-    const msg = typeof payload === 'string' ? { type:'chat', text:payload, t:Date.now() } : payload
+    const msg = typeof payload === 'string' ? { type: 'chat', text: payload, t: Date.now() } : payload
     return (await window.ftps.send(peerId, msg)).ok
   }
-  // FIX #2/#5: Use path-based streaming when file.path is available (Electron exposes this).
+  // Use path-based streaming when file.path is available (Electron exposes this).
   // This means files of ANY size (10GB+) are sent without loading into RAM.
   // Falls back to FileReader base64 only if no path (e.g., generated Blob).
   async sendFile(peerId, file, onProg, fidOverride) {
@@ -98,7 +98,7 @@ export class TCPBridge {
         )
         return res?.ok ? fid : false
       } finally {
-        unsub?.()  // FIX: guarantee cleanup even if sendFileStream throws
+        unsub?.()
       }
     } else {
       // FALLBACK PATH: legacy FileReader base64 (Blobs, generated data, etc.)
@@ -110,11 +110,11 @@ export class TCPBridge {
         const res = await window.ftps.sendFile(peerId, fid, file.name, file.size, file.type || 'application/octet-stream', dataB64)
         return res?.ok ? fid : false
       } finally {
-        unsub?.()  // FIX: guarantee cleanup even if sendFile throws
+        unsub?.()
       }
     }
   }
-  // FIX #5: Folder send also uses streaming per file
+  // Folder send also uses streaming per file
   async sendFolderFile(peerId, file, fid, folderFid, relPath, fileIndex, onProg) {
     const filePath = file.path || null
     if (filePath) {
@@ -129,7 +129,7 @@ export class TCPBridge {
         )
         return res?.ok ? fid : false
       } finally {
-        unsub?.()  // FIX: guarantee cleanup even if sendFileInFolderStream throws
+        unsub?.()  // guarantee cleanup even if sendFileInFolderStream throws
       }
     } else {
       const dataB64 = await fileToBase64(file)
@@ -143,13 +143,14 @@ export class TCPBridge {
         )
         return res?.ok ? fid : false
       } finally {
-        unsub?.()  // FIX: guarantee cleanup even if sendFileInFolder throws
+        unsub?.()  // guarantee cleanup even if sendFileInFolder throws
       }
     }
   }
   async sendFolder(peerId, files, onEvent) {
-    // FIX: Reduced concurrency from 3 to 2 — keeps pipeline full without overwhelming socket
-    const CONCURRENCY = 2
+    // Increased concurrency to 5 — modern TCP handles multiple concurrent streams well,
+    // especially with streaming (no RAM overhead). Old value of 2 was bottleneck for large folders.
+    const CONCURRENCY = 5
     const MAX_RETRIES = 1  // Retry failed files once
     const total = files.length
     let completed = 0
@@ -159,7 +160,7 @@ export class TCPBridge {
 
     const worker = async () => {
       while (queue.length > 0) {
-        // FIX: Abort remaining if too many failures
+        // Abort remaining if too many failures
         if (failCount >= FAIL_THRESHOLD) {
           onEvent?.({ type: 'error', index: -1, total, error: `Too many failures (${failCount}/${total}) — aborting remaining` })
           break
@@ -195,14 +196,14 @@ export class TCPBridge {
     onEvent?.({ type: 'done', total, failCount })
   }
   disconnect(peerId) { window.ftps.disconnect(peerId) }
-  closeAll()         { window.ftps.closeAll() }
-  destroy()          { this._unsubs.forEach(f => f?.()); this._unsubs = []; this._folderFileCache.clear() }
+  closeAll() { window.ftps.closeAll() }
+  destroy() { this._unsubs.forEach(f => f?.()); this._unsubs = []; this._folderFileCache.clear() }
 }
 
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const r = new FileReader()
-    r.onload  = () => resolve(r.result.split(',')[1])
+    r.onload = () => resolve(r.result.split(',')[1])
     r.onerror = () => reject(new Error('FileReader failed'))
     r.readAsDataURL(file)
   })
