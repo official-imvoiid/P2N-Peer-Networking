@@ -1,7 +1,7 @@
 {
-  "name": "ftps",
-  "version": "2.0.0",
-  "description": "FTPS — Encrypted P2P File Transfer & Chat. No servers. No WebRTC.",
+  "name": "FTPS",
+  "version": "1.0.0",
+  "description": "FTPS — Encrypted P2P File Transfer & Chat",
   "private": true,
   "main": "electron/main.js",
   "scripts": {
